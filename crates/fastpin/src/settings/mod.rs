@@ -135,17 +135,22 @@ fn bind_keys(cx: &mut App) {
 ///
 /// `include_bytes!` keeps the logo independent of the working directory, and
 /// the 1254² source is downscaled to 64² before it reaches the GPU: a 28 px
-/// brand mark has no use for six megabytes of texture.
+/// brand mark has no use for six megabytes of texture. The transparent variant
+/// is used rather than `fastpin.png` because the titlebar sits on the window
+/// surface, where the source's white card would still show as a white tile.
 fn brand_logo() -> Option<Arc<RenderImage>> {
     static LOGO: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
     LOGO.get_or_init(|| {
-        let decoded = image::load_from_memory(include_bytes!(
-            "../../../../assets/logo/fastpin.png"
+        let mut decoded = image::load_from_memory(include_bytes!(
+            "../../../../assets/logo/fastpin-transparent.png"
         ))
-        .ok()?;
-        let mut small = decoded
-            .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
-            .to_rgba8();
+        .ok()?
+        .to_rgba8();
+        // Both calls are no-ops on the generated asset; they keep a stale or
+        // hand-edited PNG from bringing the white card back.
+        crate::brand_icon::clear_edge_white(&mut decoded, crate::brand_icon::WHITE_THRESHOLD);
+        crate::brand_icon::de_white_transparent(&mut decoded);
+        let mut small = crate::brand_icon::resize_icon(&decoded, 64);
         // gpui's polychrome atlas is B8G8R8A8 (the layout the screenshot path
         // already feeds it) and the sprite blend is straight alpha, so the
         // decoded RGBA needs only an R/B swap — without it the blue mark
@@ -238,7 +243,6 @@ const MOSAIC_BLOCKS: [(&str, i32); 4] = [
 pub struct SettingsView {
     page: Page,
     settings: Settings,
-    engine: SharedString,
     status: SharedString,
     status_error: bool,
     open_select: Option<SelectId>,
@@ -361,11 +365,6 @@ impl SettingsView {
         Self {
             page: Page::General,
             settings,
-            engine: if crate::ocr::models_available() {
-                "PP-OCRv6 Small".into()
-            } else {
-                "模型缺失，识别不可用".into()
-            },
             status: SharedString::default(),
             status_error: false,
             open_select: None,
@@ -810,14 +809,10 @@ impl SettingsView {
             Ok(None) => {}
             Ok(Some(dir)) => {
                 // A model directory only counts once the three files are there;
-                // keep the choice but say so right away.
+                // keep the choice but say so right away. The resources page
+                // recomputes the status on every render, so no cached label.
                 self.settings.ocr.models_dir = Some(dir);
                 self.persist(cx);
-                self.engine = if crate::ocr::models_available() {
-                    "PP-OCRv6 Small".into()
-                } else {
-                    "该目录缺少模型文件".into()
-                };
             }
             Err(e) => {
                 self.fail(format!("{e}"));
@@ -828,11 +823,6 @@ impl SettingsView {
 
     fn clear_models_dir(&mut self, cx: &mut Context<Self>) {
         if self.settings.ocr.models_dir.take().is_some() {
-            self.engine = if crate::ocr::models_available() {
-                "PP-OCRv6 Small".into()
-            } else {
-                "模型缺失，识别不可用".into()
-            };
             self.persist(cx);
         } else {
             cx.notify();
@@ -1586,9 +1576,19 @@ impl SettingsView {
     }
 
     fn page_resources(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Recomputed on every render, never cached on the view: deleting or
+        // swapping model files outside the app has to move the dot and the
+        // label in the same frame.
+        let engine = crate::ocr::engine_status();
+        let default_dir: SharedString = engine
+            .dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "未找到".into())
+            .into();
         let models: SharedString = match &self.settings.ocr.models_dir {
             Some(p) => p.display().to_string().into(),
-            None => "默认：程序目录 models\\v6".into(),
+            None => format!("默认：{default_dir}").into(),
         };
         div()
             .flex()
@@ -1602,17 +1602,19 @@ impl SettingsView {
                             .items_center()
                             .gap(px(8.))
                             .child(div().w(px(7.)).h(px(7.)).rounded(px(4.)).bg(
-                                if crate::ocr::models_available() {
+                                if engine.available {
                                     theme::success()
                                 } else {
-                                    theme::danger()
+                                    // Grey, not red: a missing optional model is
+                                    // an "not installed" state, not a failure.
+                                    theme::secondary_fg()
                                 },
                             ))
                             .child(
                                 div()
                                     .text_size(px(12.))
                                     .text_color(theme::secondary_fg())
-                                    .child(self.engine.clone()),
+                                    .child(engine.label),
                             ),
                     )),
                 widgets::stack("模型目录", "覆盖内置的 models\\v6 目录，留空使用默认位置。")
@@ -1639,7 +1641,7 @@ impl SettingsView {
                     ),
             ]))
             .child(widgets::hint(
-                "需要检测、识别与字典三个模型文件同时存在，取字与翻译才可用。",
+                "需要检测、识别与字典三个模型文件同时存在且非空，取字与翻译才可用。",
             ))
     }
 
@@ -1922,7 +1924,11 @@ mod tests {
                 .expect("embedded logo decodes");
         assert!(decoded.width() >= 64 && decoded.height() >= 64);
         let logo = brand_logo().expect("brand logo caches");
-        assert!(logo.as_bytes(0).is_some(), "RenderImage carries the frame");
+        let bytes = logo.as_bytes(0).expect("RenderImage carries the frame");
+        // Straight-alpha BGRA: the titlebar tile must be transparent at the
+        // corner and opaque in the middle, i.e. no white card.
+        assert_eq!(bytes[3], 0, "corner alpha");
+        assert!(bytes[(32 * 64 + 32) * 4 + 3] > 0, "glyph alpha");
     }
 
     /// The old product name survives only in the migration constants that must

@@ -64,15 +64,80 @@ pub fn recognize(bgra: &[u8], w: u32, h: u32, stride: u32) -> Result<String> {
     Ok(reading_order::to_plain_text(&blocks))
 }
 
-/// What the settings page reports as the active engine. There is no fallback
+/// True when `dir` holds all three model files with bytes in them. A zero-byte
+/// file is what an interrupted copy or download leaves behind, and ORT refuses
+/// it later, so it counts as missing. Unreadable entries count as missing too.
+pub fn models_present_in(dir: &std::path::Path) -> bool {
+    [DET_MODEL, REC_MODEL, DICT].iter().all(|file| {
+        dir.join(file)
+            .metadata()
+            .map(|meta| meta.is_file() && meta.len() > 0)
+            .unwrap_or(false)
+    })
+}
+
+/// Whether the resolved model directory can drive OCR. There is no fallback
 /// recognizer in this build, so a missing model means OCR is simply off.
 pub fn models_available() -> bool {
-    let Ok(dir) = models_dir() else {
-        return false;
+    models_dir()
+        .map(|dir| models_present_in(&dir))
+        .unwrap_or(false)
+}
+
+/// Where [`engine_status`] found the models. The distinction exists so the
+/// settings page never paints a green "installed" dot for a `cargo run` build
+/// that is merely leaning on the source tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelOrigin {
+    /// A user-chosen directory, `FASTPIN_MODELS`, or `models\v6` next to the
+    /// executable — a real installation.
+    Installed,
+    /// Only `<CARGO_MANIFEST_DIR>/../../models/v6` exists. OCR works here,
+    /// but the machine itself has nothing installed.
+    DevFallback,
+}
+
+/// Everything the resources page renders about the engine. Recomputed on every
+/// render, so deleting or replacing model files outside the app updates the
+/// dot and the label together.
+#[derive(Clone, Debug)]
+pub struct EngineStatus {
+    /// Green dot only when an installed directory is complete.
+    pub available: bool,
+    /// The directory OCR actually reads, shown so the page cannot imply the
+    /// program directory when the resolved path is elsewhere.
+    pub dir: Option<PathBuf>,
+    pub label: &'static str,
+}
+
+/// Pure decision behind [`engine_status`], split out so the non-green branches
+/// are testable without the real machine's model folder.
+fn classify(present: bool, origin: ModelOrigin, configured: bool) -> (bool, &'static str) {
+    match (origin, present) {
+        (ModelOrigin::Installed, true) => (true, "PP-OCRv6 Small"),
+        (ModelOrigin::Installed, false) if configured => (false, "该目录缺少模型文件"),
+        (ModelOrigin::Installed, false) => (false, "模型缺失，识别不可用"),
+        // `cargo run` builds can OCR from the repo, but nothing is installed.
+        (ModelOrigin::DevFallback, true) => (false, "开发目录模型，未安装"),
+        (ModelOrigin::DevFallback, false) => (false, "模型缺失，识别不可用"),
+    }
+}
+
+pub fn engine_status() -> EngineStatus {
+    let configured = crate::config::get().ocr.models_dir.is_some();
+    let Ok((dir, origin)) = resolve_models_dir() else {
+        return EngineStatus {
+            available: false,
+            dir: None,
+            label: "模型缺失，识别不可用",
+        };
     };
-    [DET_MODEL, REC_MODEL, DICT]
-        .iter()
-        .all(|f| dir.join(f).is_file())
+    let (available, label) = classify(models_present_in(&dir), origin, configured);
+    EngineStatus {
+        available,
+        dir: Some(dir),
+        label,
+    }
 }
 
 /// A panic while holding the lock must not disable OCR for the rest of the
@@ -84,7 +149,12 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Engine>> {
 fn build() -> Result<OAROCR> {
     let dir = models_dir()?;
     for file in [DET_MODEL, REC_MODEL, DICT] {
-        if !dir.join(file).is_file() {
+        let usable = dir
+            .join(file)
+            .metadata()
+            .map(|meta| meta.is_file() && meta.len() > 0)
+            .unwrap_or(false);
+        if !usable {
             return Err(Error::new(format!(
                 "OCR model missing: {}",
                 dir.join(file).display()
@@ -110,12 +180,14 @@ fn build() -> Result<OAROCR> {
 
 /// `settings.json` wins, then `FASTPIN_MODELS`, then the install layout the C#
 /// build already uses, then the in-repo copy a `cargo run` build sits beside.
-fn models_dir() -> Result<PathBuf> {
+/// The origin travels with the path so the UI can tell an install from a
+/// developer-only fallback.
+fn resolve_models_dir() -> Result<(PathBuf, ModelOrigin)> {
     if let Some(dir) = crate::config::get().ocr.models_dir {
-        return Ok(dir);
+        return Ok((dir, ModelOrigin::Installed));
     }
     if let Some(dir) = std::env::var_os("FASTPIN_MODELS") {
-        return Ok(PathBuf::from(dir));
+        return Ok((PathBuf::from(dir), ModelOrigin::Installed));
     }
     let exe = std::env::current_exe()?;
     let base = exe
@@ -123,12 +195,16 @@ fn models_dir() -> Result<PathBuf> {
         .ok_or_else(|| Error::new("executable has no parent directory"))?;
     let shipped = base.join("models").join("v6");
     if shipped.is_dir() {
-        return Ok(shipped);
+        return Ok((shipped, ModelOrigin::Installed));
     }
     // ponytail: a `cargo run` build sits in `target\`, where the packaged
     // `models\v6` is not. The repo copy is the same three files, so fall back
     // to it rather than making every developer set FASTPIN_MODELS.
-    Ok(PathBuf::from(REPO_MODELS))
+    Ok((PathBuf::from(REPO_MODELS), ModelOrigin::DevFallback))
+}
+
+fn models_dir() -> Result<PathBuf> {
+    resolve_models_dir().map(|(dir, _)| dir)
 }
 
 /// The in-repo copy, resolved at compile time. Absent on a user machine, which
@@ -172,6 +248,62 @@ fn to_rgb(bgra: &[u8], w: u32, h: u32, stride: u32) -> Result<RgbImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    /// Unique scratch directory; the real model folders are never touched.
+    fn scratch(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("fastpin-ocr-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_models(dir: &std::path::Path, bytes: usize) {
+        for file in [DET_MODEL, REC_MODEL, DICT] {
+            fs::write(dir.join(file), vec![7u8; bytes]).unwrap();
+        }
+    }
+
+    #[test]
+    fn models_need_three_non_empty_files() {
+        let dir = scratch("present");
+        assert!(!models_present_in(&dir), "empty directory");
+
+        write_models(&dir, 0);
+        assert!(!models_present_in(&dir), "zero-byte files");
+
+        fs::remove_file(dir.join(REC_MODEL)).unwrap();
+        assert!(!models_present_in(&dir), "one file missing");
+
+        write_models(&dir, 1);
+        assert!(models_present_in(&dir), "all three non-empty");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn models_in_a_missing_directory_are_unavailable() {
+        let dir = std::env::temp_dir().join(format!(
+            "fastpin-ocr-{}-does-not-exist",
+            std::process::id()
+        ));
+        assert!(!models_present_in(&dir));
+    }
+
+    #[test]
+    fn classify_never_greens_a_missing_or_uninstalled_engine() {
+        let (available, label) = classify(true, ModelOrigin::Installed, false);
+        assert!(available);
+        assert_eq!(label, "PP-OCRv6 Small");
+
+        assert!(!classify(false, ModelOrigin::Installed, false).0);
+        assert!(!classify(false, ModelOrigin::Installed, true).0);
+        // A complete repo fallback still means "nothing installed".
+        let (available, label) = classify(true, ModelOrigin::DevFallback, false);
+        assert!(!available);
+        assert!(label.contains("未安装"));
+        assert!(!classify(false, ModelOrigin::DevFallback, false).0);
+    }
 
     #[test]
     fn to_rgb_drops_alpha_and_honours_stride() {

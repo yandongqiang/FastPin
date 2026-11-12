@@ -2,8 +2,11 @@
 //!
 //! `fastpin.png` is RGB with a white card behind the glyph. An edge-seeded
 //! flood fill (`fastpin::brand_icon::clear_edge_white`) makes only that card
-//! transparent, keeping the glyph's own white highlights, and writes
-//! `fastpin-transparent.png`. The ICO is built from that transparent file.
+//! transparent, keeping the glyph's own white highlights, and
+//! `de_white_transparent` then paints the cleared pixels with the nearest
+//! glyph colour so a later downscale cannot drag white into the edge. The
+//! result is written as `fastpin-transparent.png`, and the ICO is built from
+//! that transparent file.
 //!
 //! Multi-size ICO is written by hand because `image`'s ICO encoder stores a
 //! single frame. Sizes 16-128 use 32bpp BGRA BMP entries plus the AND mask
@@ -16,9 +19,10 @@
 
 use std::path::PathBuf;
 
-use fastpin::brand_icon::{clear_edge_white, WHITE_THRESHOLD};
+use fastpin::brand_icon::{
+    clear_edge_white, de_white_transparent, resize_icon, WHITE_THRESHOLD,
+};
 use image::codecs::png::PngEncoder;
-use image::imageops::FilterType;
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
 
 const SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
@@ -31,11 +35,13 @@ fn main() {
 
     let mut source = image::open(&src).expect("open fastpin.png").to_rgba8();
     let cleared = clear_edge_white(&mut source, WHITE_THRESHOLD);
+    let painted = de_white_transparent(&mut source);
     std::fs::write(&transparent, png_entry(&source)).expect("write fastpin-transparent.png");
     println!(
-        "wrote {} ({} px cleared)",
+        "wrote {} ({} px cleared, {} repainted)",
         transparent.display(),
-        cleared
+        cleared,
+        painted
     );
 
     // Read back the file the installer ships, so the ICO cannot diverge from
@@ -46,7 +52,11 @@ fn main() {
     let entries: Vec<(u32, Vec<u8>)> = SIZES
         .iter()
         .map(|&size| {
-            let rgba = image::imageops::resize(&source, size, size, FilterType::Lanczos3);
+            let rgba = resize_icon(&source, size);
+            let (white_holes, semi_white) = frame_stats(&rgba);
+            println!(
+                "{size:>3}px: {white_holes} transparent-white px, {semi_white} pale semi px"
+            );
             let payload = if size >= 256 {
                 png_entry(&rgba)
             } else {
@@ -79,6 +89,25 @@ fn main() {
 
     std::fs::write(&dst, &out).expect("write fastpin.ico");
     println!("wrote {} ({} bytes, sizes {SIZES:?})", dst.display(), out.len());
+}
+
+/// Counts the two artefacts a white card leaves behind after downscaling:
+/// entirely transparent pixels still carrying near-white RGB (the "white
+/// core"), and semi-transparent near-white pixels (a visible pale edge).
+fn frame_stats(img: &RgbaImage) -> (u32, u32) {
+    let pale = |p: &image::Rgba<u8>| {
+        p[0] >= WHITE_THRESHOLD && p[1] >= WHITE_THRESHOLD && p[2] >= WHITE_THRESHOLD
+    };
+    let mut holes = 0;
+    let mut semi = 0;
+    for p in img.pixels() {
+        if p[3] == 0 && pale(p) {
+            holes += 1;
+        } else if p[3] < 255 && pale(p) {
+            semi += 1;
+        }
+    }
+    (holes, semi)
 }
 
 fn png_entry(img: &RgbaImage) -> Vec<u8> {

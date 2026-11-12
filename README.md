@@ -38,7 +38,7 @@ FastPin 最初基于 [Starshot](https://github.com/loliri/Starshot) 二次开发
 
 ## 快速上手
 
-装好后程序静默进托盘，直接按热键即可：
+发布页提供 Portable zip 和由 `installer/fastpin.iss` 构建的 Inno Setup 安装包（默认每用户安装，无需管理员权限）。装好后程序静默进托盘，直接按热键即可：
 
 | 热键 | 动作 |
 | --- | --- |
@@ -64,11 +64,11 @@ FastPin 最初基于 [Starshot](https://github.com/loliri/Starshot) 二次开发
 
 在选区内直接画，不弹独立编辑窗：
 
-矩形 · 箭头 · 画笔 · 文字 · 马赛克
+矩形 · 椭圆 · 箭头 · 画笔 · 文字 · 马赛克 · 序号 · 直线（实线 / 虚线 / 云线）
 
 支持撤销 / 重做 / 清空，颜色、线宽、马赛克格子的默认值都能在设置里改。
 
-**工具栏可自定义**：17 个按钮都能在「设置 → 截图」里显示或隐藏，完成和取消始终显示。
+**工具栏可自定义**：除「完成」「取消」外的按钮都能在「设置 → 截屏」里显示或隐藏。
 
 ### 本地 OCR
 
@@ -92,7 +92,7 @@ OCR 取出文字后一键翻译，用你自己的 API：
 
 固定选区，手动滚动页面，自动检测新内容并拼接。
 
-- 每 450 ms 采一帧，按重叠区域做灰度 SAD 匹配对齐，避免重复条带
+- 每 150 ms 采一帧，按重叠区域做灰度 SAD 匹配对齐，避免重复条带
 - 上限 16384px（D3D11 纹理尺寸上限）
 - 拼接期间选区点击穿透，下方的应用正常接收滚轮
 - 完成时同时保存 PNG 并复制到剪贴板
@@ -109,14 +109,21 @@ OCR 取出文字后一键翻译，用你自己的 API：
 
 ### 更新检查
 
-「设置 → 通用 → 关于」里可手动检查更新，对照 GitHub Releases 的最新版本；发现新版本后一键跳到发布页下载。
+「设置 → 关于」里可手动检查更新，对照 GitHub Releases 的最新版本；发现新版本后一键跳到发布页下载。
+
+### 设置窗口
+
+设置从托盘右键菜单单独打开，关掉后进程仍留在托盘。左侧共 12 类：常规、截屏、录屏、历史图片、输出、贴图、外观、快捷键、翻译、资源管理、数据管理、关于。
+
+- 「输出」可配置文字 / 图片水印（九宫格位置、不透明度、大小、平铺、拍摄时间）与保存位置。
+- 「外观」可切换浅色 / 深色主题，立即生效并保存。
+- 「录屏」「历史图片」两页当前暂不支持；界面目前仅提供简体中文。
 
 ## 与 C# 版的差距
 
 Rust 版仍在补齐以下 C# 版已有的能力：
 
 - HDR 输出格式（AVIF / JPEG XL / PNGv3）：当前只输出 SDR PNG，HDR 屏幕下做正确的 tone mapping
-- 椭圆 / 直线 / 序号标注（占位已留，尚未开放）
 - 文件名模板、自动保存 / 自动复制的独立开关
 - 应用内流式更新与差分补丁（当前为手动检查 + 浏览器下载）
 
@@ -148,11 +155,11 @@ crates/fastpin/src/
 └── pin.rs / longcapture.rs / hdr.rs / exclusive.rs / perf.rs …
 ```
 
-UI 用 vendored GPUI 0.2.2（`third_party/gpui`），本地补丁是 `patches/gpui-0.2.2-fastpin-overlay.patch`，升级 GPUI 前必读 `patches/README.md`。
+UI 依赖 `gpui-kit = "=0.8.0"`，它把 `gpui-pre` 重导出为 `gpui`。仓库通过根 `Cargo.toml` 的 `[patch.crates-io]` 把 `gpui-pre` / `gpui-pre-windows`（0.3.9，位于 `third_party/gpui-pre*`）替换为打了本地补丁的版本，用于冻结帧的 DirectComposition 合成。补丁内容与重新生成方式见 `patches/README.md`、`patches/regen.sh`。
 
 | 层 | 技术 |
 | --- | --- |
-| UI | GPUI 0.2.2（vendored） |
+| UI | gpui-kit 0.8.0 + patched gpui-pre 0.3.9 |
 | 图形 | D3D11 + DirectComposition + Direct2D |
 | 捕获 | Windows.Graphics.Capture / DXGI Output Duplication |
 | 编码 | WIC（PNG） |
@@ -171,15 +178,17 @@ UI 用 vendored GPUI 0.2.2（`third_party/gpui`），本地补丁是 `patches/gp
 
 ```bash
 cargo build --release    # 产出 target/release/FastPin.exe
-cargo test --workspace   # 单元测试
+cargo test -p fastpin    # 单元测试
 cargo clippy --workspace --all-targets --locked -- -D warnings   # CI 同款检查
 ```
 
 OCR 模型已入库（`models/v6/`），发布包会把它们放在 exe 旁边的 `models\v6\`。本地直接跑 `target\` 里的构建时，用 `FASTPIN_MODELS` 环境变量指向模型目录：
 
 ```text
-set FASTPIN_MODELS=F:\own\FastPin-rust\models\v6
+set FASTPIN_MODELS=<你的仓库路径>\models\v6
 ```
+
+其它可选环境变量：`FASTPIN_BENCH`（内部压测）、`FASTPIN_NO_TRAY_HINT`（不显示首次托盘提示）。
 
 ### 调试与性能 flags
 
@@ -220,16 +229,7 @@ PP-OCRv6 Small 覆盖中日英与拉丁语系。韩文、阿拉伯文等不在�
 - [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) — PP-OCRv6 模型（Apache-2.0）
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）
 
-## Code signing policy
-
-Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).
-
-### Roles
-
-- Committer and Reviewer: [@yandongqiang](https://github.com/yandongqiang)
-- Approver: [@yandongqiang](https://github.com/yandongqiang)
-
-### Privacy
+## Privacy
 
 FastPin 不会把截图、OCR 结果、API 密钥或任何用户数据发送到用户未显式配置或请求的系统。网络访问只发生在两种情况：用户主动请求的翻译（发往用户自己配置的 API 端点）和针对 GitHub Releases 的更新检查。
 
@@ -240,4 +240,3 @@ FastPin does not transfer screenshots, OCR results, API keys, or other user data
 MIT，见 [LICENSE](LICENSE)。
 
 FastPin 最初基于 Starshot 二次开发；本仓库是独立的 Rust 实现，不是 Starshot 官方版本。
-# FastPin

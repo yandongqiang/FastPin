@@ -24,9 +24,9 @@
 
 全程不出现主窗口。没有启动器，没有欢迎页，没有图库。设置是从托盘单独打开的一个窗口，关掉它进程不退出。
 
-本仓库是 FastPin 的 **Rust 重写版**：GPUI 界面、单 HWND 冻结覆盖层、DirectComposition 合成，目标是更小的体积与更快的冷启动。功能上对齐 C# 版的主干流程，尚未补齐的部分见[与 C# 版的差距](#与-c-版的差距)。
+GPUI 界面、单 HWND 冻结覆盖层、DirectComposition 合成，目标是更小的体积与更快的冷启动。功能上对齐 C# 版的主干流程，尚未补齐的部分见[与 C# 版的差距](#与-c-版的差距)。
 
-FastPin 最初基于 [Starshot](https://github.com/loliri/Starshot) 二次开发。
+FastPin 最初基于 Zshot 二次开发。
 
 ## 为什么
 
@@ -224,6 +224,7 @@ PP-OCRv6 Small 覆盖中日英与拉丁语系。韩文、阿拉伯文等不在�
 ## 致谢
 
 - [Starshot](https://github.com/loliri/Starshot) — FastPin 最初的底座，作者 [@loliri](https://github.com/loliri)（MIT）
+- Zshot — 本仓库直接基于其二次开发的 Rust / GPUI 截图工具
 - [GPUI](https://github.com/zed-industries/zed) — Zed 编辑器的 GPU 加速 UI 框架
 - [oar-ocr](https://github.com/GreatV/oar-ocr) — Rust OCR 推理封装
 - [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) — PP-OCRv6 模型（Apache-2.0）
@@ -239,4 +240,4 @@ FastPin does not transfer screenshots, OCR results, API keys, or other user data
 
 MIT，见 [LICENSE](LICENSE)。
 
-FastPin 最初基于 Starshot 二次开发；本仓库是独立的 Rust 实现，不是 Starshot 官方版本。
+FastPin 最初基于 Zshot 二次开发。

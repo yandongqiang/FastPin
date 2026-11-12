@@ -26,7 +26,7 @@
 
 GPUI 界面、单 HWND 冻结覆盖层、DirectComposition 合成，目标是更小的体积与更快的冷启动。功能上对齐 C# 版的主干流程，尚未补齐的部分见[与 C# 版的差距](#与-c-版的差距)。
 
-FastPin 最初基于 Zshot 二次开发。
+FastPin 最初基于 Zshot 二次vibe coding开发。
 
 ## 为什么
 

@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use gpui::{
     deferred, div, img, prelude::*, px, size, App, Bounds, Context, CursorStyle, Entity, Focusable,
-    FontWeight, ImageSource, MouseButton, RenderImage, SharedString, Subscription, TitlebarOptions,
-    Window, WindowBounds, WindowHandle, WindowOptions,
+    FontWeight, ImageSource, MouseButton, RenderImage, SharedString, Subscription, Window,
+    WindowBounds, WindowControlArea, WindowHandle, WindowOptions,
 };
 
 use crate::config::Settings;
@@ -83,12 +83,18 @@ pub fn open(cx: &mut App) {
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some(format!("{} 设置", crate::APP_NAME).into()),
-                ..Default::default()
-            }),
+            // No system caption: `titlebar: None` makes the Windows backend
+            // hide the OS titlebar (`hide_title_bar`), so the client covers the
+            // whole window and `SettingsView::titlebar` draws its own. Native
+            // dragging comes from the caption's WindowControlArea::Drag hitbox
+            // (WM_NCHITTEST -> HTCAPTION); the sizing frame is kept by
+            // is_resizable, and the minimum size is unchanged.
+            titlebar: None,
             focus: true,
             show: true,
+            is_movable: true,
+            is_resizable: true,
+            is_minimizable: true,
             window_min_size: Some(size(px(860.), px(560.))),
             ..Default::default()
         },
@@ -902,6 +908,71 @@ impl SettingsView {
     }
 
     // ---- chrome ------------------------------------------------------------
+
+    /// Caption drawn in place of the system titlebar. The left region is the
+    /// drag handle; the buttons are ordinary client elements so their click
+    /// handlers still fire (a control-area hitbox would hand them to Windows).
+    fn titlebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut bar = div()
+            .flex_none()
+            .w_full()
+            .h(px(40.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .pl(px(14.))
+            .pr(px(6.))
+            .bg(widgets::titlebar_bg())
+            .border_b_1()
+            .border_color(theme::border())
+            .child(
+                div()
+                    .id("settings-titlebar-drag")
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(9.))
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(18.))
+                            .h(px(18.))
+                            .rounded(px(5.))
+                            .overflow_hidden()
+                            .child(logo_element(18.)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::primary_fg())
+                            .child(format!("{} 设置", crate::APP_NAME)),
+                    ),
+            );
+
+        for action in widgets::titlebar_actions(window.is_minimizable()) {
+            let id = match action {
+                widgets::TitlebarAction::Minimize => "settings-titlebar-min",
+                widgets::TitlebarAction::Close => "settings-titlebar-close",
+            };
+            let is_close = action == widgets::TitlebarAction::Close;
+            let button = widgets::titlebar_button(id, action).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_, _, window: &mut Window, _| {
+                    if is_close {
+                        window.remove_window();
+                    } else {
+                        window.minimize_window();
+                    }
+                }),
+            );
+            bar = bar.child(button);
+        }
+        bar
+    }
 
     fn nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let reset_label = if self.confirm_reset_all {
@@ -1782,7 +1853,7 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).text().trim().to_string();
         let searching = !query.is_empty();
 
@@ -1807,33 +1878,41 @@ impl Render for SettingsView {
 
         div()
             .flex()
-            .flex_row()
+            .flex_col()
             .size_full()
             .bg(widgets::page_bg())
             .text_color(theme::primary_fg())
-            .child(self.nav(cx))
+            .child(self.titlebar(window, cx))
             .child(
                 div()
-                    .flex_1()
-                    .h_full()
                     .flex()
-                    .flex_col()
-                    .child(self.search_bar())
+                    .flex_row()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.nav(cx))
                     .child(
                         div()
-                            .id("settings-page")
                             .flex_1()
-                            .overflow_y_scroll()
-                            .px(px(24.))
-                            .pb(px(24.))
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .child(self.search_bar())
                             .child(
                                 div()
-                                    .w_full()
-                                    .max_w(px(CONTENT_MAX_W))
-                                    .flex()
-                                    .flex_col()
-                                    .child(header)
-                                    .child(body),
+                                    .id("settings-page")
+                                    .flex_1()
+                                    .overflow_y_scroll()
+                                    .px(px(24.))
+                                    .pb(px(24.))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .max_w(px(CONTENT_MAX_W))
+                                            .flex()
+                                            .flex_col()
+                                            .child(header)
+                                            .child(body),
+                                    ),
                             ),
                     ),
             )
@@ -1843,6 +1922,16 @@ impl Render for SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titlebar_buttons_keep_close_last_and_gate_minimize() {
+        use widgets::{titlebar_actions, TitlebarAction};
+        assert_eq!(
+            titlebar_actions(true),
+            vec![TitlebarAction::Minimize, TitlebarAction::Close]
+        );
+        assert_eq!(titlebar_actions(false), vec![TitlebarAction::Close]);
+    }
 
     #[test]
     fn about_page_names_the_product_fastpin() {

@@ -8,8 +8,8 @@
 
 标注编辑 · 本地 OCR · 自带 API 翻译 · 长截图 · 贴图钉住
 
-[![Release](https://img.shields.io/github/v/release/Zyl0812/FastPin?style=flat-square)](../../releases)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](https://github.com/Zyl0812/FastPin?tab=MIT-1-ov-file)
+[![Release](https://img.shields.io/github/v/release/yandongqiang/FastPin?style=flat-square)](../../releases)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](https://github.com/yandongqiang/FastPin?tab=MIT-1-ov-file)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?style=flat-square&logo=windows)](../../releases)
 
 [下载](../../releases) · [快速上手](#快速上手) · [功能](#功能) · [从源码构建](#从源码构建)

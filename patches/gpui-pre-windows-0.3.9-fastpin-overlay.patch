@@ -1,0 +1,423 @@
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml	2026-11-10 18:14:27.997645200 +0800
++++ b/Cargo.toml	2026-11-10 18:14:28.059242500 +0800
+@@ -193,6 +193,20 @@
+     "Win32_UI_Input_Pointer",
+ ]
+ 
++# FastPin overlay patch: the patched-in GPU APIs cross the crate boundary into
++# applications that compile against `windows` 0.61, so the patched trait
++# methods use a renamed 0.61 dependency; the COM pointers themselves are the
++# same objects, converted via `as_raw`/`from_raw` where the 0.62 renderer
++# needs them.
++[target.'cfg(target_os = "windows")'.dependencies.windows61]
++package = "windows"
++version = "0.61"
++features = [
++    "Win32_Foundation",
++    "Win32_Graphics_Direct3D11",
++    "Win32_Graphics_Dxgi",
++]
++
+ [target.'cfg(target_os = "windows")'.dependencies.windows-core]
+ version = "0.62"
+ 
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/directx_devices.rs b/src/directx_devices.rs
+--- a/src/directx_devices.rs	2026-11-10 18:14:28.006857800 +0800
++++ b/src/directx_devices.rs	2026-11-10 18:14:28.074330900 +0800
+@@ -70,6 +70,17 @@
+             device_context,
+         })
+     }
++
++    // FastPin overlay patch: GPU introspection used by the app-facing
++    // with_gpu_context/adapter_luid API.
++    pub(crate) fn adapter_luid(&self) -> Option<(u32, i32)> {
++        let desc = unsafe { self.adapter.GetDesc() }.ok()?;
++        Some((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart))
++    }
++
++    pub(crate) fn is_available(&self) -> bool {
++        unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
++    }
+ }
+ 
+ #[inline]
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/directx_renderer.rs b/src/directx_renderer.rs
+--- a/src/directx_renderer.rs	2026-11-10 18:14:28.007857400 +0800
++++ b/src/directx_renderer.rs	2026-11-10 18:14:28.075333300 +0800
+@@ -117,8 +117,13 @@
+ 
+ struct DirectComposition {
+     comp_device: IDCompositionDevice,
++    // Held so the HWND composition target and visual tree stay alive.
++    #[allow(dead_code)]
+     comp_target: IDCompositionTarget,
+-    comp_visual: IDCompositionVisual,
++    #[allow(dead_code)]
++    root_visual: IDCompositionVisual,
++    freeze_visual: IDCompositionVisual,
++    ui_visual: IDCompositionVisual,
+ }
+ 
+ impl DirectXRendererDevices {
+@@ -201,6 +206,25 @@
+         self.atlas.clone()
+     }
+ 
++    // FastPin overlay patch: app-facing freeze-frame plumbing.
++    pub(crate) fn set_background_swap_chain(
++        &self,
++        swap: Option<&IDXGISwapChain1>,
++    ) -> Result<()> {
++        let composition = self
++            .direct_composition
++            .as_ref()
++            .context("DirectComposition is disabled")?;
++        composition.set_freeze_swap_chain(swap)
++    }
++
++    pub(crate) fn wait_for_commit_completion(&self) -> Result<()> {
++        if let Some(composition) = self.direct_composition.as_ref() {
++            composition.wait_for_commit_completion()?;
++        }
++        Ok(())
++    }
++
+     fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+         let resources = self.resources.as_ref().expect("resources missing");
+         let device_context = &self
+@@ -1015,23 +1039,63 @@
+     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
+         let comp_device = get_comp_device(dxgi_device)?;
+         let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+-        let comp_visual = unsafe { comp_device.CreateVisual() }?;
++        let root_visual = unsafe { comp_device.CreateVisual() }?;
++        let freeze_visual = unsafe { comp_device.CreateVisual() }?;
++        let ui_visual = unsafe { comp_device.CreateVisual() }?;
++
++        unsafe {
++            // FastPin overlay patch — z-order, with an explicit reference visual
++            // so the intent reads literally: the UI goes IN FRONT OF the
++            // freeze frame.
++            //
++            // Do not pass None here. With referenceVisual = NULL the meaning
++            // of insertAbove inverts — per AddVisual's docs, TRUE means
++            // "above no sibling, therefore rendered BELOW all of them".
++            // Passing (freeze, false, None) + (ui, true, None) reads like
++            // "freeze behind, UI on top" but actually puts the opaque freeze
++            // frame on top, hiding every piece of overlay UI.
++            root_visual.AddVisual(&freeze_visual, false, None)?;
++            root_visual.AddVisual(&ui_visual, true, Some(&freeze_visual))?;
++            comp_target.SetRoot(&root_visual)?;
++            comp_device.Commit()?;
++        }
+ 
+         Ok(Self {
+             comp_device,
+             comp_target,
+-            comp_visual,
++            root_visual,
++            freeze_visual,
++            ui_visual,
+         })
+     }
+ 
+     pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
+         unsafe {
+-            self.comp_visual.SetContent(swap_chain)?;
+-            self.comp_target.SetRoot(&self.comp_visual)?;
++            self.ui_visual.SetContent(swap_chain)?;
+             self.comp_device.Commit()?;
+         }
+         Ok(())
+     }
++
++    // FastPin overlay patch: the freeze frame is a second DComp visual that
++    // sits BELOW the GPUI UI visual. Capture renders its still frame into a
++    // dedicated swap chain and parks it here so the overlay draws on top of
++    // it while real GPUI frames are suspended.
++    pub fn set_freeze_swap_chain(&self, swap_chain: Option<&IDXGISwapChain1>) -> Result<()> {
++        unsafe {
++            match swap_chain {
++                Some(swap) => self.freeze_visual.SetContent(swap)?,
++                None => self.freeze_visual.SetContent(None::<&windows::core::IUnknown>)?,
++            }
++            self.comp_device.Commit()?;
++        }
++        Ok(())
++    }
++
++    pub fn wait_for_commit_completion(&self) -> Result<()> {
++        unsafe { self.comp_device.WaitForCommitCompletion()? };
++        Ok(())
++    }
+ }
+ 
+ impl DirectXGlobalElements {
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/events.rs b/src/events.rs
+--- a/src/events.rs	2026-11-10 18:14:28.009861400 +0800
++++ b/src/events.rs	2026-11-10 18:14:28.063243000 +0800
+@@ -28,6 +28,9 @@
+ pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
+ pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
+ pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
++// FastPin overlay patch: sent from the vsync thread before DirectX devices are
++// recreated, so the app can release device-dependent state on the main thread.
++pub(crate) const WM_GPUI_GPU_RESET_BEGIN: u32 = WM_USER + 9;
+ pub(crate) const WM_GPUI_DISPLAYS_CHANGED: u32 = WM_USER + 10;
+ 
+ const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+@@ -160,6 +163,8 @@
+             WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
+             WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
+             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
++            // FastPin overlay patch: WM_APP + 32 — overlay input-ready sentinel.
++            0x8020 => self.handle_app_ready_sentinel(),
+             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
+             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
+             _ => None,
+@@ -1312,6 +1317,18 @@
+         Some(0)
+     }
+ 
++    // FastPin overlay patch: overlay input-ready sentinel (WM_APP + 32), used
++    // as the T7 perf mark. Re-borrowed each time so the callback stays
++    // registered across invocations.
++    fn handle_app_ready_sentinel(&self) -> Option<isize> {
++        let callback = self.state.callbacks.app_ready_sentinel.take();
++        if let Some(mut callback) = callback {
++            callback();
++            self.state.callbacks.app_ready_sentinel.set(Some(callback));
++        }
++        Some(0)
++    }
++
+     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
+         self.state.direct_manipulation.on_pointer_hit_test(wparam);
+         None
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform.rs b/src/platform.rs
+--- a/src/platform.rs	2026-11-10 18:14:28.011857900 +0800
++++ b/src/platform.rs	2026-11-10 18:14:28.065826300 +0800
+@@ -6,7 +6,7 @@
+     rc::{Rc, Weak},
+     sync::{
+         Arc,
+-        atomic::{AtomicBool, Ordering},
++        atomic::{AtomicBool, AtomicU64, Ordering},
+     },
+ };
+ 
+@@ -84,6 +84,9 @@
+     validation_number: usize,
+     main_receiver: PriorityQueueReceiver<RunnableVariant>,
+     dispatcher: Arc<WindowsDispatcher>,
++    // FastPin overlay patch: increments each time DirectX devices are swapped
++    // in after a reset. Capture keys its shared-device caches to this.
++    gpu_generation: Arc<AtomicU64>,
+ }
+ 
+ pub(crate) struct WindowsPlatformState {
+@@ -112,6 +115,9 @@
+     system_sleep: Cell<Option<Box<dyn FnMut()>>>,
+     system_wake: Cell<Option<Box<dyn FnMut()>>>,
+     displays_changed: Cell<Option<Box<dyn FnMut()>>>,
++    // FastPin overlay patch: runs on the main thread before DirectX devices are
++    // recreated after a device reset, so the overlay can park its freeze frame.
++    gpu_reset_begin: Cell<Option<Box<dyn FnMut()>>>,
+ }
+ 
+ impl WindowsPlatformState {
+@@ -581,6 +587,75 @@
+             .set(Some(callback));
+     }
+ 
++    // FastPin overlay patch: GPU introspection and lifecycle hooks. The
++    // callback/device types come from the renamed `windows61` dependency so
++    // they unify with applications compiled against `windows` 0.61; the COM
++    // pointers are borrowed across via as_raw/from_raw with ManuallyDrop so
++    // no reference counts change.
++    fn gpu_generation(&self) -> u64 {
++        self.inner.gpu_generation.load(Ordering::SeqCst)
++    }
++
++    fn adapter_luid(&self) -> Option<(u32, i32)> {
++        self.inner
++            .state
++            .directx_devices
++            .borrow()
++            .as_ref()
++            .and_then(|devices| devices.adapter_luid())
++    }
++
++    fn with_gpu_context(
++        &self,
++        f: &mut dyn FnMut(
++            &windows61::Win32::Graphics::Direct3D11::ID3D11Device,
++            &windows61::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
++        ),
++    ) -> bool {
++        use windows61::core::Interface as _;
++        let state = self.inner.state.directx_devices.borrow();
++        let Some(devices) = state.as_ref() else {
++            return false;
++        };
++        if !devices.is_available() {
++            return false;
++        }
++        // `from_raw` transfers ownership of the reference (no AddRef) and the
++        // wrapper releases it on drop, so pin them for the duration of the
++        // borrow and let the platform's own references keep the objects alive.
++        let device = std::mem::ManuallyDrop::new(unsafe {
++            windows61::Win32::Graphics::Direct3D11::ID3D11Device::from_raw(devices.device.as_raw())
++        });
++        let context = std::mem::ManuallyDrop::new(unsafe {
++            windows61::Win32::Graphics::Direct3D11::ID3D11DeviceContext::from_raw(
++                devices.device_context.as_raw(),
++            )
++        });
++        f(&device, &context);
++        true
++    }
++
++    fn on_gpu_reset_begin(&self, callback: Box<dyn FnMut()>) {
++        self.inner
++            .state
++            .callbacks
++            .gpu_reset_begin
++            .set(Some(callback));
++    }
++
++    fn release_gpu_devices(&self) {
++        if self.inner.state.directx_devices.borrow().is_some()
++            && !self
++                .raw_window_handles
++                .read()
++                .is_empty()
++        {
++            log::warn!("release_gpu_devices ignored: windows are still open");
++            return;
++        }
++        self.detach_gpu();
++    }
++
+     fn on_thermal_state_change(&self, _callback: Box<dyn FnMut()>) {}
+ 
+     fn thermal_state(&self) -> ThermalState {
+@@ -1163,6 +1238,7 @@
+                 .main_receiver
+                 .take()
+                 .context("missing main receiver")?,
++            gpu_generation: Arc::new(AtomicU64::new(0)),
+         }))
+     }
+ 
+@@ -1192,7 +1268,8 @@
+             | WM_GPUI_DOCK_MENU_ACTION
+             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
+             | WM_GPUI_DISPLAYS_CHANGED
+-            | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
++            | WM_GPUI_GPU_DEVICE_LOST
++            | WM_GPUI_GPU_RESET_BEGIN => self.handle_gpui_events(msg, wparam, lparam),
+             WM_POWERBROADCAST => self.handle_power_broadcast(wparam),
+             WM_DISPLAYCHANGE => self.handle_display_change(handle),
+             WM_QUERYENDSESSION => Some(1),
+@@ -1221,6 +1298,7 @@
+             WM_GPUI_KEYBOARD_LAYOUT_CHANGED => self.handle_keyboard_layout_change(),
+             WM_GPUI_DISPLAYS_CHANGED => self.handle_displays_changed(),
+             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
++            WM_GPUI_GPU_RESET_BEGIN => self.handle_gpu_reset_begin(),
+             _ => unreachable!(),
+         }
+     }
+@@ -1396,7 +1474,21 @@
+         if current.is_some() {
+             *current = Some(directx_devices.clone());
+         }
++        drop(current);
++        // FastPin overlay patch: bump on the main thread next to the device swap
++        // so observers can key caches to the new device set.
++        self.gpu_generation.fetch_add(1, Ordering::SeqCst);
++
++        Some(0)
++    }
+ 
++    // FastPin overlay patch: the vsync thread signals that device recreation is
++    // about to start, before any GPU work touches the new device set.
++    fn handle_gpu_reset_begin(&self) -> Option<isize> {
++        self.with_callback(
++            |callbacks| &callbacks.gpu_reset_begin,
++            |callback| callback(),
++        );
+         Some(0)
+     }
+ }
+@@ -1717,6 +1809,17 @@
+     // If we don't wait, the final drawing result will be blank.
+     std::thread::sleep(std::time::Duration::from_millis(350));
+ 
++    // FastPin overlay patch: let the app release device-dependent state (e.g.
++    // the DirectComposition freeze frame) before the new device set exists.
++    unsafe {
++        SendMessageW(
++            platform_window,
++            WM_GPUI_GPU_RESET_BEGIN,
++            Some(WPARAM(validation_number)),
++            Some(LPARAM(0)),
++        );
++    }
++
+     *directx_devices = try_to_recover_from_device_lost(|| {
+         DirectXDevices::new().context("Failed to recreate new DirectX devices after device lost")
+     })?;
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/window.rs b/src/window.rs
+--- a/src/window.rs	2026-11-10 18:14:28.014857900 +0800
++++ b/src/window.rs	2026-11-10 18:14:28.068828500 +0800
+@@ -408,6 +408,8 @@
+     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
+     pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
+     pub(crate) appearance_changed: Cell<Option<Box<dyn FnMut()>>>,
++    // FastPin overlay patch: overlay input-ready sentinel (WM_APP + 32).
++    pub(crate) app_ready_sentinel: Cell<Option<Box<dyn FnMut()>>>,
+ }
+ 
+ struct WindowCreateContext {
+@@ -1057,6 +1059,38 @@
+         self.0.hwnd
+     }
+ 
++    // FastPin overlay patch: DirectComposition freeze-frame plumbing. The
++    // swap-chain type comes from the renamed `windows61` dependency to unify
++    // with applications compiled against `windows` 0.61; the COM pointer is
++    // borrowed across via as_raw/from_raw with ManuallyDrop so no reference
++    // counts change.
++    fn set_background_swap_chain(
++        &self,
++        swap: Option<&windows61::Win32::Graphics::Dxgi::IDXGISwapChain1>,
++    ) -> anyhow::Result<()> {
++        use windows61::core::Interface as _;
++        let swap = swap.map(|swap| {
++            std::mem::ManuallyDrop::new(unsafe {
++                windows::Win32::Graphics::Dxgi::IDXGISwapChain1::from_raw(swap.as_raw())
++            })
++        });
++        self.state
++            .renderer
++            .borrow()
++            .set_background_swap_chain(swap.as_deref())
++    }
++
++    fn wait_for_commit_completion(&self) -> anyhow::Result<()> {
++        self.state.renderer.borrow().wait_for_commit_completion()
++    }
++
++    fn on_app_ready_sentinel(&self, callback: Box<dyn FnMut()>) {
++        self.state
++            .callbacks
++            .app_ready_sentinel
++            .set(Some(callback));
++    }
++
+     fn gpu_specs(&self) -> Option<GpuSpecs> {
+         self.state.renderer.borrow().gpu_specs().log_err()
+     }

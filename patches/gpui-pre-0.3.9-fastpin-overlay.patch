@@ -1,0 +1,198 @@
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml	2026-11-10 18:14:27.270948400 +0800
++++ b/Cargo.toml	2026-11-10 18:14:27.425316600 +0800
+@@ -636,6 +636,19 @@
+     "Win32_System_WindowsProgramming",
+ ]
+ 
++# FastPin overlay patch: the patched-in GPU APIs are part of the public surface,
++# so their signatures must use the same `windows` major that applications
++# compile against (0.61). Type identity across the boundary comes from the
++# crate version, not the feature set, so these types unify with the app's.
++[target.'cfg(target_os = "windows")'.dependencies.windows61]
++package = "windows"
++version = "0.61"
++features = [
++    "Win32_Foundation",
++    "Win32_Graphics_Direct3D11",
++    "Win32_Graphics_Dxgi",
++]
++
+ [lints.clippy]
+ dbg_macro = "deny"
+ declare_interior_mutable_const = "deny"
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/app.rs b/src/app.rs
+--- a/src/app.rs	2026-11-10 18:14:27.210372500 +0800
++++ b/src/app.rs	2026-11-10 18:14:27.363562900 +0800
+@@ -1924,6 +1924,54 @@
+         self.platform.should_auto_hide_scrollbars()
+     }
+ 
++    // FastPin overlay patch: GPU introspection and lifecycle hooks.
++    /// Current GPU device generation. Increments when DirectX devices are
++    /// recreated after a reset.
++    #[cfg(target_os = "windows")]
++    pub fn gpu_generation(&self) -> u64 {
++        self.platform.gpu_generation()
++    }
++
++    /// Adapter LUID `(LowPart, HighPart)` of the GPUI DirectX device, if available.
++    #[cfg(target_os = "windows")]
++    pub fn adapter_luid(&self) -> Option<(u32, i32)> {
++        self.platform.adapter_luid()
++    }
++
++    /// Temporarily borrows the GPUI Direct3D device and immediate context on the main thread.
++    ///
++    /// Returns `None` if the devices are unavailable. Do not clone the immediate context out of
++    /// the closure for long-term storage.
++    #[cfg(target_os = "windows")]
++    pub fn with_gpu_context<R>(
++        &mut self,
++        f: impl FnOnce(
++            &windows61::Win32::Graphics::Direct3D11::ID3D11Device,
++            &windows61::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
++        ) -> R,
++    ) -> Option<R> {
++        let mut result = None;
++        let mut f = Some(f);
++        let ok = self.platform.with_gpu_context(&mut |device, context| {
++            if let Some(f) = f.take() {
++                result = Some(f(device, context));
++            }
++        });
++        if ok { result } else { None }
++    }
++
++    /// Registers a callback that runs on the main thread before DirectX devices are recreated.
++    #[cfg(target_os = "windows")]
++    pub fn on_gpu_reset_begin(&self, callback: impl FnMut() + 'static) {
++        self.platform.on_gpu_reset_begin(Box::new(callback));
++    }
++
++    /// Releases the platform's DirectX devices (and stops vsync). Only valid
++    /// while no window is open.
++    pub fn release_gpu_devices(&self) {
++        self.platform.release_gpu_devices();
++    }
++
+     /// Restarts the application.
+     pub fn restart(&mut self) {
+         self.restart_observers
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform.rs b/src/platform.rs
+--- a/src/platform.rs	2026-11-10 18:14:27.211684900 +0800
++++ b/src/platform.rs	2026-11-10 18:14:27.365565800 +0800
+@@ -601,6 +601,44 @@
+     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
+     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
+     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
++
++    // FastPin overlay patch: GPU introspection and lifecycle hooks. The types
++    // below come from the renamed `windows61` dependency so the signatures
++    // unify with applications that compile against `windows` 0.61.
++    /// Current GPU device generation. Increments when DirectX devices are
++    /// recreated after a reset.
++    #[cfg(target_os = "windows")]
++    fn gpu_generation(&self) -> u64 {
++        0
++    }
++
++    /// Adapter LUID `(LowPart, HighPart)` of the platform DirectX device, if available.
++    #[cfg(target_os = "windows")]
++    fn adapter_luid(&self) -> Option<(u32, i32)> {
++        None
++    }
++
++    /// Temporarily borrows the platform Direct3D device and immediate context
++    /// on the main thread. Returns `false` when the devices are unavailable.
++    #[cfg(target_os = "windows")]
++    fn with_gpu_context(
++        &self,
++        _f: &mut dyn FnMut(
++            &windows61::Win32::Graphics::Direct3D11::ID3D11Device,
++            &windows61::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
++        ),
++    ) -> bool {
++        false
++    }
++
++    /// Registers a callback that runs on the main thread before DirectX
++    /// devices are recreated after a device reset.
++    #[cfg(target_os = "windows")]
++    fn on_gpu_reset_begin(&self, _callback: Box<dyn FnMut()>) {}
++
++    /// Releases the platform's DirectX devices (and stops vsync). Only valid
++    /// while no window is open.
++    fn release_gpu_devices(&self) {}
+ }
+ 
+ /// A handle to a platform's display, e.g. a monitor or laptop screen.
+@@ -1316,6 +1354,30 @@
+     #[cfg(target_os = "windows")]
+     fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;
+ 
++    // FastPin overlay patch: DirectComposition freeze-frame plumbing. The
++    // swap-chain type comes from the renamed `windows61` dependency so it
++    // unifies with applications that compile against `windows` 0.61.
++    /// Sets or clears the DirectComposition freeze (background) swap chain.
++    /// Pass `None` to detach freeze content. Requires DirectComposition.
++    #[cfg(target_os = "windows")]
++    fn set_background_swap_chain(
++        &self,
++        _swap: Option<&windows61::Win32::Graphics::Dxgi::IDXGISwapChain1>,
++    ) -> anyhow::Result<()> {
++        anyhow::bail!("set_background_swap_chain is not supported")
++    }
++
++    /// Block until DirectComposition has finished the last `Commit`.
++    #[cfg(target_os = "windows")]
++    fn wait_for_commit_completion(&self) -> anyhow::Result<()> {
++        Ok(())
++    }
++
++    /// Called when the window WndProc receives the overlay-ready sentinel
++    /// (`WM_APP + 32`).
++    #[cfg(target_os = "windows")]
++    fn on_app_ready_sentinel(&self, _callback: Box<dyn FnMut()>) {}
++
+     // Linux specific methods
+     fn inner_window_bounds(&self) -> WindowBounds {
+         self.window_bounds()
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/window.rs b/src/window.rs
+--- a/src/window.rs	2026-11-10 18:14:27.178390800 +0800
++++ b/src/window.rs	2026-11-10 18:14:27.333428600 +0800
+@@ -3061,6 +3061,34 @@
+             .set_background_appearance(background_appearance);
+     }
+ 
++    // FastPin overlay patch: DirectComposition freeze-frame plumbing.
++    /// Sets or clears the DirectComposition freeze (background) swap chain.
++    ///
++    /// Pass `None` to detach freeze content. Requires DirectComposition. The
++    /// swap-chain type comes from the renamed `windows61` dependency so it
++    /// unifies with applications that compile against `windows` 0.61.
++    #[cfg(target_os = "windows")]
++    pub fn set_background_swap_chain(
++        &self,
++        swap: Option<&windows61::Win32::Graphics::Dxgi::IDXGISwapChain1>,
++    ) -> anyhow::Result<()> {
++        self.platform_window.set_background_swap_chain(swap)
++    }
++
++    /// Block until DirectComposition has finished the last `Commit`.
++    #[cfg(target_os = "windows")]
++    pub fn wait_for_commit_completion(&self) -> anyhow::Result<()> {
++        self.platform_window.wait_for_commit_completion()
++    }
++
++    /// Called when the window WndProc receives `WM_APP + 32`, used as the
++    /// overlay ready sentinel.
++    #[cfg(target_os = "windows")]
++    pub fn on_app_ready_sentinel(&self, callback: impl FnMut() + 'static) {
++        self.platform_window
++            .on_app_ready_sentinel(Box::new(callback));
++    }
++
+     /// Mark the window as dirty at the platform level.
+     pub fn set_window_edited(&mut self, edited: bool) {
+         self.platform_window.set_edited(edited);

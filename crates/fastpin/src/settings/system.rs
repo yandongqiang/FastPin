@@ -1,0 +1,251 @@
+//! The bits of the general page that touch Windows rather than settings.json.
+
+use std::ffi::c_void;
+use std::path::{Path, PathBuf};
+
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::ERROR_CANCELLED;
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::Registry::{
+    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
+};
+use windows::Win32::UI::Shell::{
+    FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, ShellExecuteW,
+    FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+};
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+use crate::error::{Error, Result};
+
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "FastPin";
+/// Pre-rebrand value name; `migrate_legacy_run_value` moves it over.
+const LEGACY_RUN_VALUE: &str = "Zshot";
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// `%LOCALAPPDATA%\FastPin` — settings.json and the log folder live under it.
+pub fn data_dir() -> Result<PathBuf> {
+    let base = std::env::var("LOCALAPPDATA").map_err(|_| Error::new("LOCALAPPDATA is not set"))?;
+    Ok(PathBuf::from(base).join("FastPin"))
+}
+
+/// The registry is the source of truth: the user can drop the entry from Task
+/// Manager's startup tab, and a cached copy in settings.json would then lie.
+pub fn autostart_enabled() -> bool {
+    let mut buf = [0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(wide(RUN_KEY).as_ptr()),
+            PCWSTR(wide(RUN_VALUE).as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            Some(&mut len),
+        )
+    };
+    status.is_ok()
+}
+
+pub fn set_autostart(enabled: bool) -> Result<()> {
+    let key = wide(RUN_KEY);
+    let name = wide(RUN_VALUE);
+    if !enabled {
+        // Absent already is the desired state, not a failure.
+        let _ = unsafe {
+            RegDeleteKeyValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(key.as_ptr()),
+                PCWSTR(name.as_ptr()),
+            )
+        };
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    // Quoted: the path has spaces under "Program Files", and an unquoted Run
+    // entry would launch the first token instead.
+    let command = wide(&format!("\"{}\"", exe.display()));
+    let bytes = command.len() * 2;
+    unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            REG_SZ.0,
+            Some(command.as_ptr() as *const c_void),
+            bytes as u32,
+        )
+        .ok()?;
+    }
+    Ok(())
+}
+
+/// Rebrand migration for the autostart entry: the old build registered under
+/// the pre-rebrand value name, which the new build no longer reads. Only touches
+/// the registry when that value exists, so users who never enabled autostart
+/// are unaffected. Idempotent: after the move the legacy value is gone.
+pub(crate) fn migrate_legacy_run_value() -> Vec<String> {
+    let key = wide(RUN_KEY);
+    let legacy = wide(LEGACY_RUN_VALUE);
+    let mut buf = [0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    let found = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(legacy.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            Some(&mut len),
+        )
+    };
+    if found.is_err() {
+        return Vec::new();
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return vec!["autostart: legacy entry found but current_exe failed".into()];
+    };
+    let name = wide(RUN_VALUE);
+    let command = wide(&format!("\"{}\"", exe.display()));
+    let write = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            REG_SZ.0,
+            Some(command.as_ptr() as *const c_void),
+            (command.len() * 2) as u32,
+        )
+    };
+    if write.is_err() {
+        return vec!["autostart: could not write FastPin entry".into()];
+    }
+    let removed = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, PCWSTR(key.as_ptr()), PCWSTR(legacy.as_ptr())) };
+    if removed.is_ok() {
+        vec!["autostart: moved legacy -> FastPin".into()]
+    } else {
+        vec!["autostart: FastPin written, legacy entry not removed".into()]
+    }
+}
+
+pub fn open_folder(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)?;
+    let verb = wide("open");
+    let target = wide(&path.display().to_string());
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW returns a fake HINSTANCE; <= 32 is the error range.
+    if result.0 as usize <= 32 {
+        return Err(Error::new(format!("无法打开 {}", path.display())));
+    }
+    Ok(())
+}
+
+/// Deletes the files in the log folder, keeping the folder itself. Returns how
+/// many went away so the page can say something more useful than "done".
+pub fn clear_logs() -> Result<usize> {
+    let dir = crate::perf::log_dir()?;
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        // A log the running process still holds open cannot be deleted on
+        // Windows; skipping it is better than aborting the whole sweep.
+        if path.is_file() && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Total bytes under `path`, one level of subdirectories deep — enough for the
+/// data folder and the log folder without walking an entire drive.
+pub fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let path = e.path();
+            match e.metadata() {
+                Ok(md) if md.is_file() => md.len(),
+                Ok(md) if md.is_dir() => dir_size(&path),
+                _ => 0,
+            }
+        })
+        .sum()
+}
+
+/// Folder picker for the save-location card. `Ok(None)` is the user pressing
+/// cancel, which must not read as a failure — every other error does.
+pub fn pick_folder(current: &Path) -> Result<Option<PathBuf>> {
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        dialog.SetOptions(dialog.GetOptions()? | FOS_PICKFOLDERS)?;
+        // Open where the user already saves. A path that no longer exists just
+        // leaves the dialog at the shell default.
+        let start = wide(&current.display().to_string());
+        if let Ok(item) =
+            SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(start.as_ptr()), None)
+        {
+            let _ = dialog.SetFolder(&item);
+        }
+        if let Err(e) = dialog.Show(None) {
+            if e.code() == ERROR_CANCELLED.to_hresult() {
+                return Ok(None);
+            }
+            return Err(e.into());
+        }
+        let pw = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+        // Freed before the `?`: an early return here would leak the COM string.
+        let text = pw.to_string();
+        CoTaskMemFree(Some(pw.0 as *const _));
+        Ok(Some(PathBuf::from(
+            text.map_err(|e| Error::new(e.to_string()))?,
+        )))
+    }
+}
+
+/// Image picker for the watermark asset. `Ok(None)` is a cancel, like
+/// `pick_folder`. A broken or cancelled pick never touches the stored path.
+pub fn pick_image(current: &Path) -> Result<Option<PathBuf>> {
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        let start = wide(&current.display().to_string());
+        if let Ok(item) =
+            SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(start.as_ptr()), None)
+        {
+            let _ = dialog.SetFolder(&item);
+        }
+        if let Err(e) = dialog.Show(None) {
+            if e.code() == ERROR_CANCELLED.to_hresult() {
+                return Ok(None);
+            }
+            return Err(e.into());
+        }
+        let pw = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let text = pw.to_string();
+        CoTaskMemFree(Some(pw.0 as *const _));
+        Ok(Some(PathBuf::from(
+            text.map_err(|e| Error::new(e.to_string()))?,
+        )))
+    }
+}

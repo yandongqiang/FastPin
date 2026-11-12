@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/fastpin"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.3.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[patch.crates-io]
+gpui-pre = { path = "third_party/gpui-pre" }
+gpui-pre-windows = { path = "third_party/gpui-pre-windows" }

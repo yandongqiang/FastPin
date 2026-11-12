@@ -3,28 +3,24 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use windows::core::{GUID, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_GUID, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChangeWindowMessageFilterEx, CreatePopupMenu, DestroyMenu, GetCursorPos, InsertMenuW,
-    LoadIconW, LoadImageW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu, HICON,
-    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, MF_BYPOSITION, MF_SEPARATOR, MF_STRING,
-    MSGFLT_ALLOW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_RBUTTONUP,
+    ChangeWindowMessageFilterEx, LoadIconW, LoadImageW, RegisterWindowMessageW, HICON,
+    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, MSGFLT_ALLOW, WM_LBUTTONUP,
+    WM_RBUTTONUP,
 };
 
 use crate::error::Result;
 use crate::hotkey;
+use crate::platform::tray_menu::{
+    ID_CLOSE_ALL, ID_COPY, ID_EXIT, ID_FULL, ID_REGION, ID_SETTINGS,
+};
 use crate::platform::WM_TRAYICON;
-
-const ID_REGION: u32 = 1;
-const ID_FULL: u32 = 2;
-const ID_COPY: u32 = 3;
-const ID_SETTINGS: u32 = 4;
-const ID_EXIT: u32 = 9;
 
 /// Stable identity for the notification icon. Windows keys the user's
 /// "always show" setting on a GUID, and a GUID (rather than the per-process
@@ -45,6 +41,7 @@ pub enum TrayCommand {
     Region,
     Fullscreen,
     CopyOnly,
+    CloseAllPins,
     Settings,
     Exit,
 }
@@ -324,84 +321,29 @@ pub fn handle_tray(hwnd: HWND, lparam: LPARAM) -> Option<TrayCommand> {
 }
 
 fn show_menu(hwnd: HWND) -> Option<TrayCommand> {
-    unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        let hotkeys = crate::config::get().hotkeys;
-        let region = menu_label("区域截图", &hotkeys.region);
-        let full = menu_label("全屏截图", &hotkeys.fullscreen);
-        let copy = menu_label("仅复制", &hotkeys.copy_only);
-        let _ = InsertMenuW(
-            menu,
-            0,
-            MF_BYPOSITION | MF_STRING,
-            ID_REGION as usize,
-            PCWSTR(region.as_ptr()),
-        );
-        let _ = InsertMenuW(
-            menu,
-            1,
-            MF_BYPOSITION | MF_STRING,
-            ID_FULL as usize,
-            PCWSTR(full.as_ptr()),
-        );
-        let _ = InsertMenuW(
-            menu,
-            2,
-            MF_BYPOSITION | MF_STRING,
-            ID_COPY as usize,
-            PCWSTR(copy.as_ptr()),
-        );
-        let _ = InsertMenuW(menu, 3, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = InsertMenuW(
-            menu,
-            4,
-            MF_BYPOSITION | MF_STRING,
-            ID_SETTINGS as usize,
-            PCWSTR(w("设置\0").as_ptr()),
-        );
-        let _ = InsertMenuW(
-            menu,
-            5,
-            MF_BYPOSITION | MF_STRING,
-            ID_EXIT as usize,
-            PCWSTR(w("退出\0").as_ptr()),
-        );
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let _ = SetForegroundWindow(hwnd);
-        let cmd = TrackPopupMenu(
-            menu,
-            TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
-            pt.x,
-            pt.y,
-            Some(0),
-            hwnd,
-            None,
-        );
-        let _ = DestroyMenu(menu);
-        match cmd.0 as u32 {
-            ID_REGION => Some(TrayCommand::Region),
-            ID_FULL => Some(TrayCommand::Fullscreen),
-            ID_COPY => Some(TrayCommand::CopyOnly),
-            ID_SETTINGS => Some(TrayCommand::Settings),
-            ID_EXIT => Some(TrayCommand::Exit),
-            _ => None,
-        }
-    }
+    let hotkeys = crate::config::get().hotkeys;
+    let items = crate::platform::tray_menu::build(
+        &hotkey_hint(&hotkeys.region),
+        &hotkey_hint(&hotkeys.fullscreen),
+        &hotkey_hint(&hotkeys.copy_only),
+        crate::pin::count(),
+    );
+    let cmd = crate::platform::tray_menu::track(hwnd, items)?;
+    Some(match cmd {
+        ID_REGION => TrayCommand::Region,
+        ID_FULL => TrayCommand::Fullscreen,
+        ID_COPY => TrayCommand::CopyOnly,
+        ID_CLOSE_ALL => TrayCommand::CloseAllPins,
+        ID_SETTINGS => TrayCommand::Settings,
+        ID_EXIT => TrayCommand::Exit,
+        _ => return None,
+    })
 }
 
-/// Menu labels double as a hotkey cheat sheet: the shell right-aligns text
-/// after `\t`, the classic accelerator column. The bindings are re-read on
-/// every popup so a rebind shows up without a restart.
-fn menu_label(title: &str, stored: &str) -> Vec<u16> {
-    let hint = hotkey::parse(stored)
-        .map(hotkey::format)
-        .unwrap_or_default();
-    format!("{title}\t{hint}\0").encode_utf16().collect()
-}
-
-fn w(s: &str) -> Vec<u16> {
-    s.encode_utf16().collect()
+/// Formats a registered hotkey for the right-aligned shortcut column. Bindings
+/// are re-read on every popup so a rebind shows up without a restart.
+fn hotkey_hint(stored: &str) -> String {
+    hotkey::parse(stored).map(hotkey::format).unwrap_or_default()
 }
 
 #[cfg(test)]

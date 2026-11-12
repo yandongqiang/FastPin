@@ -1,6 +1,7 @@
 mod hook;
 mod instance;
 mod tray;
+pub(crate) mod tray_menu;
 
 pub use hook::{
     action_from_wparam, action_wparam, apply_bindings, hook_target, install_ll_hook,

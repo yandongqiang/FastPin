@@ -1891,15 +1891,26 @@ pub(crate) fn track_menu(owner: HWND, items: &[MenuEntry]) -> Option<u32> {
     }
 }
 
+/// Number of live pinned images, shown on the tray's 关闭所有贴图 row.
+pub fn count() -> usize {
+    entries().len()
+}
+
+/// Close every pinned image. Shared by the tray's 关闭所有贴图 command and the
+/// per-pin context menu's 关闭全部钉图 command.
+pub fn close_all(cx: &mut App) {
+    for e in entries() {
+        if pin_edit::is_editing(e.group) {
+            pin_edit::finish(cx, e.group, false, Vec::new());
+        }
+        let _ = e.handle.update(cx, |_, window, _| window.remove_window());
+    }
+    PINS.with(|slot| slot.borrow_mut().clear());
+}
+
 pub(crate) fn run_menu_command(cx: &mut App, id: u64, cmd: u32) {
     if cmd == CMD_CLOSE_ALL {
-        for e in entries() {
-            if pin_edit::is_editing(e.group) {
-                pin_edit::finish(cx, e.group, false, Vec::new());
-            }
-            let _ = e.handle.update(cx, |_, window, _| window.remove_window());
-        }
-        PINS.with(|slot| slot.borrow_mut().clear());
+        close_all(cx);
         return;
     }
     let Some(handle) = entry_handle(id) else {

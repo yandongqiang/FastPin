@@ -12,7 +12,7 @@
 AppId={{8F3A5C2E-9B7D-4E1F-A6C3-2D5E8F0B1A47}
 AppName=FastPin
 AppVersion={#AppVersion}
-AppPublisher=Zyl0812
+AppPublisher=yandongqiang
 AppPublisherURL=https://github.com/yandongqiang/FastPin
 AppSupportURL=https://github.com/yandongqiang/FastPin/issues
 AppUpdatesURL=https://github.com/yandongqiang/FastPin/releases/latest

@@ -1882,6 +1882,10 @@ mod tests {
             ("migrate.rs", "root.join"),
             ("system.rs", "LEGACY_RUN_VALUE"),
             ("translate.rs", "LEGACY_VAULT_RESOURCE"),
+            // README 里的上游来源声明 / 致谢是用户可见的历史事实（用户
+            // 2026-11-12 要求保留「基于旧项目二次开发」并致谢），不是内部标识
+            // 残留；用「二次开发」作标记只豁免这些致谢行，README 其余命中照常报错。
+            ("README.md", "二次开发"),
         ];
         let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = crate_dir

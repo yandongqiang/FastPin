@@ -1,38 +1,54 @@
-//! Owner-drawn tray context menu, styled after the reference card.
+//! Tray context menu: a compact, rounded card drawn in its own popup window.
 //!
-//! `TrackPopupMenu` still owns the modal loop (keyboard navigation, screen
-//! clamping, click-outside dismiss, `TPM_RETURNCMD`), so every existing tray
-//! command keeps its behaviour and the `Shell_NotifyIconW` add/delete logic is
-//! untouched. Only the rendering changes: each row is an `MFT_OWNERDRAW` item
-//! measured by `WM_MEASUREITEM` and painted by `WM_DRAWITEM`, both routed here
-//! from the hidden window's `hidden_proc`.
+//! `TrackPopupMenu` cannot round its corners — it is a plain GDI menu window —
+//! so the menu is now a `WS_POPUP` window created here, with the card, rows,
+//! icons and separators painted by `WM_PAINT`. The popup runs its own modal
+//! message loop (the same technique `TrackPopupMenu` used), so the hidden
+//! tray window still blocks for the lifetime of the menu and returns the
+//! chosen command synchronously, keeping `tray.rs` / `app.rs` dispatch intact.
+//!
+//! Corners: Windows 11 rounds the window through
+//! `DWMWA_WINDOW_CORNER_PREFERENCE`, which also keeps the system drop shadow.
+//! Older builds fall back to a rounded window region plus `CS_DROPSHADOW`.
 //!
 //! The menu is a plain data structure ([`MenuItem`]) so its order, separators
-//! and the disabled version row can be unit-tested without a GUI. Colours come
+//! and the disabled version row stay unit-testable without a GUI. Colours come
 //! from the gpui-kit semantic tokens for the persisted light/dark appearance,
 //! never from hardcoded literals, so icons/text stay readable in both themes.
 
-use std::cell::RefCell;
+use std::mem::size_of;
+use std::sync::Once;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DWM_WINDOW_CORNER_PREFERENCE,
+};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, FillRect,
-    GetStockObject, LineTo, MoveToEx, Polyline, Rectangle, SelectObject, SetBkMode, SetTextColor,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CALCRECT, DT_LEFT, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, NULL_BRUSH, OUT_DEFAULT_PRECIS,
+    BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
+    DrawTextW, Ellipse, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect,
+    LineTo, MonitorFromPoint, MoveToEx, Rectangle, RoundRect, SelectObject, SetBkMode,
+    SetTextColor, SetWindowRgn, UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC,
+    HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
     PS_SOLID, TRANSPARENT,
 };
-use windows::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_CHECKED, ODS_DISABLED, ODS_GRAYED, ODS_SELECTED,
-    ODT_MENU,
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN,
+    VK_ESCAPE, VK_RETURN, VK_UP,
 };
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, DestroyMenu, GetCursorPos, InsertMenuItemW, SetForegroundWindow, SetMenuInfo,
-    TrackPopupMenu, MENU_ITEM_STATE, MENUINFO, MENUITEMINFOW, MFS_DISABLED, MFT_OWNERDRAW,
-    MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIM_BACKGROUND, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
+    GetMessageW, GetWindowLongPtrW, IsWindow, LoadCursorW, PostQuitMessage, RegisterClassExW,
+    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, CS_DROPSHADOW,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, MSG, SW_SHOW, WA_ACTIVE, WA_CLICKACTIVE,
+    WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 // Command ids. The original numbers are kept so `tray.rs` / `app.rs` dispatch
@@ -45,19 +61,6 @@ pub(crate) const ID_SETTINGS: u32 = 4;
 pub(crate) const ID_CLOSE_ALL: u32 = 5;
 pub(crate) const ID_EXIT: u32 = 9;
 
-// Layout in logical (96-DPI) pixels, expressed in multiples of the theme's
-// body font size so the menu follows `Theme.font_size`. The ratios are those
-// of the previous 16px-based layout: 46/13/40 tall rows, 20px side padding.
-const CARD_W: f32 = 290.0;
-const ROW_EM: f32 = 2.875;
-const SEP_EM: f32 = 0.8125;
-const VERSION_EM: f32 = 2.5;
-const PAD_EM: f32 = 1.25;
-const ICON_BOX_EM: f32 = 1.125;
-const ICON_GAP_EM: f32 = 0.875;
-const TEXT_GAP_EM: f32 = 1.0;
-const SEP_INSET_EM: f32 = 1.0;
-
 /// Left-hand line icons. `TOOLBAR_ICONS` / `assets.rs` are SVG paths consumed
 /// by GPUI, not GDI bitmaps, so the menu draws its own outline icons instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +71,6 @@ pub enum MenuIcon {
     Copy,
     Close,
     Gear,
-    Check,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +139,76 @@ pub fn build(region: &str, fullscreen: &str, copy_only: &str, pin_count: usize) 
     ]
 }
 
+// ---- compact metrics -------------------------------------------------------
+//
+// Logical (96-DPI) pixels, matching the reference card: 14px text, 40px rows,
+// 15px side padding, 11px separator inset, 16px icons. `Metrics` is pure so
+// the values can be unit-tested; [`scaled`] applies the monitor DPI at paint
+// and hit-test time exactly once, the way the old owner-draw menu did.
+
+#[derive(Clone, Copy, Debug)]
+struct Metrics {
+    font: f32,
+    card_w: f32,
+    row_h: f32,
+    sep_h: f32,
+    version_h: f32,
+    pad: f32,
+    pad_y: f32,
+    icon_box: f32,
+    icon_gap: f32,
+    text_gap: f32,
+    sep_inset: f32,
+    radius: f32,
+}
+
+impl Metrics {
+    /// The theme body size is 16px; the menu is deliberately a step smaller.
+    /// The clamp keeps the card compact if the user picks a larger body font.
+    fn from_font(theme_font: f32) -> Self {
+        Self {
+            font: (theme_font - 2.0).clamp(12.0, 14.0),
+            card_w: 272.0,
+            row_h: 40.0,
+            sep_h: 10.0,
+            version_h: 34.0,
+            pad: 15.0,
+            pad_y: 6.0,
+            icon_box: 16.0,
+            icon_gap: 10.0,
+            text_gap: 10.0,
+            sep_inset: 11.0,
+            radius: 10.0,
+        }
+    }
+
+    fn from_theme() -> Self {
+        Self::from_font(crate::overlay::theme::font_size().into())
+    }
+
+    fn kind_height(&self, kind: MenuKind) -> f32 {
+        match kind {
+            MenuKind::Action => self.row_h,
+            MenuKind::Separator => self.sep_h,
+            MenuKind::Disabled => self.version_h,
+        }
+    }
+
+    /// Full card height: every row plus the top/bottom inner padding.
+    fn height(&self, items: &[MenuItem]) -> f32 {
+        self.pad_y * 2.0 + items.iter().map(|it| self.kind_height(it.kind)).sum::<f32>()
+    }
+}
+
+/// Rounds one logical length to physical pixels for the current monitor.
+fn scaled(value: f32, scale: f32) -> i32 {
+    (value * scale).round() as i32
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 // ---- semantic colours -----------------------------------------------------
 
 #[derive(Clone, Copy)]
@@ -169,54 +241,43 @@ fn menu_colors() -> MenuColors {
     }
 }
 
-/// Logical metrics derived once per menu from the theme's font size.
-///
-/// Win32 expands the owner-draw item rects with these values; `scale` in
-/// [`ActiveMenu`] then applies the monitor DPI on top, exactly as before.
-#[derive(Clone, Copy)]
-struct Metrics {
-    font: f32,
-    row_h: f32,
-    sep_h: f32,
-    version_h: f32,
-    pad: f32,
-    icon_box: f32,
-    icon_gap: f32,
-    text_gap: f32,
-    sep_inset: f32,
-}
+// ---- live popup -----------------------------------------------------------
 
-impl Metrics {
-    fn from_theme() -> Self {
-        let font: f32 = crate::overlay::theme::font_size().into();
-        let font = font.max(1.0);
-        Self {
-            font,
-            row_h: ROW_EM * font,
-            sep_h: SEP_EM * font,
-            version_h: VERSION_EM * font,
-            pad: PAD_EM * font,
-            icon_box: ICON_BOX_EM * font,
-            icon_gap: ICON_GAP_EM * font,
-            text_gap: TEXT_GAP_EM * font,
-            sep_inset: SEP_INSET_EM * font,
-        }
-    }
-}
-
-// ---- live menu state ------------------------------------------------------
-
-struct ActiveMenu {
+/// Everything the popup needs while it is on screen. Stored behind
+/// `GWLP_USERDATA` so the window procedure can reach it without a thread-local
+/// borrow that a re-entrant message would panic on.
+struct PopupState {
     items: Vec<MenuItem>,
     colors: MenuColors,
     metrics: Metrics,
     scale: f32,
     font: HFONT,
-    bg_brush: HBRUSH,
+    hover: Option<usize>,
+    chosen: Option<u32>,
+    activated: bool,
+    leave_tracked: bool,
+    closing: bool,
 }
 
-thread_local! {
-    static ACTIVE: RefCell<Option<ActiveMenu>> = const { RefCell::new(None) };
+const POPUP_CLASS: &str = "FastPinTrayPopup";
+
+fn register_class() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        let name = wide(POPUP_CLASS);
+        let wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            // DROPSHADOW is the fallback outline on Windows 10; Windows 11
+            // rounds the window through DWM and keeps the system shadow.
+            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
+            lpfnWndProc: Some(popup_proc),
+            hInstance: GetModuleHandleW(None).ok().map(Into::into).unwrap_or_default(),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            lpszClassName: PCWSTR(name.as_ptr()),
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&wc);
+    });
 }
 
 fn make_font(font_px: f32) -> HFONT {
@@ -242,224 +303,503 @@ fn make_font(font_px: f32) -> HFONT {
     }
 }
 
-/// Shows the owner-drawn card menu at the cursor and returns the chosen
-/// command id (None when dismissed). The `TrackPopupMenu` flags, owner window
-/// and `TPM_RETURNCMD` are byte-for-byte the previous native menu's.
-pub(crate) fn track(hwnd: HWND, items: Vec<MenuItem>) -> Option<u32> {
+/// Monitor DPI under the cursor, so a tray on a scaled display still draws a
+/// card of the size the reference shows. Falls back to the tray window's DPI
+/// when `GetDpiForMonitor` is unavailable.
+fn dpi_scale(hwnd: HWND, pt: POINT) -> f32 {
     unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        let colors = menu_colors();
-        let metrics = Metrics::from_theme();
-        let scale = {
-            let dpi = GetDpiForWindow(hwnd);
-            if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
-        };
-        let font = make_font(metrics.font * scale);
-        let bg_brush = CreateSolidBrush(COLORREF(colors.bg));
+        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut dx = 96u32;
+        let mut dy = 96u32;
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy).is_ok() && dx > 0 {
+            return dx as f32 / 96.0;
+        }
+        let dpi = GetDpiForWindow(hwnd);
+        if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
+    }
+}
 
-        ACTIVE.with(|cell| {
-            *cell.borrow_mut() = Some(ActiveMenu {
-                items,
-                colors,
-                metrics,
-                scale,
-                font,
-                bg_brush,
-            });
-        });
-
-        // Cover the menu window's own margin with the card colour (owner-draw
-        // items only own their rows). The brush must live until DestroyMenu.
-        let info = MENUINFO {
-            cbSize: std::mem::size_of::<MENUINFO>() as u32,
-            fMask: MIM_BACKGROUND,
-            hbrBack: bg_brush,
+/// Cursor position clamped into the monitor work area, flipping left/up when
+/// the card would run past the right/bottom edge (the tray lives there).
+fn place(pt: POINT, w: i32, h: i32) -> (i32, i32) {
+    unsafe {
+        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        let _ = SetMenuInfo(menu, &info);
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let work = info.rcWork;
+            let mut x = if pt.x + w > work.right { work.right - w } else { pt.x };
+            let mut y = if pt.y + h > work.bottom { pt.y - h } else { pt.y };
+            x = x.max(work.left);
+            y = y.max(work.top);
+            return (x, y);
+        }
+    }
+    (pt.x, pt.y)
+}
 
-        ACTIVE.with(|cell| {
-            let guard = cell.borrow();
-            let active = guard.as_ref().unwrap();
-            for (index, it) in active.items.iter().enumerate() {
-                let mii = MENUITEMINFOW {
-                    cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-                    fMask: MIIM_FTYPE | MIIM_ID | MIIM_DATA | MIIM_STATE,
-                    fType: MFT_OWNERDRAW,
-                    // Separators and the version row are display-only: disabled
-                    // so they cannot be hovered, selected or clicked.
-                    fState: if it.kind == MenuKind::Action {
-                        MENU_ITEM_STATE(0)
-                    } else {
-                        MFS_DISABLED
-                    },
-                    wID: it.id,
-                    dwItemData: index,
-                    ..Default::default()
-                };
-                let _ = InsertMenuItemW(menu, index as u32, true, &mii);
-            }
-        });
+/// Real rounded corners: DWM on Windows 11, a rounded region elsewhere.
+unsafe fn apply_rounding(hwnd: HWND, w: i32, h: i32, scale: f32) {
+    let preference: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND;
+    let rounded = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_WINDOW_CORNER_PREFERENCE,
+        &preference as *const _ as _,
+        size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+    )
+    .is_ok();
 
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let _ = SetForegroundWindow(hwnd);
-        let cmd = TrackPopupMenu(
-            menu,
-            TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
-            pt.x,
-            pt.y,
-            Some(0),
+    if rounded {
+        // A one-pixel extended frame is what asks DWM for the system drop
+        // shadow (and lets it clip the card's rounded corners); the hairline
+        // visible in the reference is painted by us instead.
+        let margins = MARGINS {
+            cxLeftWidth: 1,
+            cxRightWidth: 1,
+            cyTopHeight: 1,
+            cyBottomHeight: 1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        let none = DWMWA_COLOR_NONE;
+        let _ = DwmSetWindowAttribute(
             hwnd,
-            None,
+            DWMWA_BORDER_COLOR,
+            &none as *const _ as _,
+            size_of::<u32>() as u32,
         );
-        let _ = DestroyMenu(menu);
-
-        ACTIVE.with(|cell| {
-            if let Some(active) = cell.borrow_mut().take() {
-                let _ = DeleteObject(active.font.into());
-                let _ = DeleteObject(active.bg_brush.into());
-            }
-        });
-
-        let cmd = cmd.0 as u32;
-        (cmd != 0).then_some(cmd)
-    }
-}
-
-// ---- owner-draw message handlers ------------------------------------------
-
-pub(crate) fn on_measure_item(lparam: LPARAM) -> LRESULT {
-    unsafe {
-        let m = &mut *(lparam.0 as *mut MEASUREITEMSTRUCT);
-        if m.CtlType.0 != ODT_MENU.0 {
-            return LRESULT(0);
-        }
-        let handled = ACTIVE.with(|cell| {
-            let guard = cell.borrow();
-            let Some(active) = guard.as_ref() else {
-                return false;
-            };
-            let Some(it) = active.items.get(m.itemData) else {
-                return false;
-            };
-            m.itemWidth = (CARD_W * active.scale).round() as u32;
-            let mtr = active.metrics;
-            m.itemHeight = ((match it.kind {
-                MenuKind::Action => mtr.row_h,
-                MenuKind::Separator => mtr.sep_h,
-                MenuKind::Disabled => mtr.version_h,
-            }) * active.scale)
-                .round() as u32;
-            true
-        });
-        LRESULT(handled as isize)
-    }
-}
-
-pub(crate) fn on_draw_item(lparam: LPARAM) -> LRESULT {
-    unsafe {
-        let d = &*(lparam.0 as *const DRAWITEMSTRUCT);
-        if d.CtlType.0 != ODT_MENU.0 {
-            return LRESULT(0);
-        }
-        let handled = ACTIVE.with(|cell| {
-            let guard = cell.borrow();
-            let Some(active) = guard.as_ref() else {
-                return false;
-            };
-            let Some(it) = active.items.get(d.itemData) else {
-                return false;
-            };
-            draw_item(d, it, active);
-            true
-        });
-        LRESULT(handled as isize)
-    }
-}
-
-unsafe fn draw_item(d: &DRAWITEMSTRUCT, it: &MenuItem, active: &ActiveMenu) {
-    let hdc = d.hDC;
-    let rc = d.rcItem;
-    let s = active.scale;
-    let c = &active.colors;
-    let m = active.metrics;
-    let state = d.itemState.0;
-
-    let selected = state & ODS_SELECTED.0 != 0;
-    let disabled = it.kind == MenuKind::Disabled || state & (ODS_DISABLED.0 | ODS_GRAYED.0) != 0;
-    let checked = state & ODS_CHECKED.0 != 0;
-
-    // Background / hover wash.
-    let bg = if selected && !disabled { c.hover } else { c.bg };
-    let brush = CreateSolidBrush(COLORREF(bg));
-    let _ = FillRect(hdc, &rc, brush);
-    let _ = DeleteObject(brush.into());
-
-    if it.kind == MenuKind::Separator {
-        let inset = (m.sep_inset * s).round() as i32;
-        let y = (rc.top + rc.bottom) / 2;
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(c.separator));
-        let old_pen = SelectObject(hdc, pen.into());
-        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        let _ = MoveToEx(hdc, rc.left + inset, y, None);
-        let _ = LineTo(hdc, rc.right - inset, y);
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
-        let _ = DeleteObject(pen.into());
         return;
     }
 
-    let old_font = SelectObject(hdc, active.font.into());
-    let _ = SetBkMode(hdc, TRANSPARENT);
-    let _ = SetTextColor(hdc, COLORREF(if disabled { c.disabled } else { c.text }));
+    let radius = (10.0 * scale).round() as i32;
+    let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2);
+    if !region.is_invalid() && SetWindowRgn(hwnd, Some(region), true) == 0 {
+        let _ = DeleteObject(region.into());
+    }
+}
 
-    let pad = (m.pad * s).round() as i32;
-    let icon_box = (m.icon_box * s).round() as i32;
-    let icon_gap = (m.icon_gap * s).round() as i32;
-    let text_gap = (m.text_gap * s).round() as i32;
+/// Shows the compact card at the cursor and returns the chosen command id
+/// (None when dismissed). The popup runs its own message loop, so this still
+/// returns synchronously, exactly like the previous `TrackPopupMenu` call.
+pub(crate) fn track(hwnd: HWND, items: Vec<MenuItem>) -> Option<u32> {
+    if items.is_empty() {
+        return None;
+    }
+    register_class();
 
-    if !disabled {
-        let ix = rc.left + pad;
-        let iy = rc.top + ((rc.bottom - rc.top) - icon_box) / 2;
-        let b = IconBox { l: ix, t: iy, sz: icon_box };
-        let icon = if checked { MenuIcon::Check } else { it.icon };
-        if icon != MenuIcon::None {
-            draw_icon(hdc, icon, &b, COLORREF(c.text));
+    let metrics = Metrics::from_theme();
+    let colors = menu_colors();
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    let scale = dpi_scale(hwnd, pt);
+    let font = make_font(metrics.font * scale);
+
+    let w = scaled(metrics.card_w, scale);
+    let h = scaled(metrics.height(&items), scale);
+    let (x, y) = place(pt, w, h);
+
+    let class = wide(POPUP_CLASS);
+    let title = wide("");
+    let popup = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            PCWSTR(class.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            WS_POPUP,
+            x,
+            y,
+            w,
+            h,
+            None,
+            None,
+            GetModuleHandleW(None).ok().map(Into::into),
+            None,
+        )
+    };
+    let Ok(popup) = popup else {
+        unsafe {
+            let _ = DeleteObject(font.into());
+        }
+        return None;
+    };
+
+    let state = Box::into_raw(Box::new(PopupState {
+        items,
+        colors,
+        metrics,
+        scale,
+        font,
+        hover: None,
+        chosen: None,
+        activated: false,
+        leave_tracked: false,
+        closing: false,
+    }));
+
+    unsafe {
+        SetWindowLongPtrW(popup, GWLP_USERDATA, state as isize);
+        apply_rounding(popup, w, h, scale);
+        let _ = ShowWindow(popup, SW_SHOW);
+        let _ = SetForegroundWindow(popup);
+        let _ = SetFocus(Some(popup));
+        // Capture guarantees the first click anywhere reaches us even when the
+        // foreground lock refuses `SetForegroundWindow` from a tray click.
+        let _ = SetCapture(popup);
+        let _ = UpdateWindow(popup);
+    }
+
+    let mut msg = MSG::default();
+    loop {
+        let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        if ret.0 == 0 {
+            // Preserve a quit request for the application's own loop.
+            unsafe { PostQuitMessage(msg.wParam.0 as i32) };
+            break;
+        }
+        if ret.0 == -1 {
+            break;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if !unsafe { IsWindow(Some(popup)).as_bool() } {
+            break;
         }
     }
 
-    let label_left = rc.left + pad + icon_box + icon_gap;
-
-    // Measure the right-aligned column so a long label never overlaps it.
-    let mut sw = 0i32;
-    if !it.shortcut.is_empty() {
-        let mut probe: Vec<u16> = it.shortcut.encode_utf16().collect();
-        let mut calc = RECT::default();
-        let _ = DrawTextW(hdc, &mut probe, &mut calc, DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT);
-        sw = calc.right - calc.left;
+    unsafe {
+        let _ = ReleaseCapture();
+        if IsWindow(Some(popup)).as_bool() {
+            let _ = DestroyWindow(popup);
+        }
+        let state = Box::from_raw(state);
+        let chosen = state.chosen;
+        let _ = DeleteObject(state.font.into());
+        chosen
     }
-    let label_right = rc.right - pad - sw - if sw > 0 { text_gap } else { 0 };
+}
 
-    if !it.label.is_empty() {
-        let mut text: Vec<u16> = it.label.encode_utf16().collect();
-        let mut r = RECT { left: label_left, top: rc.top, right: label_right, bottom: rc.bottom };
-        let _ = DrawTextW(hdc, &mut text, &mut r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+// ---- window procedure -----------------------------------------------------
+
+unsafe extern "system" fn popup_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PopupState;
+    let Some(state) = ptr.as_mut() else {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    };
+
+    match msg {
+        WM_PAINT => {
+            paint(hwnd, state);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_MOUSEMOVE => {
+            track_leave(hwnd, state);
+            let (x, y) = mouse_xy(lparam);
+            let hit = state.hit_test(x, y);
+            if hit != state.hover {
+                state.hover = hit;
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            state.leave_tracked = false;
+            if state.hover.take().is_some() {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = mouse_xy(lparam);
+            if let Some(index) = state.hit_test(x, y) {
+                state.chosen = Some(state.items[index].id);
+            }
+            close(hwnd, state);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN | WM_RBUTTONUP => {
+            // A click outside the card (capture still delivers it) dismisses;
+            // a press on a separator or the disabled version row does nothing.
+            let (_, y) = mouse_xy(lparam);
+            if msg == WM_RBUTTONUP || !state.inside(y) {
+                close(hwnd, state);
+            }
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            match wparam.0 as u32 & 0xFFFF {
+                // Ignore the initial inactive notification Windows sends while
+                // the window is being shown; only a real deactivation closes.
+                WA_INACTIVE => {
+                    if state.activated {
+                        close(hwnd, state);
+                    }
+                }
+                WA_ACTIVE | WA_CLICKACTIVE => state.activated = true,
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            // Another window took the mouse (clicked elsewhere): dismiss.
+            let gained = HWND(lparam.0 as *mut core::ffi::c_void);
+            if state.activated && gained != hwnd {
+                close(hwnd, state);
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            match wparam.0 as u32 {
+                v if v == VK_ESCAPE.0 as u32 => close(hwnd, state),
+                v if v == VK_DOWN.0 as u32 => {
+                    state.hover = state.next_action(state.hover, 1);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                v if v == VK_UP.0 as u32 => {
+                    state.hover = state.next_action(state.hover, -1);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                v if v == VK_RETURN.0 as u32 => {
+                    if let Some(index) = state.hover {
+                        state.chosen = Some(state.items[index].id);
+                        close(hwnd, state);
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn close(hwnd: HWND, state: &mut PopupState) {
+    if state.closing {
+        return;
+    }
+    state.closing = true;
+    let _ = ReleaseCapture();
+    let _ = DestroyWindow(hwnd);
+}
+
+fn mouse_xy(lparam: LPARAM) -> (i32, i32) {
+    let x = (lparam.0 & 0xFFFF) as u16 as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+    (x, y)
+}
+
+fn track_leave(hwnd: HWND, state: &mut PopupState) {
+    if state.leave_tracked {
+        return;
+    }
+    let mut tme = TRACKMOUSEEVENT {
+        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    if unsafe { TrackMouseEvent(&mut tme) }.is_ok() {
+        state.leave_tracked = true;
+    }
+}
+
+impl PopupState {
+    /// Row under the cursor, only for actionable rows. Padding, separators and
+    /// the disabled version row are not clickable.
+    fn hit_test(&self, _x: i32, y: i32) -> Option<usize> {
+        let mut top = scaled(self.metrics.pad_y, self.scale);
+        for (index, item) in self.items.iter().enumerate() {
+            let height = scaled(self.metrics.kind_height(item.kind), self.scale);
+            if y >= top && y < top + height {
+                return (item.kind == MenuKind::Action).then_some(index);
+            }
+            top += height;
+        }
+        None
     }
 
-    if !it.shortcut.is_empty() {
-        let _ = SetTextColor(hdc, COLORREF(c.shortcut));
-        let mut text: Vec<u16> = it.shortcut.encode_utf16().collect();
-        let mut r = RECT {
-            left: rc.right - pad - sw,
-            top: rc.top,
-            right: rc.right - pad,
-            bottom: rc.bottom,
+    /// True anywhere inside the card's painted rows (padding included), so a
+    /// press on a separator or the disabled version row is not a dismissal.
+    fn inside(&self, y: i32) -> bool {
+        let pad = scaled(self.metrics.pad_y, self.scale);
+        y >= pad && y < scaled(self.metrics.height(&self.items), self.scale) - pad
+    }
+
+    /// Next actionable row in `direction`, wrapping — for Up/Down.
+    fn next_action(&self, from: Option<usize>, direction: i32) -> Option<usize> {
+        let actions: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.kind == MenuKind::Action)
+            .map(|(index, _)| index)
+            .collect();
+        if actions.is_empty() {
+            return None;
+        }
+        let current = from.and_then(|index| actions.iter().position(|a| *a == index));
+        let next = match (current, direction.is_positive()) {
+            (None, true) => 0,
+            (None, false) => actions.len() - 1,
+            (Some(pos), true) => (pos + 1) % actions.len(),
+            (Some(pos), false) => (pos + actions.len() - 1) % actions.len(),
         };
-        let _ = DrawTextW(hdc, &mut text, &mut r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        Some(actions[next])
+    }
+}
+
+// ---- painting -------------------------------------------------------------
+
+unsafe fn paint(hwnd: HWND, state: &PopupState) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let s = state.scale;
+    let m = state.metrics;
+    let c = state.colors;
+
+    // Card fill. Corners are clipped by DWM or the window region, so a plain
+    // fill is enough; the hairline border is drawn on top.
+    let brush = CreateSolidBrush(COLORREF(c.bg));
+    let _ = FillRect(hdc, &rc, brush);
+    let _ = DeleteObject(brush.into());
+
+    let radius = scaled(m.radius, s);
+    let border = CreatePen(PS_SOLID, 1, COLORREF(c.separator));
+    let old_pen = SelectObject(hdc, border.into());
+    let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    // RECT's right/bottom are exclusive, so stop one pixel short or the
+    // right/bottom hairline falls outside the client area.
+    let _ = RoundRect(hdc, 0, 0, rc.right - 1, rc.bottom - 1, radius * 2, radius * 2);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(border.into());
+
+    let old_font = SelectObject(hdc, state.font.into());
+    let _ = SetBkMode(hdc, TRANSPARENT);
+
+    let pad = scaled(m.pad, s);
+    let icon_box = scaled(m.icon_box, s);
+    let icon_gap = scaled(m.icon_gap, s);
+    let text_gap = scaled(m.text_gap, s);
+
+    let mut top = scaled(m.pad_y, s);
+    for (index, item) in state.items.iter().enumerate() {
+        let height = scaled(m.kind_height(item.kind), s);
+        let row = RECT {
+            left: 0,
+            top,
+            right: rc.right,
+            bottom: top + height,
+        };
+
+        if item.kind == MenuKind::Separator {
+            let inset = scaled(m.sep_inset, s);
+            let y = (row.top + row.bottom) / 2;
+            let pen = CreatePen(PS_SOLID, 1, COLORREF(c.separator));
+            let old_pen = SelectObject(hdc, pen.into());
+            let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            let _ = MoveToEx(hdc, inset, y, None);
+            let _ = LineTo(hdc, rc.right - inset, y);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(pen.into());
+            top += height;
+            continue;
+        }
+
+        let disabled = item.kind == MenuKind::Disabled;
+        if state.hover == Some(index) && !disabled {
+            let hover = CreateSolidBrush(COLORREF(c.hover));
+            let inset = scaled(6.0, s);
+            let mut r = row;
+            r.left += inset;
+            r.right -= inset;
+            let _ = FillRect(hdc, &r, hover);
+            let _ = DeleteObject(hover.into());
+        }
+
+        let _ = SetTextColor(hdc, COLORREF(if disabled { c.disabled } else { c.text }));
+
+        let icon_left = pad;
+        if !disabled {
+            let iy = row.top + (height - icon_box) / 2;
+            let b = IconBox {
+                l: icon_left,
+                t: iy,
+                sz: icon_box,
+            };
+            if item.icon != MenuIcon::None {
+                draw_icon(hdc, item.icon, &b, COLORREF(c.text));
+            }
+        }
+
+        let label_left = pad + icon_box + icon_gap;
+
+        // Measure the right-aligned column so a long label never overlaps it.
+        let mut shortcut_w = 0i32;
+        if !item.shortcut.is_empty() {
+            let mut probe: Vec<u16> = item.shortcut.encode_utf16().collect();
+            let mut calc = RECT::default();
+            let _ = DrawTextW(
+                hdc,
+                &mut probe,
+                &mut calc,
+                DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT,
+            );
+            shortcut_w = calc.right - calc.left;
+        }
+        let label_right = rc.right - pad - shortcut_w - if shortcut_w > 0 { text_gap } else { 0 };
+
+        if !item.label.is_empty() {
+            let mut text: Vec<u16> = item.label.encode_utf16().collect();
+            let mut r = RECT {
+                left: label_left,
+                top: row.top,
+                right: label_right,
+                bottom: row.bottom,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut text,
+                &mut r,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+
+        if !item.shortcut.is_empty() {
+            let _ = SetTextColor(hdc, COLORREF(c.shortcut));
+            let mut text: Vec<u16> = item.shortcut.encode_utf16().collect();
+            let mut r = RECT {
+                left: rc.right - pad - shortcut_w,
+                top: row.top,
+                right: rc.right - pad,
+                bottom: row.bottom,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut text,
+                &mut r,
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+
+        top += height;
     }
 
     SelectObject(hdc, old_font);
+    let _ = EndPaint(hwnd, &ps);
 }
 
 // ---- outline icons --------------------------------------------------------
@@ -481,15 +821,14 @@ impl IconBox {
         let _ = MoveToEx(hdc, self.x(x1), self.y(y1), None);
         let _ = LineTo(hdc, self.x(x2), self.y(y2));
     }
-    unsafe fn poly(&self, hdc: HDC, pts: &[(f32, f32)]) {
-        let v: Vec<POINT> = pts
-            .iter()
-            .map(|(x, y)| POINT { x: self.x(*x), y: self.y(*y) })
-            .collect();
-        let _ = Polyline(hdc, &v);
-    }
     unsafe fn circle(&self, hdc: HDC, cx: f32, cy: f32, r: f32) {
-        let _ = Ellipse(hdc, self.x(cx - r), self.y(cy - r), self.x(cx + r), self.y(cy + r));
+        let _ = Ellipse(
+            hdc,
+            self.x(cx - r),
+            self.y(cy - r),
+            self.x(cx + r),
+            self.y(cy + r),
+        );
     }
     unsafe fn rect(&self, hdc: HDC, x1: f32, y1: f32, x2: f32, y2: f32) {
         let _ = Rectangle(hdc, self.x(x1), self.y(y1), self.x(x2), self.y(y2));
@@ -537,11 +876,7 @@ unsafe fn draw_icon(hdc: HDC, icon: MenuIcon, b: &IconBox, ink: COLORREF) {
                 );
             }
         }
-        MenuIcon::Check => {
-            b.poly(hdc, &[(4.0, 12.0), (9.5, 17.5), (20.0, 5.0)]);
-        }
     }
-
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(pen.into());
@@ -554,7 +889,11 @@ mod tests {
     #[test]
     fn tray_menu_spec_keeps_action_order_separators_and_disabled_version() {
         let items = build("Ctrl+Alt+A", "PrtSc", "Ctrl+Alt+W", 0);
-        assert_eq!(items.len(), 10, "4 actions + sep + settings + sep + exit + sep + version");
+        assert_eq!(
+            items.len(),
+            10,
+            "4 actions + sep + settings + sep + exit + sep + version"
+        );
 
         let ids: Vec<u32> = items.iter().map(|i| i.id).collect();
         assert_eq!(
@@ -596,5 +935,40 @@ mod tests {
         assert!(items[..4].iter().all(|i| i.icon != MenuIcon::None));
         assert_eq!(items[5].icon, MenuIcon::Gear);
         assert_eq!(items[7].icon, MenuIcon::Close);
+    }
+
+    /// The reference card is compact: 14px text, 40px rows, 15px side padding
+    /// and 11px separator insets at 100% DPI. Every length must follow the
+    /// monitor scale, so a 150% display gets the same proportions.
+    #[test]
+    fn tray_menu_metrics_are_compact_and_scale_with_dpi() {
+        let m = Metrics::from_font(16.0);
+        assert_eq!(m.font, 14.0, "theme 16px minus 2, capped at 14");
+        assert_eq!(m.row_h, 40.0);
+        assert_eq!(m.version_h, 34.0);
+        assert_eq!(m.icon_box, 16.0);
+        assert_eq!(m.sep_inset, 11.0);
+        assert!(
+            (14.0..=16.0).contains(&m.pad),
+            "side padding stays in the reference's 14-16px band"
+        );
+
+        // Larger body fonts cannot inflate the card.
+        assert_eq!(Metrics::from_font(22.0).font, 14.0);
+        assert_eq!(Metrics::from_font(11.0).font, 12.0);
+
+        let items = build("a", "b", "c", 0);
+        assert_eq!(
+            m.height(&items),
+            40.0 * 6.0 + 10.0 * 3.0 + 34.0 + 12.0,
+            "six action rows, three separators, version row, 6px inner padding"
+        );
+
+        // One multiplication by the DPI scale, rounded to physical pixels.
+        assert_eq!(scaled(m.font, 1.5), 21);
+        assert_eq!(scaled(m.row_h, 1.5), 60);
+        assert_eq!(scaled(m.pad, 1.25), 19);
+        assert_eq!(scaled(m.sep_inset, 2.0), 22);
+        assert_eq!(scaled(m.card_w, 1.0), 272);
     }
 }

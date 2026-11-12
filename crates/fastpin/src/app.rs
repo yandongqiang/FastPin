@@ -22,9 +22,8 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    CS_HREDRAW, CS_VREDRAW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, WM_DESTROY, WM_DRAWITEM,
-    WM_HOTKEY, WM_MEASUREITEM, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_OVERLAPPED,
+    CS_HREDRAW, CS_VREDRAW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, WM_DESTROY, WM_HOTKEY,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 use crate::capture::{
@@ -835,14 +834,8 @@ unsafe extern "system" fn hidden_proc(
         }
         return LRESULT(0);
     }
-    // Owner-drawn tray menu: the hidden window is the TrackPopupMenu owner, so
-    // Windows sends these here during its modal loop.
-    if msg == WM_MEASUREITEM {
-        return crate::platform::tray_menu::on_measure_item(lparam);
-    }
-    if msg == WM_DRAWITEM {
-        return crate::platform::tray_menu::on_draw_item(lparam);
-    }
+    // Tray menu: the popup runs its own modal loop inside `handle_tray`, so
+    // there is no owner-draw traffic on the hidden window any more.
     if msg == taskbar_created_message() {
         let _ = add_tray_icon(hwnd);
         return LRESULT(0);

@@ -1,7 +1,7 @@
 //! Settings-window widgets. The metrics follow the Citepix settings window:
-//! a 200px pane with filled pills, a search bar across the content area, a
-//! page heading with a per-page reset button, and one rounded surface holding
-//! rows separated by hairlines.
+//! a 200px tinted pane with filled pills, a search field in the title bar, a
+//! one-line page heading with a per-page reset button, and one rounded surface
+//! holding rows separated by hairlines.
 //!
 //! Every widget returns a plain element and leaves the click handler to the
 //! caller, so the view keeps `cx.listener` and these stay view-agnostic.
@@ -29,19 +29,31 @@ pub fn page_bg() -> Hsla {
     crate::overlay::theme::muted()
 }
 
-/// The pane sits a step darker than the page; averaging the two neutral tokens
-/// keeps that relationship in both appearances.
-pub fn nav_bg() -> Hsla {
-    let page = crate::overlay::theme::muted();
-    let secondary = crate::overlay::theme::elevated_surface();
-    Hsla {
-        l: (page.l + secondary.l) / 2.0,
-        ..page
-    }
+/// Blends `t` of `accent` into `base`, so the pane and the cards pick up the
+/// reference's lavender tint without hardcoding a colour that would break the
+/// dark appearance.
+fn tint(base: Hsla, accent: Hsla, t: f32) -> Hsla {
+    let a: gpui::Rgba = base.into();
+    let b: gpui::Rgba = accent.into();
+    let lerp = |x: f32, y: f32| x + (y - x) * t;
+    Hsla::from(gpui::Rgba {
+        r: lerp(a.r, b.r),
+        g: lerp(a.g, b.g),
+        b: lerp(a.b, b.b),
+        a: 1.0,
+    })
 }
 
+/// The pane sits a step darker than the page and carries the accent tint the
+/// reference's left rail has.
+pub fn nav_bg() -> Hsla {
+    tint(crate::overlay::theme::muted(), accent(), 0.08)
+}
+
+/// Cards are a whisper of accent over the surface, matching the lavender
+/// panels in the reference while staying legible in dark mode.
 pub fn card_bg() -> Hsla {
-    crate::overlay::theme::surface_solid()
+    tint(crate::overlay::theme::surface_solid(), accent(), 0.04)
 }
 
 pub fn input_bg() -> Hsla {
@@ -92,7 +104,9 @@ fn icon(path: &'static str, size: f32, color: Hsla) -> Div {
 
 // ---- navigation ------------------------------------------------------------
 
-/// One entry of the left pane: 36 tall, filled light purple when selected.
+/// One entry of the left pane: 36 tall. The selected row takes the solid
+/// primary fill with on-accent icon and text, as the reference does; the rest
+/// stay in foreground ink over the tinted rail and only lighten on hover.
 pub fn nav_item(
     id: impl Into<ElementId>,
     icon_path: &'static str,
@@ -100,9 +114,9 @@ pub fn nav_item(
     selected: bool,
 ) -> Stateful<Div> {
     let fg = if selected {
-        accent()
+        crate::overlay::theme::on_accent()
     } else {
-        crate::overlay::theme::secondary_fg()
+        crate::overlay::theme::primary_fg()
     };
     div()
         .id(id)
@@ -116,29 +130,33 @@ pub fn nav_item(
         .items_center()
         .gap(px(10.))
         .cursor(CursorStyle::PointingHand)
-        .when(selected, |el| el.bg(accent_wash()))
+        .when(selected, |el| el.bg(accent()))
         .when(!selected, |el| el.hover(|s| s.bg(nav_hover())))
         .child(icon(icon_path, 16., fg))
         .child(
             div()
                 .text_size(px(13.))
-                .when(selected, |el| el.font_weight(FontWeight::MEDIUM))
-                .text_color(crate::overlay::theme::primary_fg())
+                .when(selected, |el| el.font_weight(FontWeight::SEMIBOLD))
+                .text_color(fg)
                 .child(text.into()),
         )
 }
 
 // ---- page chrome -----------------------------------------------------------
 
-/// Title (bold) plus the grey page description.
+/// Page title plus its grey description, on one baseline row as the reference
+/// puts them, so the heading reads as one line rather than a stacked block.
 pub fn page_heading(title: impl Into<SharedString>, desc: impl Into<SharedString>) -> Div {
     div()
         .flex()
-        .flex_col()
-        .gap(px(4.))
+        .flex_row()
+        .items_baseline()
+        .gap(px(14.))
+        .min_w(px(0.))
         .child(
             div()
-                .text_size(px(19.))
+                .flex_none()
+                .text_size(px(22.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(crate::overlay::theme::primary_fg())
                 .child(title.into()),
@@ -157,7 +175,7 @@ pub fn section() -> Div {
         .w_full()
         .flex()
         .flex_col()
-        .rounded(px(8.))
+        .rounded(px(10.))
         .bg(card_bg())
         .border_1()
         .border_color(crate::overlay::theme::border())
@@ -193,8 +211,8 @@ pub fn row(title: impl Into<SharedString>, desc: impl Into<SharedString>) -> Div
     div()
         .w_full()
         .min_h(px(ROW_MIN_H))
-        .px(px(16.))
-        .py(px(12.))
+        .px(px(20.))
+        .py(px(14.))
         .flex()
         .flex_row()
         .items_center()
@@ -207,8 +225,8 @@ pub fn row(title: impl Into<SharedString>, desc: impl Into<SharedString>) -> Div
 pub fn stack(title: impl Into<SharedString>, desc: impl Into<SharedString>) -> Div {
     div()
         .w_full()
-        .px(px(16.))
-        .py(px(12.))
+        .px(px(20.))
+        .py(px(14.))
         .flex()
         .flex_col()
         .gap(px(8.))
@@ -252,8 +270,8 @@ pub fn unsupported_row(title: impl Into<SharedString>, desc: impl Into<SharedStr
     div()
         .w_full()
         .min_h(px(ROW_MIN_H))
-        .px(px(16.))
-        .py(px(12.))
+        .px(px(20.))
+        .py(px(14.))
         .flex()
         .flex_row()
         .items_center()

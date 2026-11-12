@@ -1,6 +1,7 @@
-//! Settings window, laid out like the Citepix settings window: a 200px
-//! navigation pane with brand and a global reset, a search bar across the
-//! content area, and pages built from rounded row sections.
+//! Settings window, laid out like the Citepix settings window: one caption
+//! (logo + title + centred search) in the component title bar, a 200px
+//! navigation pane with a global reset, and pages built from rounded row
+//! sections.
 //!
 //! Only pages whose settings this build can actually honour carry controls;
 //! the rest say so in a disabled row instead of offering dead switches.
@@ -911,31 +912,46 @@ impl SettingsView {
     /// Caption drawn by the gpui-component `TitleBar`: the component owns the
     /// 34px height, the gradient and bottom hairline, the min/max/close
     /// controls, the `WindowControlArea` hit areas and `start_window_move`
-    /// dragging. Only the brand mark and the window title are app content.
+    /// dragging. The app content is the brand mark, the window title, and the
+    /// search field centred between them and the window buttons.
+    ///
+    /// This is the only place the product title is drawn; the left rail starts
+    /// with its navigation items.
     fn titlebar(&self) -> impl IntoElement {
-        gpui_kit::component::TitleBar::new().pl(px(14.)).child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(9.))
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(28.))
-                        .h(px(28.))
-                        .rounded(px(7.))
-                        .overflow_hidden()
-                        .child(logo_element(28.)),
-                )
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::primary_fg())
-                        .child(format!("{} 设置", crate::APP_NAME)),
-                ),
-        )
+        gpui_kit::component::TitleBar::new()
+            .pl(px(14.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(9.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(24.))
+                            .h(px(24.))
+                            .rounded(px(6.))
+                            .overflow_hidden()
+                            .child(logo_element(24.)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::primary_fg())
+                            .child(format!("{} 设置", crate::APP_NAME)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .items_center()
+                    .justify_center()
+                    .child(self.search_field()),
+            )
     }
 
     fn nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -953,46 +969,11 @@ impl SettingsView {
             .bg(widgets::nav_bg())
             .child(
                 div()
-                    .h(px(56.))
-                    .px(px(18.))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(28.))
-                            .h(px(28.))
-                            .rounded(px(7.))
-                            .overflow_hidden()
-                            .child(logo_element(28.)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::primary_fg())
-                                    .child(crate::APP_NAME),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(theme::secondary_fg())
-                                    .child("设置"),
-                            ),
-                    ),
-            )
-            .child(
-                div()
                     .id("settings-nav")
                     .flex_1()
                     .overflow_y_scroll()
-                    .py(px(6.))
+                    .pt(px(10.))
+                    .pb(px(6.))
                     .children(Page::ALL.map(|page| {
                         widgets::nav_item(
                             SharedString::from(format!("nav-{}", page.id())),
@@ -1024,37 +1005,33 @@ impl SettingsView {
             )
     }
 
-    fn search_bar(&self) -> impl IntoElement {
+    /// The global search input, drawn inside the title bar. `occlude` matters:
+    /// the title bar marks its whole strip as a drag area, and without it the
+    /// drag hitbox wins the OS hit test over the field, so clicks would move
+    /// the window instead of focusing the input.
+    fn search_field(&self) -> impl IntoElement {
         div()
-            .h(px(56.))
-            .px(px(24.))
-            .flex_none()
+            .occlude()
+            .w(px(480.))
+            .h(px(32.))
+            .px(px(10.))
             .flex()
+            .flex_row()
             .items_center()
+            .gap(px(8.))
+            .rounded(px(16.))
+            .bg(widgets::input_bg())
+            .border_1()
+            .border_color(theme::border())
             .child(
-                div()
-                    .w_full()
-                    .max_w(px(520.))
-                    .h(px(34.))
-                    .px(px(10.))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.))
-                    .rounded(px(8.))
-                    .bg(widgets::input_bg())
-                    .border_1()
-                    .border_color(theme::border())
-                    .child(
-                        gpui::svg()
-                            .path("settings/search.svg")
-                            .w(px(14.))
-                            .h(px(14.))
-                            .flex_none()
-                            .text_color(theme::secondary_fg()),
-                    )
-                    .child(div().flex_1().min_w(px(0.)).child(self.search.clone())),
+                gpui::svg()
+                    .path("settings/search.svg")
+                    .w(px(14.))
+                    .h(px(14.))
+                    .flex_none()
+                    .text_color(theme::secondary_fg()),
             )
+            .child(div().flex_1().min_w(px(0.)).child(self.search.clone()))
     }
 
     fn heading(
@@ -1072,8 +1049,8 @@ impl SettingsView {
             .items_start()
             .justify_between()
             .gap(px(16.))
-            .pt(px(8.))
-            .pb(px(14.))
+            .pt(px(20.))
+            .pb(px(16.))
             .child(widgets::page_heading(title, desc))
             .child(
                 div()
@@ -1860,7 +1837,6 @@ impl Render for SettingsView {
                             .h_full()
                             .flex()
                             .flex_col()
-                            .child(self.search_bar())
                             .child(
                                 div()
                                     .id("settings-page")
@@ -1896,6 +1872,47 @@ mod tests {
         let source = include_str!("mod.rs");
         assert!(source.contains("widgets::row(crate::APP_NAME"));
         assert!(source.contains("format!(\"{} 设置\", crate::APP_NAME)"));
+    }
+
+    /// The window title must be drawn once, in the component title bar. The
+    /// left rail used to repeat the logo, the product name and "设置" above
+    /// the navigation, which read as two captions for the same window.
+    #[test]
+    fn nav_pane_no_longer_repeats_the_brand_header() {
+        let source = include_str!("mod.rs");
+        let nav_start = source.find("fn nav(").expect("nav is defined");
+        let nav_end = source.find("fn search_field").expect("search_field follows nav");
+        let nav = &source[nav_start..nav_end];
+        assert!(
+            !nav.contains("crate::APP_NAME"),
+            "left rail must not draw the product name"
+        );
+        assert!(
+            !nav.contains("logo_element"),
+            "left rail must not repeat the brand mark"
+        );
+    }
+
+    /// The search field lives inside the title bar now; the content area no
+    /// longer spends a 56px row on it.
+    #[test]
+    fn search_field_is_embedded_in_the_title_bar() {
+        let source = include_str!("mod.rs");
+        let title_start = source.find("fn titlebar").expect("titlebar is defined");
+        let title_end = source.find("fn nav(").expect("nav follows titlebar");
+        let titlebar = &source[title_start..title_end];
+        assert!(
+            titlebar.contains("self.search_field()"),
+            "title bar must own the search field"
+        );
+        assert!(
+            !source.contains(concat!("fn search", "_bar")),
+            "the standalone search row was removed"
+        );
+        assert!(
+            titlebar.contains("format!(\"{} 设置\", crate::APP_NAME)"),
+            "the single window caption stays in the title bar"
+        );
     }
 
     #[test]

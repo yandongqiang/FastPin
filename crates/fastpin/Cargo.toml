@@ -14,7 +14,7 @@ name = "FastPin"
 path = "src/main.rs"
 
 [dependencies]
-gpui-kit = { version = "=0.8.0", default-features = false }
+gpui-kit = { version = "=0.8.0", default-features = false, features = ["component", "assets"] }
 raw-window-handle = "0.6"
 image = "0.25"
 oar-ocr = "0.9"

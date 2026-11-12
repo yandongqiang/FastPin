@@ -17,7 +17,7 @@ use std::time::Duration;
 use gpui::{
     deferred, div, img, prelude::*, px, size, App, Bounds, Context, CursorStyle, Entity, Focusable,
     FontWeight, ImageSource, MouseButton, RenderImage, SharedString, Subscription, Window,
-    WindowBounds, WindowControlArea, WindowHandle, WindowOptions,
+    WindowBounds, WindowHandle, WindowOptions,
 };
 
 use crate::config::Settings;
@@ -83,20 +83,19 @@ pub fn open(cx: &mut App) {
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            // No system caption: `titlebar: None` makes the Windows backend
-            // hide the OS titlebar (`hide_title_bar`), so the client covers the
-            // whole window and `SettingsView::titlebar` draws its own. Native
-            // dragging comes from the caption's WindowControlArea::Drag hitbox
-            // (WM_NCHITTEST -> HTCAPTION); the sizing frame is kept by
-            // is_resizable, and the minimum size is unchanged.
-            titlebar: None,
+            // The component title bar draws itself over the whole client area
+            // (`appears_transparent` hides the OS caption) and owns dragging
+            // through its own `WindowControlArea::Drag` plus
+            // `start_window_move`; the min/max/close controls are part of the
+            // component. The sizing frame is kept by `is_resizable`, and the
+            // minimum size is unchanged.
             focus: true,
             show: true,
             is_movable: true,
             is_resizable: true,
             is_minimizable: true,
             window_min_size: Some(size(px(860.), px(560.))),
-            ..Default::default()
+            ..gpui_kit::component::TitleBar::window_options()
         },
         |window, cx| cx.new(|cx| SettingsView::new(window, cx)),
     );
@@ -909,69 +908,34 @@ impl SettingsView {
 
     // ---- chrome ------------------------------------------------------------
 
-    /// Caption drawn in place of the system titlebar. The left region is the
-    /// drag handle; the buttons are ordinary client elements so their click
-    /// handlers still fire (a control-area hitbox would hand them to Windows).
-    fn titlebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut bar = div()
-            .flex_none()
-            .w_full()
-            .h(px(40.))
-            .flex()
-            .flex_row()
-            .items_center()
-            .pl(px(14.))
-            .pr(px(6.))
-            .bg(widgets::titlebar_bg())
-            .border_b_1()
-            .border_color(theme::border())
-            .child(
-                div()
-                    .id("settings-titlebar-drag")
-                    .flex_1()
-                    .h_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(9.))
-                    .window_control_area(WindowControlArea::Drag)
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(18.))
-                            .h(px(18.))
-                            .rounded(px(5.))
-                            .overflow_hidden()
-                            .child(logo_element(18.)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::primary_fg())
-                            .child(format!("{} 设置", crate::APP_NAME)),
-                    ),
-            );
-
-        for action in widgets::titlebar_actions(window.is_minimizable()) {
-            let id = match action {
-                widgets::TitlebarAction::Minimize => "settings-titlebar-min",
-                widgets::TitlebarAction::Close => "settings-titlebar-close",
-            };
-            let is_close = action == widgets::TitlebarAction::Close;
-            let button = widgets::titlebar_button(id, action).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |_, _, window: &mut Window, _| {
-                    if is_close {
-                        window.remove_window();
-                    } else {
-                        window.minimize_window();
-                    }
-                }),
-            );
-            bar = bar.child(button);
-        }
-        bar
+    /// Caption drawn by the gpui-component `TitleBar`: the component owns the
+    /// 34px height, the gradient and bottom hairline, the min/max/close
+    /// controls, the `WindowControlArea` hit areas and `start_window_move`
+    /// dragging. Only the brand mark and the window title are app content.
+    fn titlebar(&self) -> impl IntoElement {
+        gpui_kit::component::TitleBar::new().pl(px(14.)).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(9.))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(28.))
+                        .h(px(28.))
+                        .rounded(px(7.))
+                        .overflow_hidden()
+                        .child(logo_element(28.)),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::primary_fg())
+                        .child(format!("{} 设置", crate::APP_NAME)),
+                ),
+        )
     }
 
     fn nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1853,7 +1817,7 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).text().trim().to_string();
         let searching = !query.is_empty();
 
@@ -1882,7 +1846,7 @@ impl Render for SettingsView {
             .size_full()
             .bg(widgets::page_bg())
             .text_color(theme::primary_fg())
-            .child(self.titlebar(window, cx))
+            .child(self.titlebar())
             .child(
                 div()
                     .flex()
@@ -1922,16 +1886,6 @@ impl Render for SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn titlebar_buttons_keep_close_last_and_gate_minimize() {
-        use widgets::{titlebar_actions, TitlebarAction};
-        assert_eq!(
-            titlebar_actions(true),
-            vec![TitlebarAction::Minimize, TitlebarAction::Close]
-        );
-        assert_eq!(titlebar_actions(false), vec![TitlebarAction::Close]);
-    }
 
     #[test]
     fn about_page_names_the_product_fastpin() {

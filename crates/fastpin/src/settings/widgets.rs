@@ -48,12 +48,6 @@ pub fn input_bg() -> Hsla {
     crate::overlay::theme::input()
 }
 
-/// Caption strip of the borderless settings window: an opaque surface kept
-/// distinct from the page wash so the bottom hairline reads in both themes.
-pub fn titlebar_bg() -> Hsla {
-    crate::overlay::theme::surface_solid()
-}
-
 fn hover_bg() -> Hsla {
     crate::overlay::theme::elevated_surface()
 }
@@ -512,58 +506,7 @@ fn button_shell(id: impl Into<ElementId>) -> Stateful<Div> {
         .hover(|s| s.bg(hover_bg()))
 }
 
-// ---- custom titlebar -------------------------------------------------------
-
-/// Caption buttons, in left-to-right order.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TitlebarAction {
-    Minimize,
-    Close,
-}
-
-/// Which caption buttons to draw. Minimize only exists when the platform
-/// window reports itself minimizable; Close is always present and always last.
-pub fn titlebar_actions(minimizable: bool) -> Vec<TitlebarAction> {
-    let mut actions = Vec::with_capacity(2);
-    if minimizable {
-        actions.push(TitlebarAction::Minimize);
-    }
-    actions.push(TitlebarAction::Close);
-    actions
-}
-
-/// One caption button for the borderless settings window. All colours are
-/// semantic tokens, so the hover/pressed fills and the glyph stay legible in
-/// both the light and the dark appearance.
-pub fn titlebar_button(id: impl Into<ElementId>, action: TitlebarAction) -> Stateful<Div> {
-    let glyph = match action {
-        TitlebarAction::Minimize => div()
-            .w(px(10.))
-            .h(px(1.))
-            .bg(crate::overlay::theme::primary_fg())
-            .into_any_element(),
-        TitlebarAction::Close => svg()
-            .path("settings/close.svg")
-            .w(px(12.))
-            .h(px(12.))
-            .text_color(crate::overlay::theme::primary_fg())
-            .into_any_element(),
-    };
-    div()
-        .id(id)
-        .flex_none()
-        .w(px(40.))
-        .h(px(30.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(6.))
-        .text_color(crate::overlay::theme::primary_fg())
-        .cursor(CursorStyle::PointingHand)
-        .hover(|s| s.bg(crate::overlay::theme::elevated_surface()))
-        .active(|s| s.bg(crate::overlay::theme::active_background()))
-        .child(glyph)
-}
+// ---- dropdowns -------------------------------------------------------------
 
 /// The closed state of a dropdown: current value plus a chevron. `width` lets a
 /// short value sit beside its label instead of stretching the card.

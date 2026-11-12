@@ -8,7 +8,7 @@ use std::time::Duration;
 use gpui::{App, Application, QuitMode};
 
 fn gpui_app() -> Application {
-    gpui_kit::application().with_assets(crate::overlay::ToolbarAssets)
+    gpui_kit::application().with_assets(crate::overlay::AppAssets)
 }
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};

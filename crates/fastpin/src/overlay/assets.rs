@@ -205,3 +205,77 @@ impl AssetSource for ToolbarAssets {
         }
     }
 }
+
+/// The application's registered asset source.
+///
+/// `gpui-component` renders its `Icon`s from `icons/*.svg` in the bundled
+/// `gpui-kit-assets` bundle, while FastPin ships its own toolbar and settings
+/// SVGs in `ToolbarAssets`. This source asks the bundle first and falls back
+/// to the app assets, so both path spaces resolve without renaming either.
+pub struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        // The bundle reports a miss as `Err`, not `Ok(None)`; either way the
+        // app's own paths are the fallback.
+        if let Ok(Some(bytes)) = gpui_kit::assets::Assets.load(path) {
+            return Ok(Some(bytes));
+        }
+        ToolbarAssets.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        let mut names = gpui_kit::assets::Assets.list(path).unwrap_or_default();
+        names.extend(ToolbarAssets.list(path)?);
+        Ok(names)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::assets::IconName;
+
+    #[test]
+    fn app_assets_serve_both_bundles() {
+        // gpui-component's icons resolve through the kit bundle.
+        for name in [
+            IconName::Search,
+            IconName::WindowMinimize,
+            IconName::WindowMaximize,
+            IconName::WindowRestore,
+            IconName::WindowClose,
+        ] {
+            let icon = name.path();
+            assert!(
+                AppAssets.load(&icon).ok().flatten().is_some(),
+                "missing component icon {icon}"
+            );
+        }
+        // FastPin's own toolbar SVG still resolves through the fallback.
+        assert!(AppAssets
+            .load("toolbar/select.svg")
+            .ok()
+            .flatten()
+            .is_some());
+        assert!(AppAssets
+            .load("settings/close.svg")
+            .ok()
+            .flatten()
+            .is_some());
+    }
+
+    #[test]
+    fn app_assets_list_both_path_spaces() {
+        let icons = AppAssets.list("icons/").unwrap();
+        assert!(!icons.is_empty());
+        assert!(icons.iter().all(|p| p.starts_with("icons/")));
+        let toolbar = AppAssets.list("toolbar").unwrap();
+        assert_eq!(toolbar.len(), super::super::toolbar::TOOLBAR_ICONS.len());
+    }
+
+    #[test]
+    fn app_assets_miss_returns_none() {
+        assert!(AppAssets.load("no/such/asset.svg").ok().flatten().is_none());
+    }
+}

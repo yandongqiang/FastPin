@@ -8,7 +8,7 @@ pub(crate) mod text_raster;
 pub(crate) mod theme;
 pub(crate) mod toolbar;
 
-pub use assets::ToolbarAssets;
+pub use assets::{AppAssets, ToolbarAssets};
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;

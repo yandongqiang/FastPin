@@ -5,6 +5,7 @@ extern crate gpui_kit as gpui;
 
 pub mod app;
 pub mod black;
+pub mod brand_icon;
 pub mod capture;
 pub mod codec;
 pub mod config;

@@ -1,4 +1,9 @@
-//! Regenerates `assets/logo/fastpin.ico` from `assets/logo/fastpin.png`.
+//! Regenerates the transparent brand PNG and `assets/logo/fastpin.ico`.
+//!
+//! `fastpin.png` is RGB with a white card behind the glyph. An edge-seeded
+//! flood fill (`fastpin::brand_icon::clear_edge_white`) makes only that card
+//! transparent, keeping the glyph's own white highlights, and writes
+//! `fastpin-transparent.png`. The ICO is built from that transparent file.
 //!
 //! Multi-size ICO is written by hand because `image`'s ICO encoder stores a
 //! single frame. Sizes 16-128 use 32bpp BGRA BMP entries plus the AND mask
@@ -11,6 +16,7 @@
 
 use std::path::PathBuf;
 
+use fastpin::brand_icon::{clear_edge_white, WHITE_THRESHOLD};
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
@@ -20,9 +26,23 @@ const SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let src = root.join("assets/logo/fastpin.png");
+    let transparent = root.join("assets/logo/fastpin-transparent.png");
     let dst = root.join("assets/logo/fastpin.ico");
 
-    let source = image::open(&src).expect("open fastpin.png").to_rgba8();
+    let mut source = image::open(&src).expect("open fastpin.png").to_rgba8();
+    let cleared = clear_edge_white(&mut source, WHITE_THRESHOLD);
+    std::fs::write(&transparent, png_entry(&source)).expect("write fastpin-transparent.png");
+    println!(
+        "wrote {} ({} px cleared)",
+        transparent.display(),
+        cleared
+    );
+
+    // Read back the file the installer ships, so the ICO cannot diverge from
+    // the transparent PNG.
+    let source = image::open(&transparent)
+        .expect("open fastpin-transparent.png")
+        .to_rgba8();
     let entries: Vec<(u32, Vec<u8>)> = SIZES
         .iter()
         .map(|&size| {

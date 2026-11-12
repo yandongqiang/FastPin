@@ -45,17 +45,18 @@ pub(crate) const ID_SETTINGS: u32 = 4;
 pub(crate) const ID_CLOSE_ALL: u32 = 5;
 pub(crate) const ID_EXIT: u32 = 9;
 
-// Layout in logical (96-DPI) pixels, scaled by the monitor DPI in `track`.
+// Layout in logical (96-DPI) pixels, expressed in multiples of the theme's
+// body font size so the menu follows `Theme.font_size`. The ratios are those
+// of the previous 16px-based layout: 46/13/40 tall rows, 20px side padding.
 const CARD_W: f32 = 290.0;
-const ROW_H: f32 = 46.0;
-const SEP_H: f32 = 13.0;
-const VERSION_H: f32 = 40.0;
-const PAD_X: f32 = 20.0;
-const ICON_BOX: f32 = 18.0;
-const ICON_GAP: f32 = 14.0;
-const TEXT_GAP: f32 = 16.0;
-const SEP_INSET: f32 = 16.0;
-const FONT_PX: f32 = 15.0;
+const ROW_EM: f32 = 2.875;
+const SEP_EM: f32 = 0.8125;
+const VERSION_EM: f32 = 2.5;
+const PAD_EM: f32 = 1.25;
+const ICON_BOX_EM: f32 = 1.125;
+const ICON_GAP_EM: f32 = 0.875;
+const TEXT_GAP_EM: f32 = 1.0;
+const SEP_INSET_EM: f32 = 1.0;
 
 /// Left-hand line icons. `TOOLBAR_ICONS` / `assets.rs` are SVG paths consumed
 /// by GPUI, not GDI bitmaps, so the menu draws its own outline icons instead.
@@ -157,19 +158,49 @@ fn colorref(c: gpui::Hsla) -> u32 {
 }
 
 fn menu_colors() -> MenuColors {
-    use gpui::base::ColorTokens;
-    let tokens = if crate::config::get().dark() {
-        ColorTokens::dark()
-    } else {
-        ColorTokens::light()
-    };
+    use crate::overlay::theme;
     MenuColors {
-        bg: colorref(tokens.surface),
-        hover: colorref(tokens.secondary),
-        text: colorref(tokens.foreground),
-        shortcut: colorref(tokens.muted_foreground),
-        disabled: colorref(tokens.muted_foreground),
-        separator: colorref(tokens.border),
+        bg: colorref(theme::surface_solid()),
+        hover: colorref(theme::elevated_surface()),
+        text: colorref(theme::primary_fg()),
+        shortcut: colorref(theme::secondary_fg()),
+        disabled: colorref(theme::disabled_fg()),
+        separator: colorref(theme::border()),
+    }
+}
+
+/// Logical metrics derived once per menu from the theme's font size.
+///
+/// Win32 expands the owner-draw item rects with these values; `scale` in
+/// [`ActiveMenu`] then applies the monitor DPI on top, exactly as before.
+#[derive(Clone, Copy)]
+struct Metrics {
+    font: f32,
+    row_h: f32,
+    sep_h: f32,
+    version_h: f32,
+    pad: f32,
+    icon_box: f32,
+    icon_gap: f32,
+    text_gap: f32,
+    sep_inset: f32,
+}
+
+impl Metrics {
+    fn from_theme() -> Self {
+        let font: f32 = crate::overlay::theme::font_size().into();
+        let font = font.max(1.0);
+        Self {
+            font,
+            row_h: ROW_EM * font,
+            sep_h: SEP_EM * font,
+            version_h: VERSION_EM * font,
+            pad: PAD_EM * font,
+            icon_box: ICON_BOX_EM * font,
+            icon_gap: ICON_GAP_EM * font,
+            text_gap: TEXT_GAP_EM * font,
+            sep_inset: SEP_INSET_EM * font,
+        }
     }
 }
 
@@ -178,6 +209,7 @@ fn menu_colors() -> MenuColors {
 struct ActiveMenu {
     items: Vec<MenuItem>,
     colors: MenuColors,
+    metrics: Metrics,
     scale: f32,
     font: HFONT,
     bg_brush: HBRUSH,
@@ -187,8 +219,8 @@ thread_local! {
     static ACTIVE: RefCell<Option<ActiveMenu>> = const { RefCell::new(None) };
 }
 
-fn make_font(scale: f32) -> HFONT {
-    let height = -((FONT_PX * scale).round() as i32);
+fn make_font(font_px: f32) -> HFONT {
+    let height = -(font_px.round() as i32);
     let face: Vec<u16> = "Microsoft YaHei UI\0".encode_utf16().collect();
     unsafe {
         CreateFontW(
@@ -217,17 +249,19 @@ pub(crate) fn track(hwnd: HWND, items: Vec<MenuItem>) -> Option<u32> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         let colors = menu_colors();
+        let metrics = Metrics::from_theme();
         let scale = {
             let dpi = GetDpiForWindow(hwnd);
             if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
         };
-        let font = make_font(scale);
+        let font = make_font(metrics.font * scale);
         let bg_brush = CreateSolidBrush(COLORREF(colors.bg));
 
         ACTIVE.with(|cell| {
             *cell.borrow_mut() = Some(ActiveMenu {
                 items,
                 colors,
+                metrics,
                 scale,
                 font,
                 bg_brush,
@@ -310,10 +344,11 @@ pub(crate) fn on_measure_item(lparam: LPARAM) -> LRESULT {
                 return false;
             };
             m.itemWidth = (CARD_W * active.scale).round() as u32;
+            let mtr = active.metrics;
             m.itemHeight = ((match it.kind {
-                MenuKind::Action => ROW_H,
-                MenuKind::Separator => SEP_H,
-                MenuKind::Disabled => VERSION_H,
+                MenuKind::Action => mtr.row_h,
+                MenuKind::Separator => mtr.sep_h,
+                MenuKind::Disabled => mtr.version_h,
             }) * active.scale)
                 .round() as u32;
             true
@@ -348,6 +383,7 @@ unsafe fn draw_item(d: &DRAWITEMSTRUCT, it: &MenuItem, active: &ActiveMenu) {
     let rc = d.rcItem;
     let s = active.scale;
     let c = &active.colors;
+    let m = active.metrics;
     let state = d.itemState.0;
 
     let selected = state & ODS_SELECTED.0 != 0;
@@ -361,7 +397,7 @@ unsafe fn draw_item(d: &DRAWITEMSTRUCT, it: &MenuItem, active: &ActiveMenu) {
     let _ = DeleteObject(brush.into());
 
     if it.kind == MenuKind::Separator {
-        let inset = (SEP_INSET * s).round() as i32;
+        let inset = (m.sep_inset * s).round() as i32;
         let y = (rc.top + rc.bottom) / 2;
         let pen = CreatePen(PS_SOLID, 1, COLORREF(c.separator));
         let old_pen = SelectObject(hdc, pen.into());
@@ -378,10 +414,10 @@ unsafe fn draw_item(d: &DRAWITEMSTRUCT, it: &MenuItem, active: &ActiveMenu) {
     let _ = SetBkMode(hdc, TRANSPARENT);
     let _ = SetTextColor(hdc, COLORREF(if disabled { c.disabled } else { c.text }));
 
-    let pad = (PAD_X * s).round() as i32;
-    let icon_box = (ICON_BOX * s).round() as i32;
-    let icon_gap = (ICON_GAP * s).round() as i32;
-    let text_gap = (TEXT_GAP * s).round() as i32;
+    let pad = (m.pad * s).round() as i32;
+    let icon_box = (m.icon_box * s).round() as i32;
+    let icon_gap = (m.icon_gap * s).round() as i32;
+    let text_gap = (m.text_gap * s).round() as i32;
 
     if !disabled {
         let ix = rc.left + pad;

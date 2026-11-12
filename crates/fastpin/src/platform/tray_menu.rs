@@ -141,10 +141,10 @@ pub fn build(region: &str, fullscreen: &str, copy_only: &str, pin_count: usize) 
 
 // ---- compact metrics -------------------------------------------------------
 //
-// Logical (96-DPI) pixels, matching the reference card: 14px text, 40px rows,
-// 15px side padding, 11px separator inset, 16px icons. `Metrics` is pure so
-// the values can be unit-tested; [`scaled`] applies the monitor DPI at paint
-// and hit-test time exactly once, the way the old owner-draw menu did.
+// Logical (96-DPI) pixels: 12px text, 32px rows, 12px side padding, 9px
+// separator inset, 14px icons. `Metrics` is pure so the values can be
+// unit-tested; [`scaled`] applies the monitor DPI at paint and hit-test time
+// exactly once, the way the old owner-draw menu did.
 
 #[derive(Clone, Copy, Debug)]
 struct Metrics {
@@ -163,21 +163,22 @@ struct Metrics {
 }
 
 impl Metrics {
-    /// The theme body size is 16px; the menu is deliberately a step smaller.
-    /// The clamp keeps the card compact if the user picks a larger body font.
+    /// The theme body size is 16px; the menu runs four steps below it so the
+    /// card stays dense. The clamp keeps it in an 11-13px band: smaller than
+    /// 11px clips the CJK glyphs, larger than 13px stops being a menu.
     fn from_font(theme_font: f32) -> Self {
         Self {
-            font: (theme_font - 2.0).clamp(12.0, 14.0),
-            card_w: 272.0,
-            row_h: 40.0,
-            sep_h: 10.0,
-            version_h: 34.0,
-            pad: 15.0,
-            pad_y: 6.0,
-            icon_box: 16.0,
-            icon_gap: 10.0,
-            text_gap: 10.0,
-            sep_inset: 11.0,
+            font: (theme_font - 4.0).clamp(11.0, 13.0),
+            card_w: 240.0,
+            row_h: 32.0,
+            sep_h: 8.0,
+            version_h: 28.0,
+            pad: 12.0,
+            pad_y: 4.0,
+            icon_box: 14.0,
+            icon_gap: 8.0,
+            text_gap: 8.0,
+            sep_inset: 9.0,
             radius: 10.0,
         }
     }
@@ -937,38 +938,47 @@ mod tests {
         assert_eq!(items[7].icon, MenuIcon::Close);
     }
 
-    /// The reference card is compact: 14px text, 40px rows, 15px side padding
-    /// and 11px separator insets at 100% DPI. Every length must follow the
-    /// monitor scale, so a 150% display gets the same proportions.
+    /// The card is dense: 12px text, 32px rows, 12px side padding and 9px
+    /// separator insets at 100% DPI. Every length must follow the monitor
+    /// scale, so a 150% display gets the same proportions.
     #[test]
     fn tray_menu_metrics_are_compact_and_scale_with_dpi() {
         let m = Metrics::from_font(16.0);
-        assert_eq!(m.font, 14.0, "theme 16px minus 2, capped at 14");
-        assert_eq!(m.row_h, 40.0);
-        assert_eq!(m.version_h, 34.0);
-        assert_eq!(m.icon_box, 16.0);
-        assert_eq!(m.sep_inset, 11.0);
-        assert!(
-            (14.0..=16.0).contains(&m.pad),
-            "side padding stays in the reference's 14-16px band"
-        );
+        assert_eq!(m.font, 12.0, "theme 16px minus 4");
+        assert_eq!(m.row_h, 32.0);
+        assert_eq!(m.sep_h, 8.0);
+        assert_eq!(m.version_h, 28.0);
+        assert_eq!(m.icon_box, 14.0);
+        assert_eq!(m.pad, 12.0);
+        assert_eq!(m.pad_y, 4.0);
+        assert_eq!(m.icon_gap, 8.0);
+        assert_eq!(m.text_gap, 8.0);
+        assert_eq!(m.sep_inset, 9.0);
+        assert_eq!(m.card_w, 240.0);
+        assert_eq!(m.radius, 10.0, "the rounded-corner radius is unchanged");
 
-        // Larger body fonts cannot inflate the card.
-        assert_eq!(Metrics::from_font(22.0).font, 14.0);
-        assert_eq!(Metrics::from_font(11.0).font, 12.0);
+        // Upper bounds the user asked for, so a future tweak cannot drift back
+        // to the previous, roomier card.
+        assert!(m.font <= 13.0);
+        assert!(m.row_h <= 32.0);
+        assert!(m.card_w <= 240.0);
+
+        // Larger or smaller body fonts stay inside the 11-13px band.
+        assert_eq!(Metrics::from_font(22.0).font, 13.0);
+        assert_eq!(Metrics::from_font(11.0).font, 11.0);
 
         let items = build("a", "b", "c", 0);
         assert_eq!(
             m.height(&items),
-            40.0 * 6.0 + 10.0 * 3.0 + 34.0 + 12.0,
-            "six action rows, three separators, version row, 6px inner padding"
+            32.0 * 6.0 + 8.0 * 3.0 + 28.0 + 8.0,
+            "six action rows, three separators, version row, 4px inner padding"
         );
 
         // One multiplication by the DPI scale, rounded to physical pixels.
-        assert_eq!(scaled(m.font, 1.5), 21);
-        assert_eq!(scaled(m.row_h, 1.5), 60);
-        assert_eq!(scaled(m.pad, 1.25), 19);
-        assert_eq!(scaled(m.sep_inset, 2.0), 22);
-        assert_eq!(scaled(m.card_w, 1.0), 272);
+        assert_eq!(scaled(m.font, 1.5), 18);
+        assert_eq!(scaled(m.row_h, 1.5), 48);
+        assert_eq!(scaled(m.pad, 1.25), 15);
+        assert_eq!(scaled(m.sep_inset, 2.0), 18);
+        assert_eq!(scaled(m.card_w, 1.0), 240);
     }
 }

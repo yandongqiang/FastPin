@@ -9,7 +9,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
       - run: cargo build --release --locked
       # The exe looks for models\v6 next to itself, so both packages have to carry
       # them: without this the OCR and translate buttons are dead on a fresh machine.

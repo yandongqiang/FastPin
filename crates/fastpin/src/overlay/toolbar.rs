@@ -148,7 +148,6 @@ pub const ALPHA_LABEL_W: f64 = 30.0;
 pub const ALPHA_TRACK_W: f64 = 116.0;
 pub const ALPHA_READOUT_W: f64 = 36.0;
 
-
 pub fn alpha_row_width() -> f64 {
     ALPHA_LABEL_W + ROW_GAP + ALPHA_TRACK_W + ROW_GAP + ALPHA_READOUT_W
 }

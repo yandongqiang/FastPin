@@ -129,7 +129,12 @@ pub fn build(region: &str, fullscreen: &str, copy_only: &str, pin_count: usize) 
         action(ID_REGION, MenuIcon::Scissors, "区域截图", region),
         action(ID_FULL, MenuIcon::Monitor, "全屏截图", fullscreen),
         action(ID_COPY, MenuIcon::Copy, "仅复制", copy_only),
-        action(ID_CLOSE_ALL, MenuIcon::Close, "关闭所有贴图", &pin_count.to_string()),
+        action(
+            ID_CLOSE_ALL,
+            MenuIcon::Close,
+            "关闭所有贴图",
+            &pin_count.to_string(),
+        ),
         separator(),
         action(ID_SETTINGS, MenuIcon::Gear, "设置", ""),
         separator(),
@@ -197,7 +202,11 @@ impl Metrics {
 
     /// Full card height: every row plus the top/bottom inner padding.
     fn height(&self, items: &[MenuItem]) -> f32 {
-        self.pad_y * 2.0 + items.iter().map(|it| self.kind_height(it.kind)).sum::<f32>()
+        self.pad_y * 2.0
+            + items
+                .iter()
+                .map(|it| self.kind_height(it.kind))
+                .sum::<f32>()
     }
 }
 
@@ -272,7 +281,10 @@ fn register_class() {
             // rounds the window through DWM and keeps the system shadow.
             style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
             lpfnWndProc: Some(popup_proc),
-            hInstance: GetModuleHandleW(None).ok().map(Into::into).unwrap_or_default(),
+            hInstance: GetModuleHandleW(None)
+                .ok()
+                .map(Into::into)
+                .unwrap_or_default(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             lpszClassName: PCWSTR(name.as_ptr()),
             ..Default::default()
@@ -316,7 +328,11 @@ fn dpi_scale(hwnd: HWND, pt: POINT) -> f32 {
             return dx as f32 / 96.0;
         }
         let dpi = GetDpiForWindow(hwnd);
-        if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
+        if dpi == 0 {
+            1.0
+        } else {
+            dpi as f32 / 96.0
+        }
     }
 }
 
@@ -331,8 +347,16 @@ fn place(pt: POINT, w: i32, h: i32) -> (i32, i32) {
         };
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
             let work = info.rcWork;
-            let mut x = if pt.x + w > work.right { work.right - w } else { pt.x };
-            let mut y = if pt.y + h > work.bottom { pt.y - h } else { pt.y };
+            let mut x = if pt.x + w > work.right {
+                work.right - w
+            } else {
+                pt.x
+            };
+            let mut y = if pt.y + h > work.bottom {
+                pt.y - h
+            } else {
+                pt.y
+            };
             x = x.max(work.left);
             y = y.max(work.top);
             return (x, y);
@@ -682,7 +706,15 @@ unsafe fn paint(hwnd: HWND, state: &PopupState) {
     let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
     // RECT's right/bottom are exclusive, so stop one pixel short or the
     // right/bottom hairline falls outside the client area.
-    let _ = RoundRect(hdc, 0, 0, rc.right - 1, rc.bottom - 1, radius * 2, radius * 2);
+    let _ = RoundRect(
+        hdc,
+        0,
+        0,
+        rc.right - 1,
+        rc.bottom - 1,
+        radius * 2,
+        radius * 2,
+    );
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(border.into());
@@ -899,7 +931,18 @@ mod tests {
         let ids: Vec<u32> = items.iter().map(|i| i.id).collect();
         assert_eq!(
             ids,
-            vec![ID_REGION, ID_FULL, ID_COPY, ID_CLOSE_ALL, 0, ID_SETTINGS, 0, ID_EXIT, 0, 0]
+            vec![
+                ID_REGION,
+                ID_FULL,
+                ID_COPY,
+                ID_CLOSE_ALL,
+                0,
+                ID_SETTINGS,
+                0,
+                ID_EXIT,
+                0,
+                0
+            ]
         );
 
         // Group 1 is four working actions; three separators split the groups.

@@ -135,10 +135,8 @@ mod tests {
 
     /// Unique scratch root per test; never touches the real profile folders.
     fn scratch(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "fastpin-migrate-{}-{name}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("fastpin-migrate-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
@@ -234,8 +232,8 @@ mod tests {
         assert!(crate::settings::system::data_dir()
             .unwrap()
             .ends_with(Path::new("FastPin")));
-        assert!(crate::perf::log_dir().unwrap().ends_with(
-            Path::new("FastPin").join("logs")
-        ));
+        assert!(crate::perf::log_dir()
+            .unwrap()
+            .ends_with(Path::new("FastPin").join("logs")));
     }
 }

@@ -19,9 +19,7 @@
 
 use std::path::PathBuf;
 
-use fastpin::brand_icon::{
-    clear_edge_white, de_white_transparent, resize_icon, WHITE_THRESHOLD,
-};
+use fastpin::brand_icon::{clear_edge_white, de_white_transparent, resize_icon, WHITE_THRESHOLD};
 use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
 
@@ -54,9 +52,7 @@ fn main() {
         .map(|&size| {
             let rgba = resize_icon(&source, size);
             let (white_holes, semi_white) = frame_stats(&rgba);
-            println!(
-                "{size:>3}px: {white_holes} transparent-white px, {semi_white} pale semi px"
-            );
+            println!("{size:>3}px: {white_holes} transparent-white px, {semi_white} pale semi px");
             let payload = if size >= 256 {
                 png_entry(&rgba)
             } else {
@@ -88,7 +84,11 @@ fn main() {
     }
 
     std::fs::write(&dst, &out).expect("write fastpin.ico");
-    println!("wrote {} ({} bytes, sizes {SIZES:?})", dst.display(), out.len());
+    println!(
+        "wrote {} ({} bytes, sizes {SIZES:?})",
+        dst.display(),
+        out.len()
+    );
 }
 
 /// Counts the two artefacts a white card leaves behind after downscaling:

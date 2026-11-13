@@ -7,8 +7,7 @@
 //! caller, so the view keeps `cx.listener` and these stay view-agnostic.
 
 use gpui::{
-    div, prelude::*, px, svg, CursorStyle, Div, ElementId, FontWeight, Hsla, SharedString,
-    Stateful,
+    div, prelude::*, px, svg, CursorStyle, Div, ElementId, FontWeight, Hsla, SharedString, Stateful,
 };
 
 /// Height of a one-line row. Two-line rows grow with their description.
@@ -349,7 +348,14 @@ pub fn hint(text: impl Into<SharedString>) -> Div {
         .flex_row()
         .items_start()
         .gap(px(6.))
-        .child(icon("settings/info.svg", 14., crate::overlay::theme::secondary_fg()).mt(px(1.)))
+        .child(
+            icon(
+                "settings/info.svg",
+                14.,
+                crate::overlay::theme::secondary_fg(),
+            )
+            .mt(px(1.)),
+        )
         .child(
             div()
                 .text_size(px(11.))
@@ -446,7 +452,11 @@ pub fn checkbox(
                 .items_center()
                 .justify_center()
                 .when(checked, |el| {
-                    el.child(icon("settings/check.svg", 11., crate::overlay::theme::on_accent()))
+                    el.child(icon(
+                        "settings/check.svg",
+                        11.,
+                        crate::overlay::theme::on_accent(),
+                    ))
                 }),
         )
         .child(
@@ -592,7 +602,9 @@ pub fn select_option(
                 .text_color(crate::overlay::theme::primary_fg())
                 .child(text.into()),
         )
-        .when(selected, |el| el.child(icon("settings/check.svg", 11., accent())))
+        .when(selected, |el| {
+            el.child(icon("settings/check.svg", 11., accent()))
+        })
 }
 
 /// Wraps the open option rows so they read as one surface under the field.
@@ -650,11 +662,7 @@ pub fn hotkey_field(
         .items_center()
         .justify_center()
         .rounded(px(6.))
-        .bg(if recording {
-            accent_soft()
-        } else {
-            input_bg()
-        })
+        .bg(if recording { accent_soft() } else { input_bg() })
         .border_1()
         .border_color(if recording {
             accent()

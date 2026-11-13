@@ -217,7 +217,11 @@ mod tests {
         for (x, y) in [(0, 0), (8, 0), (0, 8), (8, 8), (4, 0), (0, 4)] {
             let p = img.get_pixel(x, y);
             assert_eq!(p[3], 0, "transparent at {x},{y}");
-            assert_eq!(p.0[..3], ink.0[..3], "hole at {x},{y} takes the glyph colour");
+            assert_eq!(
+                p.0[..3],
+                ink.0[..3],
+                "hole at {x},{y} takes the glyph colour"
+            );
         }
     }
 
@@ -258,7 +262,10 @@ mod tests {
                 && p[2] >= WHITE_THRESHOLD
         };
         // The saved PNG itself carries glyph colours under alpha=0.
-        assert!(!img.pixels().any(white), "white core in the transparent PNG");
+        assert!(
+            !img.pixels().any(white),
+            "white core in the transparent PNG"
+        );
 
         // And the largest downscale step used for the ICO keeps it that way:
         // a 16 px frame must not gain a white ring where the card used to be.
@@ -269,10 +276,7 @@ mod tests {
                 "white halo in the {size}px frame"
             );
             assert_eq!(small.get_pixel(0, 0)[3], 0, "{size}px corner");
-            assert!(
-                small.pixels().any(|p| p[3] > 0),
-                "{size}px frame is empty"
-            );
+            assert!(small.pixels().any(|p| p[3] > 0), "{size}px frame is empty");
         }
     }
 }

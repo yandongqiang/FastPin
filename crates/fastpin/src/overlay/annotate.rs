@@ -293,7 +293,14 @@ pub fn prop_cells(tool: Tool) -> Vec<toolbar::PropCell> {
     } else if tool.is_arrow() {
         // Straight / polyline / curve sit inline ahead of the arrow settings,
         // so every arrow property lives in one row and no picker is needed.
-        cells.extend([toolbar::ARROW, toolbar::POLYLINE_ARROW, toolbar::CURVE_ARROW].map(Btn));
+        cells.extend(
+            [
+                toolbar::ARROW,
+                toolbar::POLYLINE_ARROW,
+                toolbar::CURVE_ARROW,
+            ]
+            .map(Btn),
+        );
         cells.extend(
             [
                 toolbar::PROP_ARROW_START,
@@ -1454,10 +1461,7 @@ mod tests {
                 1,
                 "{tool:?}"
             );
-            assert!(
-                !cells.contains(&PropCell::BadgeSizeSlider),
-                "{tool:?}"
-            );
+            assert!(!cells.contains(&PropCell::BadgeSizeSlider), "{tool:?}");
         }
         for tool in [Tool::Select, Tool::Pen, Tool::Mosaic, Tool::Text] {
             assert!(prop_cells(tool).is_empty(), "{tool:?}");
@@ -1504,7 +1508,12 @@ mod tests {
             (toolbar::CURVE_ARROW, Tool::CurveArrow),
             (toolbar::ARROW, Tool::Arrow),
         ] {
-            assert!(handle_common_toolbar(&mut s, &mut text, &mut color_open, id));
+            assert!(handle_common_toolbar(
+                &mut s,
+                &mut text,
+                &mut color_open,
+                id
+            ));
             assert_eq!(s.tool, want);
             assert_eq!(s.arrow_ends, ArrowEnds::Both, "{id} keeps the ends");
             assert_eq!(s.arrow_head, ArrowHead::Bar, "{id} keeps the head");
@@ -1592,7 +1601,12 @@ mod tests {
             (toolbar::PROP_BADGE_SQUARE, BadgeStyle::Square),
             (toolbar::PROP_BADGE_FILLED, BadgeStyle::Filled),
         ] {
-            assert!(handle_common_toolbar(&mut s, &mut text, &mut color_open, id));
+            assert!(handle_common_toolbar(
+                &mut s,
+                &mut text,
+                &mut color_open,
+                id
+            ));
             assert_eq!(s.badge_style, style);
         }
         for (f, want) in [(0.0, 8.0), (0.5, 24.0), (1.0, 40.0)] {

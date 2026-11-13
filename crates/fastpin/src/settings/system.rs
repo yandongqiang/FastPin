@@ -125,7 +125,13 @@ pub(crate) fn migrate_legacy_run_value() -> Vec<String> {
     if write.is_err() {
         return vec!["autostart: could not write FastPin entry".into()];
     }
-    let removed = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, PCWSTR(key.as_ptr()), PCWSTR(legacy.as_ptr())) };
+    let removed = unsafe {
+        RegDeleteKeyValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(legacy.as_ptr()),
+        )
+    };
     if removed.is_ok() {
         vec!["autostart: moved legacy -> FastPin".into()]
     } else {

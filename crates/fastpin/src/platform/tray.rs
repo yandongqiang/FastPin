@@ -17,9 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::error::Result;
 use crate::hotkey;
-use crate::platform::tray_menu::{
-    ID_CLOSE_ALL, ID_COPY, ID_EXIT, ID_FULL, ID_REGION, ID_SETTINGS,
-};
+use crate::platform::tray_menu::{ID_CLOSE_ALL, ID_COPY, ID_EXIT, ID_FULL, ID_REGION, ID_SETTINGS};
 use crate::platform::WM_TRAYICON;
 
 /// Stable identity for the notification icon. Windows keys the user's
@@ -343,7 +341,9 @@ fn show_menu(hwnd: HWND) -> Option<TrayCommand> {
 /// Formats a registered hotkey for the right-aligned shortcut column. Bindings
 /// are re-read on every popup so a rebind shows up without a restart.
 fn hotkey_hint(stored: &str) -> String {
-    hotkey::parse(stored).map(hotkey::format).unwrap_or_default()
+    hotkey::parse(stored)
+        .map(hotkey::format)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

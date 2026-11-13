@@ -114,11 +114,8 @@ pub(crate) fn migrate_legacy_vault() -> Vec<String> {
     // Never overwrite a key the new build already saved.
     let already = vault.Retrieve(&current, &account).is_ok();
     if !already {
-        let cred = match PasswordCredential::CreatePasswordCredential(
-            &current,
-            &account,
-            &password,
-        ) {
+        let cred = match PasswordCredential::CreatePasswordCredential(&current, &account, &password)
+        {
             Ok(c) => c,
             Err(e) => return vec![format!("vault: could not create FastPin entry ({e})")],
         };

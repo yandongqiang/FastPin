@@ -543,7 +543,10 @@ mod tests {
                     Page::Screenshot => {
                         assert_eq!(s.screenshot.save_dir.as_deref(), Some("D:/shots".as_ref()));
                         assert_eq!(s.translation.timeout_seconds, 111);
-                        assert_eq!(s.ocr.models_dir.as_deref(), Some("D:/models/custom".as_ref()));
+                        assert_eq!(
+                            s.ocr.models_dir.as_deref(),
+                            Some("D:/models/custom".as_ref())
+                        );
                     }
                     Page::Output => {
                         assert_eq!(s.screenshot.hidden_toolbar_items, ["text", "redo"]);

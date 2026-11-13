@@ -283,10 +283,8 @@ mod tests {
 
     #[test]
     fn models_in_a_missing_directory_are_unavailable() {
-        let dir = std::env::temp_dir().join(format!(
-            "fastpin-ocr-{}-does-not-exist",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("fastpin-ocr-{}-does-not-exist", std::process::id()));
         assert!(!models_present_in(&dir));
     }
 

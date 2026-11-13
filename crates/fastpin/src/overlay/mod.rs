@@ -32,10 +32,11 @@ use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsIconic,
+    EnumWindows, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow,
     IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos,
     ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WDA_EXCLUDEFROMCAPTURE, WHEEL_DELTA, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
 };
 
 use crate::capture::{crop_sdr_bgra, CapturedDesktop, Gpu, WgcLive};
@@ -44,7 +45,7 @@ use crate::geom::{
     hit_test, move_rect, physical_source_rect, resize_rect, Point, Rect, SelectionHitKind,
 };
 use crate::gpui_bridge::present_freeze_from_texture;
-use crate::longcapture::{bgra_to_gray, infer_axis, normalize_bgra, Axis, Stitcher};
+use crate::longcapture::{bgra_to_gray, normalize_bgra, Axis, Stitcher};
 use crate::longworker::{
     Done, Job, LongWorker, Outcome, Poll, Rebase, ResultGate, StopReason, Verdict, FINISH_WAIT,
 };
@@ -249,6 +250,13 @@ struct LongCaptureState {
     gate: ResultGate,
     /// Owns `prev_gray` + `Stitcher`; every frame-sized pass runs there.
     worker: LongWorker,
+    /// Top-level window under the selection centre: the one
+    /// `focus_window_under` handed the foreground to, and the one auto-scroll
+    /// posts its wheel messages to. `None` when no window could be found.
+    target: Option<HWND>,
+    /// Opt-in automatic scrolling (default off). Session-only: never written
+    /// to `config`, so a later capture cannot start scrolling by itself.
+    auto_scroll: AutoScroll,
 }
 
 fn long_status_hint(axis: Axis) -> String {
@@ -256,6 +264,159 @@ fn long_status_hint(axis: Axis) -> String {
         Axis::Vertical => "滚动页面以继续截图".to_string(),
         Axis::Horizontal => "左右滚动页面以继续截图".to_string(),
     }
+}
+
+/// Axis every long-capture session starts on. Deliberately a constant rather
+/// than `infer_axis(selection)`: horizontal capture is entered only by the
+/// user clicking the bar's ↕/↔ button, so no selection shape, config value or
+/// previous session can start a session sideways.
+const INITIAL_LONG_AXIS: Axis = Axis::Vertical;
+
+/// The only axis transition in a session: the bar's direction button being
+/// clicked. `clicked` is that button's event; there is no other caller, which
+/// is what keeps `Axis::Horizontal` user-initiated.
+fn axis_after_bar_click(current: Axis, clicked: bool) -> Axis {
+    if clicked {
+        current.flipped()
+    } else {
+        current
+    }
+}
+
+/// How often auto-scroll posts a wheel notch. The poll runs every `LONG_POLL`
+/// (150 ms) and one notch must not outrun the stitching of the frame before
+/// it: a notch is a few text lines (roughly 60-150 px in a 1000 px viewport),
+/// so 600 ms -- four polls -- lets the worker align and append the frame
+/// before the page moves again. Faster let the content outrun the overlap
+/// strip, slower read as a stalled bar.
+const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(600);
+
+/// Consecutive unconfirmed notches before the page is treated as at its end:
+/// 10 x 600 ms = 6 s of scrolling without a single new row.
+const AUTO_SCROLL_MAX_IDLE_POSTS: u32 = 10;
+
+const AUTO_SCROLL_POST_FAILED: &str = "无法向目标窗口发送滚动，请手动滚动";
+const AUTO_SCROLL_NO_PROGRESS: &str = "自动滚动已停止：未检测到更多内容";
+
+/// Pacing and give-up accounting for opt-in auto-scroll. Pure bookkeeping --
+/// no Win32 and no timer: the host asks [`AutoScroll::plan`] on each poll,
+/// posts the wheel itself, reports the result with
+/// [`AutoScroll::observe_post`], and feeds the stitched height to
+/// [`AutoScroll::observe_height`]. Everything about when to post and when to
+/// give up is therefore testable without a window.
+#[derive(Debug, Default)]
+struct AutoScroll {
+    enabled: bool,
+    last_post: Option<Instant>,
+    /// Notches posted since the stitched image last grew.
+    idle_posts: u32,
+    /// Stitched height after the last applied frame, to detect growth.
+    last_height: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AutoScrollStep {
+    /// Post one notch now.
+    Post,
+    /// Nothing to post: off, a frame is in flight, or the beat has not elapsed.
+    Wait,
+    /// Too many notches produced no new rows: auto-scroll turned itself off.
+    StopNoProgress,
+}
+
+impl AutoScroll {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Turns the switch on or off, restarting the beat either way. Never
+    /// touches the axis, the stitcher or the buffer: turning it off restores
+    /// the exact manual behaviour.
+    fn set_enabled(&mut self, on: bool) {
+        self.enabled = on;
+        self.last_post = None;
+        self.idle_posts = 0;
+        self.last_height = None;
+    }
+
+    /// Folds the session's stitched height in after each applied frame: a
+    /// taller image means content arrived, so the give-up counter restarts.
+    fn observe_height(&mut self, total_height: usize) {
+        if self.last_height.is_some_and(|h| total_height > h) {
+            self.idle_posts = 0;
+        }
+        self.last_height = Some(total_height);
+    }
+
+    /// Folds one post's result in. Returns whether auto-scroll stays on: a
+    /// refused message disables it at once, because a switch that is on while
+    /// nothing scrolls is the failure this feature must never have.
+    fn observe_post(&mut self, posted: bool) -> bool {
+        if !posted {
+            self.enabled = false;
+        }
+        self.enabled
+    }
+
+    /// Decides this tick. `in_flight` is `true` while the worker still owns
+    /// the previous frame, in which case no notch may be posted -- it would
+    /// scroll the page past the frame being stitched.
+    fn plan(&mut self, now: Instant, in_flight: bool) -> AutoScrollStep {
+        if !self.enabled {
+            return AutoScrollStep::Wait;
+        }
+        if in_flight {
+            return AutoScrollStep::Wait;
+        }
+        let due = self
+            .last_post
+            .is_none_or(|t| now.saturating_duration_since(t) >= AUTO_SCROLL_INTERVAL);
+        if !due {
+            return AutoScrollStep::Wait;
+        }
+        if self.idle_posts >= AUTO_SCROLL_MAX_IDLE_POSTS {
+            self.enabled = false;
+            return AutoScrollStep::StopNoProgress;
+        }
+        self.last_post = Some(now);
+        self.idle_posts = self.idle_posts.saturating_add(1);
+        AutoScrollStep::Post
+    }
+}
+
+/// Message and signed delta of one notch that continues the capture
+/// direction. Win32 signs: `WM_MOUSEWHEEL` is positive when the wheel turns
+/// forward (away from the user), which scrolls most apps further down the
+/// page; `WM_MOUSEHWHEEL` is positive to the right. Both are the direction the
+/// stitched image grows, so both are `+WHEEL_DELTA`.
+fn wheel_notch(axis: Axis) -> (u32, i32) {
+    match axis {
+        Axis::Vertical => (WM_MOUSEWHEEL, WHEEL_DELTA as i32),
+        Axis::Horizontal => (WM_MOUSEHWHEEL, WHEEL_DELTA as i32),
+    }
+}
+
+/// `MAKELPARAM(x, y)` in screen coordinates: the wheel messages go to a
+/// focused window while the cursor sits elsewhere, so the target needs the
+/// selection centre, not the pointer position.
+fn wheel_lparam(x: i32, y: i32) -> isize {
+    (((y as u16 as u32) << 16) | (x as u16 as u32)) as i32 as isize
+}
+
+/// Posts one wheel notch to `hwnd` at screen point `center`.
+///
+/// `false` when the window is gone or refused the message; the caller then
+/// turns auto-scroll off with a visible reason instead of keeping a switch
+/// that cannot do anything.
+fn post_wheel(hwnd: HWND, axis: Axis, center: POINT) -> bool {
+    if hwnd.0.is_null() || unsafe { !IsWindow(Some(hwnd)).as_bool() } {
+        return false;
+    }
+    let (msg, delta) = wheel_notch(axis);
+    // Low word of wParam is the key state (none), high word the signed delta.
+    let wparam = ((delta as u32) << 16) as usize;
+    let lparam = LPARAM(wheel_lparam(center.x, center.y));
+    unsafe { PostMessageW(Some(hwnd), msg, WPARAM(wparam), lparam).is_ok() }
 }
 
 /// Whether the long-capture poll loop must keep running.
@@ -354,8 +515,9 @@ fn hole_clear_of_bar(mut hole: RECT, bar_top: i32, bar_bottom: i32) -> RECT {
 /// WM_MOUSEWHEEL goes to the window with keyboard focus, not the one under
 /// the cursor, so the region hole alone cannot make the page scroll: the
 /// focused overlay would swallow every wheel tick the capture is waiting for. Handing the foreground to the topmost window under the
-/// selection center is what actually lets the user scroll.
-fn focus_window_under(overlay: HWND, pt: POINT) {
+/// selection center is what actually lets the user scroll. Returns that window
+/// so auto-scroll can post to the same target.
+fn focus_window_under(overlay: HWND, pt: POINT) -> Option<HWND> {
     struct Ctx {
         exclude: HWND,
         pt: POINT,
@@ -393,8 +555,11 @@ fn focus_window_under(overlay: HWND, pt: POINT) {
         // EnumWindows walks top-level windows in z-order: the overlay is
         // topmost and skipped, so the first hit is the scrolled app.
         let _ = EnumWindows(Some(walk), LPARAM(&mut ctx as *mut _ as isize));
-        if !ctx.found.0.is_null() {
+        if ctx.found.0.is_null() {
+            None
+        } else {
             let _ = SetForegroundWindow(ctx.found);
+            Some(ctx.found)
         }
     }
 }
@@ -922,12 +1087,12 @@ impl OverlayView {
             // dim backdrop, which must not start a drag or an edit. Clicking
             // the backdrop also activates this window, which would steal the
             // wheel back -- hand the foreground to the scroll target again.
-            if let Some(state) = self.long.as_ref() {
+            if let Some(state) = self.long.as_mut() {
                 let center = POINT {
                     x: state.abs_x + (state.w / 2) as i32,
                     y: state.abs_y + (state.h / 2) as i32,
                 };
-                focus_window_under(crate::platform::hwnd_of(window), center);
+                state.target = focus_window_under(crate::platform::hwnd_of(window), center);
             }
             return;
         }
@@ -1407,9 +1572,10 @@ impl OverlayView {
         let abs_x = self.origin_x + result.x as i32;
         let abs_y = self.origin_y + result.y as i32;
         let (w, h) = (result.w as usize, result.h as usize);
-        // A wide strip is a horizontal (left/right) long page; the stitcher is
-        // fed frames rotated so the scroll axis is always vertical.
-        let axis = infer_axis(w, h);
+        // Every session starts vertical: a wide selection no longer implies a
+        // horizontal page, and neither the previous session nor the config can
+        // carry an axis in. The bar's ↕/↔ button is the only way across.
+        let axis = INITIAL_LONG_AXIS;
         // The freeze frame may be stale by the time the user reaches for this
         // button, so -- like the C# runner -- the first frame is a fresh
         // capture, not a crop of it. A persistent WGC session on the covering
@@ -1516,6 +1682,10 @@ impl OverlayView {
             total_height,
             gate: ResultGate::new(gen),
             worker,
+            // Filled in just below by `focus_window_under`; auto-scroll cannot
+            // post anything until that window is known.
+            target: None,
+            auto_scroll: AutoScroll::default(),
         });
         // The OCR/translate panel has no meaning mid-capture; the C# build
         // collapses ResultPanel here too.
@@ -1537,7 +1707,10 @@ impl OverlayView {
             x: abs_x + result.w as i32 / 2,
             y: abs_y + result.h as i32 / 2,
         };
-        focus_window_under(crate::platform::hwnd_of(window), center);
+        let target = focus_window_under(crate::platform::hwnd_of(window), center);
+        if let Some(state) = self.long.as_mut() {
+            state.target = target;
+        }
         self.spawn_long_poll(gen, cx);
         cx.notify();
     }
@@ -1671,6 +1844,14 @@ impl OverlayView {
         if !should_keep_polling(true, state.maxed, self.phase == Phase::LongCapturing) {
             return false;
         }
+        // Auto-scroll runs on its own beat, independent of the frame cadence:
+        // a paused page (which decimates polling) is exactly what it is for.
+        // Its plan refuses to post while a job is in flight.
+        let in_flight = state.gate.in_flight();
+        self.pump_auto_scroll(started, in_flight, cx);
+        let Some(state) = self.long.as_mut() else {
+            return false;
+        };
         // Still processing the previous frame: skip this sample. The cadence
         // then follows the worker instead of queueing frames it cannot keep
         // up with, and the skip is counted for the next diag line.
@@ -1740,6 +1921,66 @@ impl OverlayView {
         true
     }
 
+    /// One auto-scroll step, driven from the poll tick. The beat and the
+    /// give-up rule live in [`AutoScroll`]; only the post itself touches
+    /// Win32. `in_flight` means the worker still owns the previous frame, so
+    /// nothing may be posted (the page would move past the frame being
+    /// stitched).
+    fn pump_auto_scroll(&mut self, now: Instant, in_flight: bool, cx: &mut Context<Self>) {
+        let Some(state) = self.long.as_mut() else {
+            return;
+        };
+        if !state.auto_scroll.enabled() {
+            return;
+        }
+        match state.auto_scroll.plan(now, in_flight) {
+            AutoScrollStep::Post => {
+                let center = POINT {
+                    x: state.abs_x + (state.w / 2) as i32,
+                    y: state.abs_y + (state.h / 2) as i32,
+                };
+                let posted = state
+                    .target
+                    .is_some_and(|hwnd| post_wheel(hwnd, state.axis, center));
+                if !state.auto_scroll.observe_post(posted) {
+                    state.status = AUTO_SCROLL_POST_FAILED.to_string();
+                    crate::perf::log_diag("long-capture: auto scroll post failed");
+                    cx.notify();
+                }
+            }
+            AutoScrollStep::StopNoProgress => {
+                state.status = AUTO_SCROLL_NO_PROGRESS.to_string();
+                crate::perf::log_diag("long-capture: auto scroll stopped, no new rows");
+                cx.notify();
+            }
+            AutoScrollStep::Wait => {}
+        }
+    }
+
+    /// 自动滚动 on the long-capture bar: flips the session switch only. No
+    /// re-baseline, no axis change, no buffer reset -- turning it off restores
+    /// the manual behaviour exactly.
+    fn toggle_auto_scroll(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.long.as_mut() else {
+            return;
+        };
+        let on = !state.auto_scroll.enabled();
+        state.auto_scroll.set_enabled(on);
+        if on && state.target.is_none() {
+            // Nothing to post to: say so now instead of collecting empty
+            // beats until the give-up rule fires.
+            state.auto_scroll.set_enabled(false);
+            state.status = AUTO_SCROLL_POST_FAILED.to_string();
+        } else {
+            state.status = if on {
+                "自动滚动：开".to_string()
+            } else {
+                long_status_hint(state.axis)
+            };
+        }
+        cx.notify();
+    }
+
     /// Applies one finished worker result. Returns false when polling must
     /// stop (the session ended or the worker refused the frame).
     fn apply_long_done(&mut self, done: Done, cx: &mut Context<Self>) -> bool {
@@ -1771,6 +2012,9 @@ impl OverlayView {
                 state.segments = frame.segments;
                 state.total_height = frame.total_height;
                 state.stall_paused = frame.paused;
+                // New rows confirm that scrolling works, whether they came
+                // from auto-scroll or from the user's own wheel.
+                state.auto_scroll.observe_height(frame.total_height);
                 match frame.verdict {
                     Verdict::Progress { .. } => {
                         state.status = format!(
@@ -1857,13 +2101,19 @@ impl OverlayView {
 
     /// Direction toggle on the long-capture bar: flip vertical <-> horizontal
     /// and re-baseline from a fresh frame. Resetting the stitcher is what keeps
-    /// the two axes from ever mixing their pixel rows.
+    /// the two axes from ever mixing their pixel rows. This is the only path
+    /// to a horizontal session, and it stops auto-scroll: the user is taking
+    /// over the wheel again.
     fn switch_long_axis(&mut self, cx: &mut Context<Self>) {
-        let Some((ax, ay, w, h, next)) = self
-            .long
-            .as_ref()
-            .map(|s| (s.abs_x, s.abs_y, s.w, s.h, s.axis.flipped()))
-        else {
+        let Some((ax, ay, w, h, next)) = self.long.as_ref().map(|s| {
+            (
+                s.abs_x,
+                s.abs_y,
+                s.w,
+                s.h,
+                axis_after_bar_click(s.axis, true),
+            )
+        }) else {
             return;
         };
         let Some(px) = self.long_frame(cx, ax, ay, w, h) else {
@@ -1914,6 +2164,7 @@ impl OverlayView {
             state.axis = next;
             state.maxed = false;
             state.stall_paused = false;
+            state.auto_scroll.set_enabled(false);
             state.segments = 1;
             state.total_height = nh;
             state.status = long_status_hint(next);
@@ -2302,12 +2553,18 @@ impl OverlayView {
         // place_toolbar centers on the selection and clamps into the monitor;
         // the width estimate only affects centering -- the bar sizes to
         // content once laid out.
-        let est_w = (state.status.chars().count() as f64 * 13.0 + 3.0 * 64.0 + 72.0) * s;
+        let est_w = (state.status.chars().count() as f64 * 13.0 + 4.0 * 88.0 + 72.0) * s;
         let (pos, _) = self.long_bar_placement(scale, est_w);
         let status: SharedString = state.status.clone().into();
         let axis_label: SharedString = match state.axis {
             Axis::Vertical => "↕ 垂直".into(),
             Axis::Horizontal => "↔ 水平".into(),
+        };
+        let auto_on = state.auto_scroll.enabled();
+        let auto_label: SharedString = if auto_on {
+            "自动滚动:开".into()
+        } else {
+            "自动滚动:关".into()
         };
         Some(
             div()
@@ -2356,6 +2613,37 @@ impl OverlayView {
                             }),
                         )
                         .child(axis_label),
+                )
+                .child(
+                    // Auto-scroll switch: opt-in, session-only, and independent
+                    // of the axis and the buffer. Off is the manual model
+                    // exactly as it was.
+                    div()
+                        .id("long-auto")
+                        .px(px(10.))
+                        .py(px(5.))
+                        .rounded_md()
+                        .text_size(px(12.))
+                        .text_color(if auto_on {
+                            theme::on_accent()
+                        } else {
+                            theme::primary_fg()
+                        })
+                        .bg(if auto_on {
+                            theme::accent()
+                        } else {
+                            theme::active_background()
+                        })
+                        .hover(|s| s.bg(theme::elevated_surface()))
+                        .cursor(CursorStyle::PointingHand)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _window, cx| {
+                                cx.stop_propagation();
+                                this.toggle_auto_scroll(cx);
+                            }),
+                        )
+                        .child(auto_label),
                 )
                 .child(
                     div()
@@ -3290,5 +3578,142 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- opt-in auto scroll -------------------------------------------------
+
+    #[test]
+    fn auto_scroll_off_by_default() {
+        let mut auto = AutoScroll::default();
+        assert!(!auto.enabled(), "every session starts with auto off");
+        // Off means off: even a due beat posts nothing.
+        assert_eq!(auto.plan(Instant::now(), false), AutoScrollStep::Wait);
+        assert!(!auto.observe_post(true), "no post may keep it on");
+        assert!(!auto.enabled());
+    }
+
+    #[test]
+    fn auto_scroll_waits_for_the_previous_frame() {
+        let mut auto = AutoScroll::default();
+        auto.set_enabled(true);
+        let t0 = Instant::now();
+        // Due (nothing posted yet), but the worker still owns a frame.
+        assert_eq!(auto.plan(t0, true), AutoScrollStep::Wait);
+        assert_eq!(
+            auto.plan(t0 + AUTO_SCROLL_INTERVAL * 3, true),
+            AutoScrollStep::Wait,
+            "a long in-flight frame must not accumulate posts"
+        );
+        // The frame landed: the notch goes out.
+        assert_eq!(auto.plan(t0, false), AutoScrollStep::Post);
+        assert_eq!(
+            auto.plan(t0 + Duration::from_millis(100), false),
+            AutoScrollStep::Wait,
+            "the beat has to elapse before the next notch"
+        );
+        assert_eq!(
+            auto.plan(t0 + AUTO_SCROLL_INTERVAL, false),
+            AutoScrollStep::Post
+        );
+    }
+
+    #[test]
+    fn auto_scroll_stops_after_repeated_no_progress() {
+        let mut auto = AutoScroll::default();
+        auto.set_enabled(true);
+        auto.observe_height(1000);
+        let mut now = Instant::now();
+        for i in 0..AUTO_SCROLL_MAX_IDLE_POSTS {
+            assert_eq!(auto.plan(now, false), AutoScrollStep::Post, "beat {i}");
+            assert!(auto.enabled());
+            // Nothing new arrived from this notch.
+            auto.observe_height(1000);
+            now += AUTO_SCROLL_INTERVAL;
+        }
+        assert_eq!(auto.plan(now, false), AutoScrollStep::StopNoProgress);
+        assert!(
+            !auto.enabled(),
+            "a switch that scrolls nothing must not stay on"
+        );
+        assert_eq!(
+            auto.plan(now + AUTO_SCROLL_INTERVAL, false),
+            AutoScrollStep::Wait,
+            "stopped, not paused: nothing more is posted"
+        );
+    }
+
+    #[test]
+    fn auto_scroll_stops_when_posting_fails() {
+        let mut auto = AutoScroll::default();
+        auto.set_enabled(true);
+        assert!(auto.observe_post(true), "a delivered notch keeps it on");
+        assert!(!auto.observe_post(false), "a refused post reports stop");
+        assert!(!auto.enabled());
+        assert_eq!(auto.plan(Instant::now(), false), AutoScrollStep::Wait);
+    }
+
+    /// A growth in the stitched image is the only thing that proves a notch
+    /// worked, so it restarts the give-up counter.
+    #[test]
+    fn auto_scroll_progress_restarts_the_no_progress_counter() {
+        let mut auto = AutoScroll::default();
+        auto.set_enabled(true);
+        auto.observe_height(1000);
+        let mut now = Instant::now();
+        for _ in 0..AUTO_SCROLL_MAX_IDLE_POSTS - 1 {
+            assert_eq!(auto.plan(now, false), AutoScrollStep::Post);
+            auto.observe_height(1000);
+            now += AUTO_SCROLL_INTERVAL;
+        }
+        // One real scroll arrives: the next notches start from zero again.
+        auto.observe_height(1400);
+        assert_eq!(auto.plan(now, false), AutoScrollStep::Post);
+        assert!(auto.enabled());
+    }
+
+    /// Forward wheel (away from the user) scrolls most apps further down;
+    /// `WM_MOUSEHWHEEL` is positive to the right. Both continue the capture.
+    #[test]
+    fn wheel_notch_continues_the_capture_direction() {
+        assert_eq!(
+            wheel_notch(Axis::Vertical),
+            (WM_MOUSEWHEEL, WHEEL_DELTA as i32)
+        );
+        assert_eq!(
+            wheel_notch(Axis::Horizontal),
+            (WM_MOUSEHWHEEL, WHEEL_DELTA as i32)
+        );
+        // MAKELPARAM packs x in the low word and y in the high word.
+        assert_eq!(wheel_lparam(0x1234, 0x5678), 0x5678_1234);
+        assert_eq!(wheel_lparam(-1, 0), 0x0000_ffff);
+    }
+
+    // ---- axis: vertical by default, horizontal only on the button ----------
+
+    #[test]
+    fn a_new_session_starts_vertical() {
+        assert_eq!(INITIAL_LONG_AXIS, Axis::Vertical);
+        // Starting again after a horizontal session must not inherit it: the
+        // start path reads the constant, never the previous session's axis.
+        let mut axis = INITIAL_LONG_AXIS;
+        for _ in 0..3 {
+            axis = axis_after_bar_click(axis, true);
+            assert_eq!(axis, Axis::Horizontal);
+            axis = INITIAL_LONG_AXIS;
+            assert_eq!(axis, Axis::Vertical, "a horizontal session leaked");
+        }
+    }
+
+    #[test]
+    fn axis_changes_only_when_the_button_is_used() {
+        // No click: the axis is whatever it was, in both directions.
+        assert_eq!(axis_after_bar_click(Axis::Vertical, false), Axis::Vertical);
+        assert_eq!(
+            axis_after_bar_click(Axis::Horizontal, false),
+            Axis::Horizontal
+        );
+        // Every click flips, so the same button goes back and forth.
+        assert_eq!(axis_after_bar_click(Axis::Vertical, true), Axis::Horizontal);
+        assert_eq!(axis_after_bar_click(Axis::Horizontal, true), Axis::Vertical);
     }
 }

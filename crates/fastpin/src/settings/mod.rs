@@ -389,7 +389,9 @@ impl SettingsView {
     }
 
     fn storage_sizes() -> (u64, u64) {
-        let data = system::data_dir().map(|p| system::dir_size(&p)).unwrap_or(0);
+        let data = system::data_dir()
+            .map(|p| system::dir_size(&p))
+            .unwrap_or(0);
         let logs = crate::perf::log_dir()
             .map(|p| system::dir_size(&p))
             .unwrap_or(0);
@@ -452,8 +454,7 @@ impl SettingsView {
         self.page = page;
         self.open_select = None;
         self.confirm_reset_all = false;
-        self.search
-            .update(cx, |input, cx| input.set_text("", cx));
+        self.search.update(cx, |input, cx| input.set_text("", cx));
         cx.notify();
     }
 
@@ -977,22 +978,20 @@ impl SettingsView {
                         )
                     })),
             )
-            .child(
-                div().p(px(14.)).child(
-                    widgets::danger_button("reset-all", reset_label).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            if this.confirm_reset_all {
-                                this.reset_all(cx);
-                            } else {
-                                this.confirm_reset_all = true;
-                                this.ok("再次点击「重置所有设置」以确认");
-                                cx.notify();
-                            }
-                        }),
-                    ),
+            .child(div().p(px(14.)).child(
+                widgets::danger_button("reset-all", reset_label).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        if this.confirm_reset_all {
+                            this.reset_all(cx);
+                        } else {
+                            this.confirm_reset_all = true;
+                            this.ok("再次点击「重置所有设置」以确认");
+                            cx.notify();
+                        }
+                    }),
                 ),
-            )
+            ))
     }
 
     /// The global search input, drawn inside the title bar. `occlude` matters:
@@ -1213,8 +1212,9 @@ impl SettingsView {
                     "取消勾选的按钮不会出现在截图工具栏上，完成和取消始终显示。",
                 )
                 .child(div().flex().flex_col().gap(px(2.)).children(grid)),
-                widgets::row("默认颜色", "新画笔、形状和文字标注的颜色。")
-                    .child(widgets::control(div().flex().flex_row().gap(px(8.)).children(swatches))),
+                widgets::row("默认颜色", "新画笔、形状和文字标注的颜色。").child(widgets::control(
+                    div().flex().flex_row().gap(px(8.)).children(swatches),
+                )),
                 width,
                 mosaic,
                 widgets::unsupported_row("截屏模式", "当前版本固定为冻结屏幕后框选区域。"),
@@ -1243,59 +1243,51 @@ impl SettingsView {
             Ok(p) => p.display().to_string().into(),
             Err(e) => format!("{e}").into(),
         };
-        let location = widgets::stack("保存位置", "工具栏的保存按钮把 PNG 写到这里。")
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.))
-                    .child(widgets::path_line(save_dir).flex_1().min_w(px(0.)))
-                    .child(
-                        widgets::button("save-dir-pick", "更改").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.choose_save_dir(cx)),
-                        ),
-                    )
-                    .child(
-                        widgets::icon_button("save-dir-open", "settings/folder.svg").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.open_folder(crate::config::screenshot_dir(), cx);
-                            }),
-                        ),
+        let location = widgets::stack("保存位置", "工具栏的保存按钮把 PNG 写到这里。").child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .child(widgets::path_line(save_dir).flex_1().min_w(px(0.)))
+                .child(widgets::button("save-dir-pick", "更改").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.choose_save_dir(cx)),
+                ))
+                .child(
+                    widgets::icon_button("save-dir-open", "settings/folder.svg").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.open_folder(crate::config::screenshot_dir(), cx);
+                        }),
                     ),
-            );
+                ),
+        );
 
         let wm = &self.settings.screenshot.watermark;
         let path_text: SharedString = match &wm.image_path {
             Some(p) => p.display().to_string().into(),
             None => "未设置（仅使用文字水印）".into(),
         };
-        let image = widgets::stack(
-            "图片水印",
-            "优先于文字水印烧录；选择有效的图片文件才生效。",
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(10.))
-                .child(widgets::path_line(path_text).flex_1().min_w(px(0.)))
-                .child(
-                    widgets::button("wm-img-pick", "选择图片").on_mouse_down(
+        let image = widgets::stack("图片水印", "优先于文字水印烧录；选择有效的图片文件才生效。")
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(widgets::path_line(path_text).flex_1().min_w(px(0.)))
+                    .child(widgets::button("wm-img-pick", "选择图片").on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.choose_water_image(cx)),
+                    ))
+                    .child(
+                        widgets::icon_button("wm-img-clear", "settings/close.svg").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.clear_water_image(cx)),
+                        ),
                     ),
-                )
-                .child(
-                    widgets::icon_button("wm-img-clear", "settings/close.svg").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.clear_water_image(cx)),
-                    ),
-                ),
-        );
+            );
 
         div()
             .flex()
@@ -1594,8 +1586,8 @@ impl SettingsView {
             .flex()
             .flex_col()
             .child(widgets::rows(vec![
-                widgets::row("识别引擎", "本地识别，截图不会离开这台机器。")
-                    .child(widgets::control(
+                widgets::row("识别引擎", "本地识别，截图不会离开这台机器。").child(
+                    widgets::control(
                         div()
                             .flex()
                             .flex_row()
@@ -1616,29 +1608,27 @@ impl SettingsView {
                                     .text_color(theme::secondary_fg())
                                     .child(engine.label),
                             ),
-                    )),
-                widgets::stack("模型目录", "覆盖内置的 models\\v6 目录，留空使用默认位置。")
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.))
-                            .child(widgets::path_line(models).flex_1().min_w(px(0.)))
-                            .child(
-                                widgets::button("models-pick", "更改").on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| this.choose_models_dir(cx)),
-                                ),
-                            )
-                            .child(
-                                widgets::icon_button("models-clear", "settings/close.svg")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.clear_models_dir(cx)),
-                                    ),
-                            ),
                     ),
+                ),
+                widgets::stack("模型目录", "覆盖内置的 models\\v6 目录，留空使用默认位置。").child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(widgets::path_line(models).flex_1().min_w(px(0.)))
+                        .child(widgets::button("models-pick", "更改").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.choose_models_dir(cx)),
+                        ))
+                        .child(
+                            widgets::icon_button("models-clear", "settings/close.svg")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.clear_models_dir(cx)),
+                                ),
+                        ),
+                ),
             ]))
             .child(widgets::hint(
                 "需要检测、识别与字典三个模型文件同时存在且非空，取字与翻译才可用。",
@@ -1667,7 +1657,11 @@ impl SettingsView {
                     .items_center()
                     .gap(px(10.))
                     .w(px(360.))
-                    .child(widgets::path_line(path_of(system::data_dir())).flex_1().min_w(px(0.)))
+                    .child(
+                        widgets::path_line(path_of(system::data_dir()))
+                            .flex_1()
+                            .min_w(px(0.)),
+                    )
                     .child(
                         widgets::icon_button("open-data", "settings/folder.svg").on_mouse_down(
                             MouseButton::Left,
@@ -1700,12 +1694,12 @@ impl SettingsView {
             )),
             widgets::row("存储占用", "数据目录与日志目录当前占用的空间。")
                 .child(widgets::control(widgets::muted_text(usage))),
-            widgets::row("清理日志", "删除运行日志，不影响设置和截图。").child(
-                widgets::control(widgets::button("clear-logs", "清理").on_mouse_down(
+            widgets::row("清理日志", "删除运行日志，不影响设置和截图。").child(widgets::control(
+                widgets::button("clear-logs", "清理").on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| this.clear_logs(cx)),
-                )),
-            ),
+                ),
+            )),
             widgets::unsupported_row("历史图片", "当前版本不保存截图历史，没有可清理的图片。"),
         ])
     }
@@ -1834,28 +1828,23 @@ impl Render for SettingsView {
                     .min_h(px(0.))
                     .child(self.nav(cx))
                     .child(
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .id("settings-page")
-                                    .flex_1()
-                                    .overflow_y_scroll()
-                                    .px(px(24.))
-                                    .pb(px(24.))
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .max_w(px(CONTENT_MAX_W))
-                                            .flex()
-                                            .flex_col()
-                                            .child(header)
-                                            .child(body),
-                                    ),
-                            ),
+                        div().flex_1().h_full().flex().flex_col().child(
+                            div()
+                                .id("settings-page")
+                                .flex_1()
+                                .overflow_y_scroll()
+                                .px(px(24.))
+                                .pb(px(24.))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .max_w(px(CONTENT_MAX_W))
+                                        .flex()
+                                        .flex_col()
+                                        .child(header)
+                                        .child(body),
+                                ),
+                        ),
                     ),
             )
     }
@@ -1883,7 +1872,9 @@ mod tests {
     fn nav_pane_no_longer_repeats_the_brand_header() {
         let source = include_str!("mod.rs");
         let nav_start = source.find("fn nav(").expect("nav is defined");
-        let nav_end = source.find("fn search_field").expect("search_field follows nav");
+        let nav_end = source
+            .find("fn search_field")
+            .expect("search_field follows nav");
         let nav = &source[nav_start..nav_end];
         assert!(
             !nav.contains("crate::APP_NAME"),
@@ -1950,8 +1941,14 @@ mod tests {
             ("translate.rs", "LEGACY_VAULT_RESOURCE"),
             // README 里的上游来源声明 / 致谢是用户可见的历史事实（用户
             // 2026-11-12 要求保留「基于旧项目二次开发」并致谢），不是内部标识
-            // 残留；用「二次开发」作标记只豁免这些致谢行，README 其余命中照常报错。
+            // 残留；用该句原文作标记只豁免这些致谢行，README 其余命中照常报错。
+            ("README.md", "二次vibe coding开发"),
             ("README.md", "二次开发"),
+            // Phase 1 审计文档引用历史命名（C# 命名空间、README 原文摘录）作为
+            // 证据，属于说明性引用而非代码残留；标记用 concat! 拼接，避免本文件
+            // 自身命中扫描 needle。
+            ("PHASE1_AUDIT_REPORT.md", concat!("Zsh", "ot.Translation")),
+            ("PHASE1_AUDIT_REPORT.md", "二次vibe coding开发"),
         ];
         let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = crate_dir

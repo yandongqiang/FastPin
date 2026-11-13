@@ -135,7 +135,7 @@ pub struct Annotation {
 }
 
 /// Where a watermark sits on the exported image (9-grid).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WatermarkPosition {
     TopLeft,
@@ -146,14 +146,9 @@ pub enum WatermarkPosition {
     MiddleRight,
     BottomLeft,
     BottomCenter,
+    #[default]
     #[serde(rename = "bottomRight")]
     BottomRight,
-}
-
-impl Default for WatermarkPosition {
-    fn default() -> Self {
-        Self::BottomRight
-    }
 }
 
 impl WatermarkPosition {
@@ -475,8 +470,10 @@ mod tests {
 
     #[test]
     fn appearance_roundtrips_and_unknown_values_stay_light() {
-        let mut s = Settings::default();
-        s.appearance = APPEARANCE_DARK.into();
+        let s = Settings {
+            appearance: APPEARANCE_DARK.into(),
+            ..Default::default()
+        };
         let json = serde_json::to_string_pretty(&s).expect("serializes");
         assert!(json.contains("\"appearance\": \"dark\""), "{json}");
         assert!(parse(&json).dark());
@@ -579,8 +576,10 @@ mod tests {
 
     #[test]
     fn watermark_resolved_text_prepends_the_stamp() {
-        let mut wm = Watermark::default();
-        wm.text = "内部资料".into();
+        let mut wm = Watermark {
+            text: "内部资料".into(),
+            ..Default::default()
+        };
         assert_eq!(wm.resolved_text(), "内部资料");
         wm.timestamp = true;
         let out = wm.resolved_text();
@@ -603,11 +602,13 @@ mod tests {
 
     #[test]
     fn watermark_serializes_and_parses_back() {
-        let mut wm = Watermark::default();
-        wm.text = "机密".into();
-        wm.position = "topLeft".into();
-        wm.scale = 2.0;
-        wm.image_path = Some(PathBuf::from("D:/a/b.png"));
+        let wm = Watermark {
+            text: "机密".into(),
+            position: "topLeft".into(),
+            scale: 2.0,
+            image_path: Some(PathBuf::from("D:/a/b.png")),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&wm).expect("serializes");
         let back: Watermark = serde_json::from_str(&json).expect("parses");
         assert_eq!(back.text, "机密");

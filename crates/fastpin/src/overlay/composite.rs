@@ -1031,6 +1031,9 @@ fn watermark_origin(
 /// Blend one premultiplied-BGRA layer at `(ox, oy)` with a global opacity. A
 /// layer pixel already carries its own coverage in alpha; `alpha` scales it.
 /// Out-of-bounds pixels are clipped, not wrapped.
+// Layer geometry is already flat here and this is a per-pixel hot loop; a
+// wrapper struct would only add indirection at both call sites.
+#[allow(clippy::too_many_arguments)]
 fn blend_premult_layer(
     buf: &mut Bgra<'_>,
     ox: i64,
@@ -2191,8 +2194,7 @@ mod tests {
                 id,
             ));
             assert_eq!(s.tool, want);
-            assert!(annotate::prop_cells(s.tool)
-                .contains(&toolbar::PropCell::Btn(toolbar::ARROW)));
+            assert!(annotate::prop_cells(s.tool).contains(&toolbar::PropCell::Btn(toolbar::ARROW)));
             s.pointer_pressed(Point { x: 5.0, y: 5.0 });
             s.pointer_moved(Point { x: 20.0, y: 20.0 });
             s.pointer_released();
@@ -2549,12 +2551,7 @@ mod tests {
     /// along `dir`). Only pixels within one head length of the tip count: a bent
     /// stroke's own body can sit far along the end direction without being part
     /// of the head.
-    fn tip_metrics(
-        mask: &CoverageMask,
-        tip: Point,
-        dir: (f64, f64),
-        radius: f64,
-    ) -> (f64, f64) {
+    fn tip_metrics(mask: &CoverageMask, tip: Point, dir: (f64, f64), radius: f64) -> (f64, f64) {
         let mut gap = f64::MAX;
         let mut past = f64::MIN;
         for row in 0..mask.height {

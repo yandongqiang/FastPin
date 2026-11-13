@@ -747,6 +747,13 @@ pub struct ScrollReport {
     /// A candidate offset was refused by [`verify_shift`]: the strip matched,
     /// the rest of the frame disagreed.
     pub rejected_by_verification: bool,
+    /// The frame changed, but the changes are concentrated in only a few
+    /// horizontal bands: a static page with a local animation (caret / clock /
+    /// video), not a whole-page scroll. Computed by [`change_is_local`] on the
+    /// reject path only. The host must never call this "画面移动" and must not
+    /// end the session for it; `false` for hand-built reports means "no
+    /// distribution evidence, treat a change as a real scroll".
+    pub local_change: bool,
 }
 
 /// Pure scroll-direction decision, shared by `overlay::long_tick` and the unit
@@ -848,6 +855,11 @@ pub fn classify_scroll_diag(
         // and no offset would be trustworthy anyway.
         return report;
     }
+    // Only the reject path reaches here (an accepted direction returned
+    // above), so this never suppresses a confirmed stitch. A frame whose
+    // changes are concentrated in a few bands is a static page with a local
+    // animation, not a whole-page scroll -- see [`change_is_local`].
+    report.local_change = change_is_local(prev_gray, gray, width, height);
 
     // Static-band probe (P1-05). The edge strip is stuck, but did the *page*
     // move? An interior strip at 3/4 (down) or 1/4 (up) height answers that
@@ -897,6 +909,73 @@ pub fn frame_change_ratio(previous: &[u8], current: &[u8]) -> f64 {
     } else {
         changed as f64 / total as f64
     }
+}
+
+/// Horizontal bands the frame is split into for change-distribution analysis.
+/// A real scroll moves content through essentially every band; a static page
+/// with a local animation only changes a handful.
+const CHANGE_BANDS: usize = 16;
+/// A band counts as changed when at least this fraction of its sampled pixels
+/// differ. Deliberately the same floor as [`MOTION_CHANGED`]: a text page that
+/// scrolled still changes a few percent of pixels in every band, while a band
+/// with no motion measures 0.
+const BAND_CHANGED: f64 = MOTION_CHANGED;
+/// Fewer than this many changed bands (out of [`CHANGE_BANDS`]) is a *local*
+/// change, not a whole-page scroll. 4/16 leaves a wide gap: a blinking caret,
+/// a clock or a video thumbnail touches 1-3 bands, a scroll touches nearly
+/// all 16. A large contiguous interior change (a sticky-band signature, e.g.
+/// 5+ bands) is still treated as motion so the existing stall/band hints keep
+/// working.
+const MIN_UNIFORM_BANDS: usize = 4;
+
+/// Whether a frame's pixel changes are *local* rather than a whole-page
+/// scroll, by looking at how the changes are distributed over the frame.
+///
+/// [`frame_change_ratio`] only answers "how much changed"; a static page with
+/// an animation, a blinking caret, a live clock or a video thumbnail keeps
+/// that fraction above [`MOTION_CHANGED`] forever, which made the host keep
+/// saying "画面移动" on a page the user never scrolled. This function answers
+/// "where did it change": the frame is split into [`CHANGE_BANDS`] horizontal
+/// bands and each band's own changed fraction is measured. A genuine scroll
+/// shifts content through nearly every band, so it is reported as uniform
+/// (`false`); a small dynamic region lights up only a few bands, so it is
+/// reported as local (`true`).
+///
+/// This is a pure function of two gray planes and their geometry, with the
+/// same luma threshold (24) and sampling stride (every 4th pixel) as
+/// [`frame_change_ratio`]. Inconclusive inputs (empty, mismatched sizes) are
+/// reported as *not* local, so a possible real scroll is never hidden.
+pub fn change_is_local(previous: &[u8], current: &[u8], width: usize, height: usize) -> bool {
+    const CHANGE_DELTA: u8 = 24;
+    const SAMPLE_STEP: usize = 4;
+    if width == 0
+        || height == 0
+        || previous.len() != current.len()
+        || previous.len() < width * height
+    {
+        return false;
+    }
+    let bands = CHANGE_BANDS.min(height).max(1);
+    let mut changed_bands = 0usize;
+    for b in 0..bands {
+        let y0 = b * height / bands;
+        let y1 = (b + 1) * height / bands;
+        let mut changed = 0u64;
+        let mut total = 0u64;
+        for y in y0..y1 {
+            let row = y * width;
+            for x in (0..width).step_by(SAMPLE_STEP) {
+                total += 1;
+                if previous[row + x].abs_diff(current[row + x]) > CHANGE_DELTA {
+                    changed += 1;
+                }
+            }
+        }
+        if total > 0 && (changed as f64 / total as f64) >= BAND_CHANGED {
+            changed_bands += 1;
+        }
+    }
+    changed_bands < MIN_UNIFORM_BANDS
 }
 
 // ---- stall detection ------------------------------------------------------
@@ -3105,5 +3184,58 @@ mod tests {
             out, expected,
             "left-scroll column order must match the page"
         );
+    }
+
+    // ---- local animation vs whole-page scroll -----------------------------
+
+    /// Same textured page in both frames, except a contiguous block of rows
+    /// whose pixels are driven far from their original luma value. Deterministic:
+    /// every changed pixel differs by at least 127, well above the 24 floor.
+    fn local_animation_pair(
+        width: usize,
+        height: usize,
+        animated_rows: std::ops::Range<usize>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let rows = lcg_rows(height, width, 0xA81E_0001);
+        let refs: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+        let prev = gray_frame(&refs, width);
+        let mut curr = prev.clone();
+        for y in animated_rows {
+            for x in 0..width {
+                let i = y * width + x;
+                curr[i] = if prev[i] < 128 { 255 } else { 0 };
+            }
+        }
+        (prev, curr)
+    }
+
+    #[test]
+    fn a_small_animation_is_a_local_change() {
+        let (w, h) = (16, 64);
+        // A blinking caret / clock / thumbnail: 3 rows out of 64.
+        let (prev, curr) = local_animation_pair(w, h, 10..13);
+        // The old whole-frame metric is fooled: it is clearly "changed".
+        assert!(frame_change_ratio(&prev, &curr) > MOTION_CHANGED);
+        // The distribution shows it is static + local, not a scroll.
+        assert!(change_is_local(&prev, &curr, w, h));
+    }
+
+    #[test]
+    fn a_uniform_scroll_is_not_a_local_change() {
+        let (w, h, k) = (16, 64, 5);
+        let (prev, curr) = scrolled_pair(w, h, k, 0x5C80_1101);
+        assert!(frame_change_ratio(&prev, &curr) > MOTION_CHANGED);
+        // Every band moved: never swallowed as "local", so a real scroll is
+        // still reported as motion (moving_frame_never_reads_as_idle).
+        assert!(!change_is_local(&prev, &curr, w, h));
+    }
+
+    #[test]
+    fn a_large_interior_change_is_not_called_local() {
+        let (w, h) = (16, 64);
+        // 16 of 64 rows = 4 full bands: a sticky-header/footer signature.
+        // It must keep the old "page is moving / band hint" behaviour.
+        let (prev, curr) = local_animation_pair(w, h, 16..32);
+        assert!(!change_is_local(&prev, &curr, w, h));
     }
 }

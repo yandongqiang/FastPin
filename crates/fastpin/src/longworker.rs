@@ -113,6 +113,15 @@ pub enum Verdict {
     /// host keeps polling at the decimated rate and the next stitched tick
     /// restores full speed.
     Stalled { static_edge: bool },
+    /// The frame changed, but only in a few bands: a static page with a local
+    /// animation (caret / clock / video), not a scroll. Never "画面移动" and
+    /// never an end: the host shows a neutral "waiting for scroll" status and
+    /// keeps the full poll rate.
+    LocalChange,
+    /// A transient per-frame glitch (width mismatch, short buffer, unusable
+    /// frame) was skipped. The session stays alive and the next good frame is
+    /// captured as usual; this is not a stop.
+    FrameSkipped,
 }
 
 /// Why the worker ended the session. The bar stays up for 完成/取消 after any
@@ -123,8 +132,11 @@ pub enum StopReason {
     HeightCap,
     /// A frame or the stitcher canvas no longer fits the image budget.
     Budget,
-    /// Any other stitch refusal (width mismatch, short frame, empty rows).
-    Frame,
+    /// A captured frame's geometry was transiently inconsistent (a WGC frame
+    /// with a different width / short buffer / unusable rows). In the normal
+    /// tick path these are skipped and the session continues; this is the
+    /// accurate text if a stop is unavoidable -- never "画面变化过大".
+    FrameSize,
 }
 
 /// A frame that was fully processed (stitched or not).
@@ -584,6 +596,25 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
             state.last_log_ms = spans.log;
             spans.process = ms(started);
             if let Err(e) = outcome {
+                if is_transient(&e) {
+                    // Recoverable glitch (WGC frame width / buffer / row count
+                    // fluctuated for one capture). Skip just this frame: the
+                    // stitcher refused the write and left its buffer untouched,
+                    // and prev_gray is deliberately NOT advanced here (it is
+                    // replaced only on a successful stitch below), so the next
+                    // good frame still aligns against a baseline whose width
+                    // matches the stitcher. No stitched content is dropped and
+                    // the session keeps polling.
+                    crate::perf::log_diag(&format!("long-tick skip: {e}"));
+                    return Outcome::Frame(FrameResult {
+                        verdict: Verdict::FrameSkipped,
+                        paused: state.stall.paused(),
+                        segments,
+                        total_height: total,
+                        stats: state.stitcher.stats(),
+                        spans,
+                    });
+                }
                 crate::perf::log_diag(&format!("long-tick stop: {e}"));
                 return Outcome::Stopped {
                     reason: stop_reason(&e),
@@ -670,7 +701,13 @@ fn idle_verdict(phase: StallPhase, report: &ScrollReport) -> Verdict {
         StallPhase::Stalled => Verdict::Stalled { static_edge: band },
         StallPhase::Paused => Verdict::Paused,
         StallPhase::Progress | StallPhase::Watching => {
-            if band {
+            if report.local_change {
+                // Static page with a local animation, not a scroll. Neutral
+                // "waiting for scroll" status, never "画面移动". observe() still
+                // returns Watching (changed > MOTION_CHANGED), so polling is
+                // not decimated and the session is never ended.
+                Verdict::LocalChange
+            } else if band {
                 // A fixed band covering the strip while the page moves behind
                 // it: the actionable hint, not a stall.
                 Verdict::StaticEdge
@@ -696,12 +733,25 @@ fn idle_verdict(phase: StallPhase, report: &ScrollReport) -> Verdict {
     }
 }
 
+/// Total, accurate mapping from a stitch refusal to the reason the bar would
+/// show if a stop were unavoidable. Transient per-frame glitches map to
+/// [`StopReason::FrameSize`] (never "画面变化过大"); the tick path skips those
+/// instead of stopping, but this keeps one authoritative source for the text.
 fn stop_reason(e: &StitchError) -> StopReason {
     match e {
         StitchError::HeightCap { .. } => StopReason::HeightCap,
         StitchError::Budget(_) => StopReason::Budget,
-        _ => StopReason::Frame,
+        StitchError::InvalidFrame { .. }
+        | StitchError::WidthMismatch { .. }
+        | StitchError::ShortFrame { .. } => StopReason::FrameSize,
     }
+}
+
+/// A recoverable, transient per-frame glitch. These are skipped (the frame is
+/// dropped, the session and its polling continue) rather than ending the
+/// session. Only the real hard limits (height cap / image budget) stop.
+fn is_transient(e: &StitchError) -> bool {
+    stop_reason(e) == StopReason::FrameSize
 }
 
 #[cfg(test)]
@@ -974,6 +1024,8 @@ mod tests {
                 | Verdict::Unaligned { .. }
                 | Verdict::FastScroll
                 | Verdict::Stalled { .. }
+                | Verdict::LocalChange
+                | Verdict::FrameSkipped
         )
     }
 
@@ -1217,6 +1269,236 @@ mod tests {
             Verdict::Unaligned {
                 verification_failed: false
             }
+        );
+    }
+
+    // ---- static page with a local animation is not "画面移动" -------------
+
+    /// Solid BGRA whose grayscale is exactly `gray` (B=G=R=gray, 29+150+77=256).
+    fn solid_bgra(width: usize, height: usize, gray: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(width * height * 4);
+        for _ in 0..width * height {
+            out.extend_from_slice(&[gray, gray, gray, 255]);
+        }
+        out
+    }
+
+    /// A: the user never scrolled; only a small block (a caret / clock /
+    /// video) keeps changing. The old whole-frame metric reads "moved", the
+    /// distribution says "local". Host must show a neutral status, never
+    /// "画面移动", never end the session, never decimate polling.
+    #[test]
+    fn local_animation_is_not_a_moving_page() {
+        let first = solid_bgra(W, H, 60);
+        // 3 of 32 rows driven to a contrasting luma (diff 160 > 24), the
+        // other 29 rows untouched. Fully deterministic frames.
+        let mut animated = solid_bgra(W, H, 60);
+        for r in 4..7 {
+            let start = r * W * 4;
+            let end = (r + 1) * W * 4;
+            for byte in &mut animated[start..end] {
+                *byte = 220;
+            }
+        }
+        let mut worker = worker(&first, 1);
+        let mut gate = ResultGate::new(1);
+        for tick in 0..(STALL_TICKS + 5) {
+            let seq = gate.issue(gate.epoch()).expect("one job at a time");
+            assert!(worker.submit(job(seq, 1, 0, animated.clone())));
+            let done = wait(&worker);
+            assert!(gate.accept(&done), "tick {tick} dropped");
+            match &done.outcome {
+                Outcome::Frame(f) => {
+                    assert_eq!(
+                        f.verdict,
+                        Verdict::LocalChange,
+                        "tick {tick}: {:?}",
+                        f.verdict
+                    );
+                    // Neutral: never the Unaligned "画面移动..." wording.
+                    assert!(!matches!(f.verdict, Verdict::Unaligned { .. }));
+                    assert!(!f.paused, "tick {tick}: full poll rate is kept");
+                }
+                other => panic!("tick {tick}: a static page must not end: {other:?}"),
+            }
+        }
+        // The session is still finishable and no captured row was lost.
+        let (px, w, h) = worker.finish(FINISH_WAIT).unwrap();
+        assert_eq!((w as usize, h as usize), (W, H));
+        assert_eq!(px, first, "stitched content is untouched");
+    }
+
+    /// A regression guard: the local-animation fix must not swallow a real
+    /// uniform scroll (preserves `moving_frame_never_reads_as_idle`).
+    #[test]
+    fn a_real_scroll_is_still_detected() {
+        let page = synthetic_page(W, H + 16, 0xC0FF_EE01);
+        let prev = bgra_to_gray(&frame(&page, W, 0, H), W, H).unwrap();
+        let curr = bgra_to_gray(&frame(&page, W, 5, H), W, H).unwrap();
+        // Uniform scroll: changes are spread through every band.
+        assert!(!crate::longcapture::change_is_local(&prev, &curr, W, H));
+        // The direction classifier still confirms a genuine 5-row stitch.
+        let strip = (H / 4).min(32);
+        let report = classify_scroll_diag(&prev, &curr, W, H, strip, ACCEPT_SCORE);
+        assert!(
+            report.direction.is_some(),
+            "a real scroll is detected: {report:?}"
+        );
+        assert!(
+            !report.local_change,
+            "a confirmed stitch is never marked local"
+        );
+
+        // A moving, non-local unaligned report is still a nudge, never Idle
+        // and never rewritten as LocalChange.
+        let moving = ScrollReport {
+            changed: 0.15,
+            ..ScrollReport::default()
+        };
+        let mut stall = StallTracker::new();
+        assert_eq!(stall.observe(&moving), StallPhase::Watching);
+        assert_eq!(
+            idle_verdict(StallPhase::Watching, &moving),
+            Verdict::Unaligned {
+                verification_failed: false
+            }
+        );
+        let fast = ScrollReport {
+            changed: 0.6,
+            ..ScrollReport::default()
+        };
+        assert_eq!(
+            idle_verdict(StallPhase::Watching, &fast),
+            Verdict::FastScroll
+        );
+    }
+
+    /// B: a transient per-frame glitch (width mismatch / unusable frame /
+    /// short buffer) is skipped, not "画面变化过大"/stopped, and the session
+    /// recovers on the very next good frame.
+    #[test]
+    fn transient_frame_error_does_not_end_the_session() {
+        let transient = [
+            StitchError::WidthMismatch {
+                expected: W,
+                got: W + 1,
+            },
+            StitchError::InvalidFrame {
+                width: W,
+                height: H,
+                rows: 0,
+            },
+            StitchError::ShortFrame {
+                needed: 16,
+                available: 8,
+            },
+        ];
+        for e in &transient {
+            assert!(is_transient(e), "{e:?}: a frame glitch must be skippable");
+            assert_eq!(
+                stop_reason(e),
+                StopReason::FrameSize,
+                "{e:?}: accurate reason, never 画面变化过大"
+            );
+        }
+        // Skipping is a recoverable state, not a stop: the bar keeps polling.
+        assert!(is_state_verdict(Verdict::FrameSkipped));
+        let skipped = FrameResult {
+            verdict: Verdict::FrameSkipped,
+            paused: false,
+            segments: 1,
+            total_height: H,
+            stats: StitchStats::default(),
+            spans: Spans::default(),
+        };
+        assert!(!matches!(Outcome::Frame(skipped), Outcome::Stopped { .. }));
+
+        // Skipping leaves the stitcher untouched (prev_gray stays at the last
+        // good, width-matching frame), so the next frame stitches normally.
+        let page = synthetic_page(W, H + 16, 0x7A11_0001);
+        let first = frame(&page, W, 0, H);
+        let mut s = Stitcher::new(W, H, MAX_H).unwrap();
+        assert!(s.fill_first(&first));
+        let before = s.total_height();
+        let wrong = frame(&page, W, 0, H);
+        assert!(matches!(
+            s.append(&wrong, W + 1, H, 0),
+            Err(StitchError::WidthMismatch { .. })
+        ));
+        assert_eq!(
+            s.total_height(),
+            before,
+            "skipped frame leaves buffer intact"
+        );
+        assert_eq!(s.segment_count(), 1);
+        let good = frame(&page, W, 5, H);
+        assert!(s.append(&good, W, H, H - 5).is_ok());
+        assert_eq!(s.total_height(), before + 5, "next frame stitches again");
+        let (px, w, h) = s.into_pixels();
+        assert_eq!((w as usize, h as usize), (W, H + 5));
+        assert_eq!(&px[..first.len()], &first[..], "stitched rows intact");
+    }
+
+    /// B regression: the real hard limits still terminate the session.
+    #[test]
+    fn height_cap_and_budget_still_stop() {
+        use crate::image_budget::{BudgetError, MAX_SIDE};
+        let cap = StitchError::HeightCap {
+            total: 10,
+            extra: 5,
+            max: 12,
+        };
+        let budget = StitchError::Budget(BudgetError::TooWide { width: 1, max: 1 });
+        assert!(!is_transient(&cap));
+        assert!(!is_transient(&budget));
+        assert_eq!(stop_reason(&cap), StopReason::HeightCap);
+        assert_eq!(stop_reason(&budget), StopReason::Budget);
+
+        // End-to-end height cap: 5 new rows exceed a H+3 cap.
+        let page = synthetic_page(W, H + 16, 0x0CA9_0001);
+        let first = frame(&page, W, 0, H);
+        let mut stitcher = Stitcher::new(W, H, H + 3).unwrap();
+        assert!(stitcher.fill_first(&first));
+        let gray = bgra_to_gray(&first, W, H).unwrap();
+        let worker = LongWorker::new(1, Axis::Vertical, stitcher, gray).unwrap();
+        let mut gate = ResultGate::new(1);
+        let seq = gate.issue(gate.epoch()).unwrap();
+        assert!(worker.submit(job(seq, 1, 0, frame(&page, W, 5, H))));
+        let done = wait(&worker);
+        assert!(gate.accept(&done));
+        let reason = match &done.outcome {
+            Outcome::Stopped { reason } => Some(*reason),
+            _ => None,
+        };
+        assert_eq!(
+            reason,
+            Some(StopReason::HeightCap),
+            "a height cap must still stop: {:?}",
+            done.outcome
+        );
+
+        // End-to-end image budget: a frame wider than MAX_SIDE is refused by
+        // bgra_to_gray before any stitch, surfacing as a Budget stop.
+        let mut s2 = Stitcher::new(W, H, MAX_H).unwrap();
+        assert!(s2.fill_first(&first));
+        let g2 = bgra_to_gray(&first, W, H).unwrap();
+        let wide_worker = LongWorker::new(2, Axis::Vertical, s2, g2).unwrap();
+        let mut gate2 = ResultGate::new(2);
+        let seq = gate2.issue(gate2.epoch()).unwrap();
+        let mut wide_job = job(seq, 2, 0, first.clone());
+        wide_job.width = MAX_SIDE as usize + 1;
+        assert!(wide_worker.submit(wide_job));
+        let done = wait(&wide_worker);
+        assert!(gate2.accept(&done));
+        let reason = match &done.outcome {
+            Outcome::Stopped { reason } => Some(*reason),
+            _ => None,
+        };
+        assert_eq!(
+            reason,
+            Some(StopReason::Budget),
+            "an image-budget limit must still stop: {:?}",
+            done.outcome
         );
     }
 }

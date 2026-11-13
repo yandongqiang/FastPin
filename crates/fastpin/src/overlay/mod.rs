@@ -2003,7 +2003,7 @@ impl OverlayView {
                 state.status = match reason {
                     StopReason::HeightCap => "已达最大高度".to_string(),
                     StopReason::Budget => "图像超出内存预算".to_string(),
-                    StopReason::Frame => "画面变化过大，已停止".to_string(),
+                    StopReason::FrameSize => "捕获帧尺寸变化，请重试".to_string(),
                 };
                 cx.notify();
                 false
@@ -2027,6 +2027,18 @@ impl OverlayView {
                     }
                     // Nothing to say: keep the previous status.
                     Verdict::Idle => {}
+                    // A static page with a local animation: neutral status,
+                    // never "画面移动", and the session stays alive.
+                    Verdict::LocalChange => {
+                        state.status = format!(
+                            "已捕获 {} 段 · 共 {} px · 等待滚动…",
+                            frame.segments, frame.total_height
+                        );
+                    }
+                    // A transient bad frame was skipped; keep capturing.
+                    Verdict::FrameSkipped => {
+                        state.status = "捕获帧瞬时异常，已跳过该帧".to_string();
+                    }
                     Verdict::StaticEdge => {
                         // The band is covering the strip right now: say so on
                         // the first tick instead of after 1.5 s.

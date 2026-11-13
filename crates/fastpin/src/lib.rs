@@ -16,6 +16,7 @@ pub mod gpui_bridge;
 pub mod hdr;
 pub mod hotkey;
 pub mod longcapture;
+pub mod longworker;
 mod migrate;
 pub mod ocr;
 pub mod overlay;

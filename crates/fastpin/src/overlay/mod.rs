@@ -44,9 +44,9 @@ use crate::geom::{
     hit_test, move_rect, physical_source_rect, resize_rect, Point, Rect, SelectionHitKind,
 };
 use crate::gpui_bridge::present_freeze_from_texture;
-use crate::longcapture::{
-    bgra_to_gray, classify_scroll_diag, infer_axis, normalize_bgra, rotate_bgra270, Axis, Stitcher,
-    ACCEPT_SCORE,
+use crate::longcapture::{bgra_to_gray, infer_axis, normalize_bgra, Axis, Stitcher};
+use crate::longworker::{
+    Done, Job, LongWorker, Outcome, Poll, Rebase, ResultGate, StopReason, Verdict, FINISH_WAIT,
 };
 use crate::overlay::annotate::{
     MaskCache, MosaicCache, MosaicTiles, SwatchesModel, TextDraft, TextLayer, ToolbarModel,
@@ -122,6 +122,11 @@ pub struct OverlayView {
     cap: Option<CapturedDesktop>,
     perf: Rc<RefCell<Option<PerfSession>>>,
     freeze_swap: Option<IDXGISwapChain1>,
+    /// Device generation the attached freeze visual belongs to. `None` while
+    /// there is no published visual (or after a reset dropped it).
+    freeze_generation: Option<u64>,
+    /// A post-reset rebuild task is already scheduled.
+    recovering_gpu: bool,
     origin_x: i32,
     origin_y: i32,
     phase: Phase,
@@ -214,20 +219,39 @@ struct LongCaptureState {
     /// Screen-space scroll axis. Horizontal sessions rotate every frame so the
     /// SAD matcher and stitcher keep working on a vertical axis.
     axis: Axis,
-    stitcher: Stitcher,
-    prev_gray: Vec<u8>,
     status: String,
     /// Bumped per session so a stale poll task from a cancelled session
     /// cannot append into a new one.
     gen: u64,
+    /// Device generation the session's GPU resources belong to. A reset makes
+    /// every one of them stale, so the poll loop stops instead of spinning on
+    /// failed WGC crops.
+    gpu_generation: u64,
     /// Height cap hit: polling stops, the bar stays up for 完成/取消.
     maxed: bool,
-    /// Ticks served, for the diagnostic log.
-    ticks: u64,
     /// Persistent WGC session for this capture's monitor, if one could be
     /// started. `None` falls back to `capture_region_bgra` per tick (a fresh
     /// WGC start every poll), same as before this session existed.
     live: Option<LongLive>,
+    /// Stall detected: polling stops, the bar stays up for 完成/取消 with the
+    /// reason in `status`.
+    stalled: bool,
+    /// Polls served, used by the paused-page decimation.
+    poll_ticks: u64,
+    /// Polls that found the previous frame still in the worker: the tick that
+    /// would have exceeded `LONG_POLL`, reported in the next diag line.
+    late_ticks: u64,
+    /// Latest `StallTracker::paused` from the worker (P1-05 decimation).
+    stall_paused: bool,
+    /// Latest stitched counters, mirrored from the last applied result so the
+    /// bar can draw without touching the worker's buffer.
+    segments: usize,
+    total_height: usize,
+    /// Generation/epoch/sequence gate: the only thing that decides whether a
+    /// finished job may touch this session (P1-01).
+    gate: ResultGate,
+    /// Owns `prev_gray` + `Stitcher`; every frame-sized pass runs there.
+    worker: LongWorker,
 }
 
 fn long_status_hint(axis: Axis) -> String {
@@ -243,6 +267,8 @@ fn long_status_hint(axis: Axis) -> String {
 struct LongLive {
     session: WgcLive,
     gpu: Gpu,
+    /// Device generation the WGC session and `gpu` handle were created on.
+    generation: u64,
     sdr_white: f32,
     mon_x: i32,
     mon_y: i32,
@@ -253,11 +279,14 @@ struct LongLive {
 /// cheaper, so a 150 ms cadence keeps far more overlap per scroll step instead
 /// of letting the content outrun the strip between samples.
 const LONG_POLL: Duration = Duration::from_millis(150);
-/// Sampled pixel-change fraction above which a rejected tick is reported as
-/// "the page moved faster than the overlap" instead of silence.
-const FAST_SCROLL_CHANGED: f64 = 0.45;
-/// D3D texture height limit, same cap as the C# LongImageBuffer.
-const LONG_MAX_H: usize = 16384;
+/// D3D texture height limit, same cap as the C# LongImageBuffer. Derived from
+/// the shared image budget so the stitcher and the export path cannot drift.
+const LONG_MAX_H: usize = crate::image_budget::MAX_SIDE as usize;
+/// While the page has been still for `STALL_TICKS`, only every Nth poll
+/// captures a frame (P1-05). A reader who paused should not cost a WGC crop,
+/// a rotation and a full-frame grayscale pass every 150 ms; a 4x slower poll
+/// notices the resumed scroll within 600 ms.
+const SLOW_POLL_EVERY: u64 = 4;
 
 /// Click-through for the selection while a long capture runs: the wheel must
 /// reach the app underneath, not the overlay. HTTRANSPARENT from a WM_NCHITTEST
@@ -399,7 +428,14 @@ fn show_overlay_inner(
     copy_only: bool,
 ) -> Result<Entity<OverlayView>> {
     let swap = match cx.with_gpu_context(|device, context| {
-        present_freeze_from_texture(device, context, &cap.sdr_display, cap.width, cap.height)
+        present_freeze_from_texture(
+            device,
+            context,
+            &cap.sdr_display,
+            cap.width,
+            cap.height,
+            cap.generation,
+        )
     }) {
         Some(Ok(s)) => s,
         Some(Err(e)) => return Err(e),
@@ -481,6 +517,8 @@ impl OverlayView {
             cap: None,
             perf: Rc::new(RefCell::new(None)),
             freeze_swap: None,
+            freeze_generation: None,
+            recovering_gpu: false,
             origin_x: 0,
             origin_y: 0,
             phase: Phase::Selecting,
@@ -517,6 +555,7 @@ impl OverlayView {
         copy_only: bool,
         window: &mut Window,
     ) -> Self {
+        let freeze_generation = Some(cap.generation);
         let mut view = Self {
             selection: Rect::new(0.0, 0.0, 0.0, 0.0),
             hover: None,
@@ -526,6 +565,8 @@ impl OverlayView {
             cap: Some(cap),
             perf: Rc::new(RefCell::new(Some(perf))),
             freeze_swap: Some(swap),
+            freeze_generation,
+            recovering_gpu: false,
             origin_x: 0,
             origin_y: 0,
             phase: Phase::Selecting,
@@ -571,6 +612,8 @@ impl OverlayView {
         self.cap = Some(cap);
         self.perf = Rc::new(RefCell::new(Some(perf)));
         self.freeze_swap = Some(swap);
+        self.freeze_generation = self.cap.as_ref().map(|c| c.generation);
+        self.recovering_gpu = false;
         self.phase = Phase::Selecting;
         self.down = false;
         self.from_drag = false;
@@ -688,6 +731,112 @@ impl OverlayView {
         }
         self.refresh_magnifier_gpu(cx);
         cx.notify();
+    }
+
+    /// Painted-frame hook: after a device reset the DirectComposition tree is
+    /// recreated and the freeze visual is empty. Schedule exactly one rebuild
+    /// per generation (the state machine also refuses while resetting).
+    fn maybe_recover_gpu(&mut self, cx: &mut Context<Self>) {
+        if !self.visible || self.recovering_gpu {
+            return;
+        }
+        let state = crate::gpu_lifecycle::snapshot();
+        if !crate::gpu_lifecycle::should_rebuild_freeze(state, self.freeze_generation) {
+            return;
+        }
+        self.recovering_gpu = true;
+        cx.spawn(async move |_this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1))
+                .await;
+            cx.update(|cx| {
+                if let Some(handle) = OVERLAY_WINDOW.with(|s| *s.borrow()) {
+                    let _ = handle.update(cx, |view, window, cx| {
+                        view.recover_gpu_after_reset(window, cx);
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Rebuild the freeze frame on the new device and re-attach it to the
+    /// recreated DirectComposition tree. A failed capture/present closes the
+    /// overlay cleanly instead of leaving it on an empty visual.
+    fn recover_gpu_after_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.recovering_gpu = false;
+        if !self.visible {
+            return;
+        }
+        let generation = crate::gpu_lifecycle::current_generation();
+        if !crate::gpu_lifecycle::is_usable(generation) {
+            // Still resetting: the next painted frame retries.
+            return;
+        }
+        // Every live WGC session belongs to the old device generation.
+        if self.long.take().is_some() {
+            set_long_passthrough(crate::platform::hwnd_of(window), None);
+            self.phase = Phase::Active;
+            self.show_panel(
+                "显示设备已重置",
+                "长截图已停止，请重新开始".to_string(),
+                false,
+                cx,
+            );
+        }
+        self.cap = None;
+        self.freeze_swap = None;
+        self.freeze_generation = None;
+
+        let rebuilt = (|| -> crate::error::Result<(CapturedDesktop, IDXGISwapChain1)> {
+            let mut perf = PerfSession::start();
+            let cap = crate::app::capture_from_app(cx, true, None, &mut perf)?;
+            if cap.generation != generation {
+                return Err(crate::error::Error::new(
+                    "GPU reset recovery captured a stale generation",
+                ));
+            }
+            let swap = match cx.with_gpu_context(|device, context| {
+                present_freeze_from_texture(
+                    device,
+                    context,
+                    &cap.sdr_display,
+                    cap.width,
+                    cap.height,
+                    cap.generation,
+                )
+            }) {
+                Some(Ok(swap)) => swap,
+                Some(Err(e)) => return Err(e),
+                None => return Err(crate::error::Error::new("GPU context unavailable")),
+            };
+            Ok((cap, swap))
+        })();
+
+        match rebuilt {
+            Ok((cap, swap)) => {
+                self.freeze_size = (cap.width, cap.height);
+                self.cap = Some(cap);
+                self.freeze_swap = Some(swap);
+                self.freeze_generation = Some(generation);
+                self.phase = Phase::Active;
+                self.mag = None;
+                self.mag_origin = None;
+                self.sync_from_cap(window);
+                // Re-publish into the tree gpui just recreated; gpui keeps the
+                // freeze visual below the UI visual.
+                self.attach_and_show(window, cx);
+                self.show_panel("显示设备已重置", "截图窗口已恢复".to_string(), false, cx);
+                if crate::gpu_lifecycle::acknowledge_recovery().is_ok() {
+                    crate::perf::log_app("gpu reset: overlay freeze visual rebuilt");
+                }
+            }
+            Err(e) => {
+                crate::perf::log_app(&format!("gpu reset: overlay recovery failed: {e}"));
+                let _ = crate::gpu_lifecycle::acknowledge_recovery();
+                self.finish(empty_result(), window, cx);
+            }
+        }
     }
 
     fn schedule_bench_auto_hide(&self, cx: &mut Context<Self>) {
@@ -1294,32 +1443,71 @@ impl OverlayView {
         if pw != result.w || ph != result.h {
             return;
         }
-        let (norm, nw, nh) = normalize_bgra(&px, w, h, axis);
+        let (norm, nw, nh) = match normalize_bgra(&px, w, h, axis) {
+            Ok(v) => v,
+            Err(e) => {
+                self.show_panel("长截图失败", e.to_string(), false, cx);
+                return;
+            }
+        };
         // The 16384 px cap applies in matcher space, i.e. to the scroll axis:
         // for a horizontal session that is the stitched long side (exported
         // width), which is exactly the D3D limit that matters.
-        let Some(mut stitcher) = Stitcher::new(nw, nh, LONG_MAX_H) else {
-            return;
+        let mut stitcher = match Stitcher::new(nw, nh, LONG_MAX_H) {
+            Ok(s) => s,
+            Err(e) => {
+                self.show_panel("长截图失败", e.to_string(), false, cx);
+                return;
+            }
         };
         if !stitcher.fill_first(norm.as_ref()) {
             return;
         }
-        let prev_gray = bgra_to_gray(norm.as_ref(), nw, nh);
+        let prev_gray = match bgra_to_gray(norm.as_ref(), nw, nh) {
+            Ok(g) => g,
+            Err(e) => {
+                self.show_panel("长截图失败", e.to_string(), false, cx);
+                return;
+            }
+        };
         self.long_seq = self.long_seq.wrapping_add(1);
         let gen = self.long_seq;
+        let gpu_generation = self
+            .cap
+            .as_ref()
+            .map(|c| c.generation)
+            .unwrap_or_else(crate::gpu_lifecycle::current_generation);
+        // The first frame is the session baseline: it is built here so a
+        // budget refusal can still be shown before the phase changes, then
+        // handed to the worker, which owns it (and every later frame) for the
+        // rest of the session.
+        let worker = match LongWorker::new(gen, axis, stitcher, prev_gray) {
+            Ok(w) => w,
+            Err(e) => {
+                self.show_panel("长截图失败", format!("后台任务启动失败：{e}"), false, cx);
+                return;
+            }
+        };
+        let (segments, total_height) = (1, nh);
         self.long = Some(LongCaptureState {
             abs_x,
             abs_y,
             w: result.w,
             h: result.h,
             axis,
-            stitcher,
-            prev_gray,
             status: long_status_hint(axis),
             gen,
+            gpu_generation,
             maxed: false,
-            ticks: 0,
             live,
+            stalled: false,
+            poll_ticks: 0,
+            late_ticks: 0,
+            stall_paused: false,
+            segments,
+            total_height,
+            gate: ResultGate::new(gen),
+            worker,
         });
         // The OCR/translate panel has no meaning mid-capture; the C# build
         // collapses ResultPanel here too.
@@ -1371,6 +1559,7 @@ impl OverlayView {
         Some(LongLive {
             session,
             gpu: cap.gpu.clone(),
+            generation: cap.generation,
             sdr_white: cap.sdr_white_nits,
             mon_x: mon.x,
             mon_y: mon.y,
@@ -1391,23 +1580,102 @@ impl OverlayView {
         .detach();
     }
 
-    /// One poll: fresh frame, SAD-align against the previous one, append the
-    /// rows that scrolled into view. Returns false when the loop should stop.
+    /// A frame could not be converted or rotated because it is over the image
+    /// budget. Stop polling but leave the bar up for 完成/取消, with a status
+    /// the user can read; the full reason goes to the diagnostic log.
+    fn stop_long_for_budget(
+        &mut self,
+        e: &crate::image_budget::BudgetError,
+        cx: &mut Context<Self>,
+    ) {
+        crate::perf::log_diag(&format!("long-capture stopped: {e}"));
+        if let Some(state) = self.long.as_mut() {
+            state.maxed = true;
+            state.status = "图像超出内存预算".to_string();
+        }
+        cx.notify();
+    }
+
+    /// One poll: fresh frame, then hand it to the worker, which aligns it
+    /// against the previous one and appends the rows that scrolled into view.
+    /// Returns false when the loop should stop.
     ///
-    /// The frame is normalized first (a horizontal session is rotated 90°) so
-    /// one vertical matcher serves both axes. Everything the user notices as
-    /// latency happens between the two log lines of a tick, which is why the
-    /// per-tick `elapsed_ms`, score, rival margin and row count are logged.
+    /// The UI thread only ever does the capture/readback (the D3D11 immediate
+    /// context is single-threaded, so the staging `Map` cannot move), then
+    /// applies the verdict of the previous frame. All of normalize, gray, SAD,
+    /// stitch and the diag write happen on the worker (P1-01).
     fn long_tick(&mut self, gen: u64, cx: &mut Context<Self>) -> bool {
         let started = Instant::now();
+        // A device reset invalidates the live WGC session and the capture
+        // generation. Stop the session with a visible reason instead of
+        // polling forever on a dead session.
+        let gpu_stale = self.long.as_ref().is_some_and(|state| {
+            !crate::gpu_lifecycle::is_usable(state.gpu_generation)
+                || state
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| !crate::gpu_lifecycle::is_usable(live.generation))
+        });
+        if gpu_stale {
+            self.abort_long_for_gpu_reset(cx);
+            return false;
+        }
         let Some(state) = self.long.as_ref() else {
             return false;
         };
-        if state.gen != gen || state.maxed || self.phase != Phase::LongCapturing {
+        if state.gen != gen || state.maxed || state.stalled || self.phase != Phase::LongCapturing {
             return false;
         }
+        // Fold in whatever the worker finished since the last poll. Only one
+        // job is ever in flight, so this is normally exactly one result; a
+        // stale one (old generation or old axis) is dropped by the gate.
+        loop {
+            let polled = match self.long.as_ref() {
+                Some(state) => state.worker.poll(),
+                None => return false,
+            };
+            match polled {
+                Poll::Empty => break,
+                Poll::Done(done) => {
+                    if !self.apply_long_done(done, cx) {
+                        return false;
+                    }
+                }
+                // The thread ended under an active session: no result can
+                // arrive, so stop instead of waiting on the in-flight job.
+                Poll::Gone => {
+                    if let Some(state) = self.long.as_mut() {
+                        state.maxed = true;
+                        state.status = "长截图后台任务已停止".to_string();
+                    }
+                    cx.notify();
+                    return false;
+                }
+            }
+        }
+        let Some(state) = self.long.as_mut() else {
+            return false;
+        };
+        if state.maxed || state.stalled || self.phase != Phase::LongCapturing {
+            return false;
+        }
+        // Still processing the previous frame: skip this sample. The cadence
+        // then follows the worker instead of queueing frames it cannot keep
+        // up with, and the skip is counted for the next diag line.
+        if state.gate.in_flight() {
+            state.late_ticks = state.late_ticks.wrapping_add(1);
+            state.poll_ticks = state.poll_ticks.wrapping_add(1);
+            return true;
+        }
+        // Reduced cadence while the page is still (P1-05): skip the capture
+        // and the align pass, but keep the poll clock moving so the
+        // decimation stays in phase with the loop.
+        if state.stall_paused && state.poll_ticks % SLOW_POLL_EVERY != 0 {
+            state.poll_ticks = state.poll_ticks.wrapping_add(1);
+            return true;
+        }
         let (ax, ay, w, h) = (state.abs_x, state.abs_y, state.w, state.h);
-        let (axis, ticks) = (state.axis, state.ticks);
+        let (axis, epoch) = (state.axis, state.gate.epoch());
         let px = match state.live.as_ref() {
             Some(live) => match crate::app::capture_region_live(
                 cx,
@@ -1433,81 +1701,102 @@ impl OverlayView {
                 Ok(_) | Err(_) => return true,
             },
         };
-        let (norm, nw, nh) = normalize_bgra(&px, w as usize, h as usize, axis);
-        let gray = bgra_to_gray(norm.as_ref(), nw, nh);
+        state.poll_ticks = state.poll_ticks.wrapping_add(1);
+        let Some(seq) = state.gate.issue(epoch) else {
+            return true;
+        };
+        let capture_ms = started.elapsed().as_secs_f64() * 1e3;
+        let late = std::mem::take(&mut state.late_ticks);
+        let job = Job {
+            generation: gen,
+            epoch,
+            seq,
+            axis,
+            width: w as usize,
+            height: h as usize,
+            bgra: px,
+            capture_ms,
+            late,
+        };
+        if !state.worker.submit(job) {
+            // Worker gone (or cancelled): end the polling; the bar stays up.
+            state.maxed = true;
+            state.status = "长截图后台任务已停止".to_string();
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    /// Applies one finished worker result. Returns false when polling must
+    /// stop (the session ended or the worker refused the frame).
+    fn apply_long_done(&mut self, done: Done, cx: &mut Context<Self>) -> bool {
         let Some(state) = self.long.as_mut() else {
             return false;
         };
-        let strip = (nh / 4).min(32);
-        // `classify_scroll_diag` tries DOWN first and only runs the up pass
-        // when down was rejected -- a genuine up-scroll cannot produce a valid
-        // bottom-strip match and vice versa, so the common path is half the
-        // work. `ACCEPT_SCORE` is the medium band that tolerates antialiasing
-        // and noise while the rival-margin guard keeps blank/repeating
-        // content out.
-        let report = classify_scroll_diag(&state.prev_gray, &gray, nw, nh, strip, ACCEPT_SCORE);
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
-        state.ticks = ticks.wrapping_add(1);
-        match report.direction {
-            Some((is_up, offset_y, new_rows)) => {
-                // The polled region (abs_x/abs_y/w/h) never changes: only the
-                // stitching direction does. `prepend` reallocates, so the
-                // 16384 px cap is checked inside it exactly like `append`.
-                let ok = if is_up {
-                    state.stitcher.prepend(norm.as_ref(), nw, nh, new_rows)
-                } else {
-                    state.stitcher.append(norm.as_ref(), nw, nh, offset_y)
-                };
-                let (score, ratio) = if is_up {
-                    (report.up_score, report.up_ratio)
-                } else {
-                    (report.down_score, report.down_ratio)
-                };
-                crate::perf::log_diag(&format!(
-                    "long-tick t{} axis={} elapsed_ms={elapsed_ms:.1} score={score:.3} \
-                     runner_up={ratio:.2} is_up={is_up} new_rows={new_rows} total={}px",
-                    state.ticks,
-                    axis.label(),
-                    state.stitcher.total_height(),
-                ));
-                if !ok {
-                    state.maxed = true;
-                    state.status = "已达最大高度".to_string();
-                    cx.notify();
-                    return false;
+        // The gate is the only place a result is accepted: a result from a
+        // closed session or a replaced axis is dropped before it can reach the
+        // pixels or the status line.
+        if !state.gate.accept(&done) {
+            return true;
+        }
+        match done.outcome {
+            Outcome::Discarded => true,
+            Outcome::Stopped { reason, .. } => {
+                match reason {
+                    StopReason::Stalled { static_edge } => {
+                        state.stalled = true;
+                        state.status = if static_edge {
+                            "固定页眉/页脚遮挡，请缩小选区".to_string()
+                        } else {
+                            "未检测到滚动/内容未变化".to_string()
+                        };
+                    }
+                    // Every other refusal is surfaced: the bar keeps the last
+                    // frame and 完成/取消 available, and the status says which
+                    // cap was hit instead of a bare "已达最大高度" for all of
+                    // them.
+                    other => {
+                        state.maxed = true;
+                        state.status = match other {
+                            StopReason::HeightCap => "已达最大高度".to_string(),
+                            StopReason::Budget => "图像超出内存预算".to_string(),
+                            _ => "画面变化过大，已停止".to_string(),
+                        };
+                    }
                 }
-                // Always align the NEXT tick against the latest captured frame,
-                // not the stitched buffer, so switching scroll direction works
-                // frame-to-frame.
-                state.prev_gray = gray;
-                state.status = format!(
-                    "已捕获 {} 段 · 共 {} px",
-                    state.stitcher.segment_count(),
-                    state.stitcher.total_height()
-                );
+                cx.notify();
+                false
             }
-            None => {
-                crate::perf::log_diag(&format!(
-                    "long-tick t{} axis={} elapsed_ms={elapsed_ms:.1} \
-                     score={:.3}/{:.3} runner_up={:.2}/{:.2} is_up=- new_rows=0 changed={:.2}",
-                    state.ticks,
-                    axis.label(),
-                    report.down_score,
-                    report.up_score,
-                    report.down_ratio,
-                    report.up_ratio,
-                    report.changed,
-                ));
-                // A frame that clearly changed but could not be aligned means
-                // the scroll outran the overlap strip. That is not a reason to
-                // end the session -- keep polling and nudge the user.
-                if report.changed > FAST_SCROLL_CHANGED {
-                    state.status = "滚动过快，请慢一点".to_string();
+            Outcome::Frame(frame) => {
+                state.segments = frame.segments;
+                state.total_height = frame.total_height;
+                state.stall_paused = frame.paused;
+                match frame.verdict {
+                    Verdict::Progress { .. } => {
+                        state.status = format!(
+                            "已捕获 {} 段 · 共 {} px",
+                            frame.segments, frame.total_height
+                        );
+                    }
+                    Verdict::Paused => {
+                        state.status = "未检测到滚动，继续等待…".to_string();
+                    }
+                    // Nothing to say: keep the previous status.
+                    Verdict::Idle => {}
+                    Verdict::StaticEdge => {
+                        // The band is covering the strip right now: say so on
+                        // the first tick instead of after 1.5 s.
+                        state.status = "固定页眉/页脚遮挡，请缩小选区".to_string();
+                    }
+                    Verdict::FastScroll => {
+                        state.status = "滚动过快，请慢一点".to_string();
+                    }
                 }
+                cx.notify();
+                true
             }
         }
-        cx.notify();
-        true
     }
 
     /// Captures one fresh frame of the long-capture region, preferring the
@@ -1558,19 +1847,55 @@ impl OverlayView {
         let Some(px) = self.long_frame(cx, ax, ay, w, h) else {
             return;
         };
-        let (norm, nw, nh) = normalize_bgra(&px, w as usize, h as usize, next);
-        let Some(mut stitcher) = Stitcher::new(nw, nh, LONG_MAX_H) else {
-            return;
+        let (norm, nw, nh) = match normalize_bgra(&px, w as usize, h as usize, next) {
+            Ok(v) => v,
+            Err(e) => {
+                self.stop_long_for_budget(&e, cx);
+                return;
+            }
+        };
+        let mut stitcher = match Stitcher::new(nw, nh, LONG_MAX_H) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::perf::log_diag(&format!("long-capture axis switch: {e}"));
+                if let Some(state) = self.long.as_mut() {
+                    state.status = "图像超出内存预算".to_string();
+                }
+                cx.notify();
+                return;
+            }
         };
         if !stitcher.fill_first(norm.as_ref()) {
             return;
         }
-        let prev_gray = bgra_to_gray(norm.as_ref(), nw, nh);
+        let prev_gray = match bgra_to_gray(norm.as_ref(), nw, nh) {
+            Ok(g) => g,
+            Err(e) => {
+                self.stop_long_for_budget(&e, cx);
+                return;
+            }
+        };
         if let Some(state) = self.long.as_mut() {
+            // A fresh epoch invalidates the in-flight frame of the old axis and
+            // hands the worker a new baseline, so the two axes can never mix
+            // their pixel rows.
+            let epoch = state.gate.epoch().wrapping_add(1);
+            let generation = state.gen;
+            state.worker.rebaseline(Rebase {
+                generation,
+                epoch,
+                axis: next,
+                stitcher,
+                prev_gray,
+            });
+            state.gate.rebaseline(epoch);
             state.axis = next;
-            state.stitcher = stitcher;
-            state.prev_gray = prev_gray;
             state.maxed = false;
+            // A fresh baseline on the other axis starts a fresh progress run.
+            state.stalled = false;
+            state.stall_paused = false;
+            state.segments = 1;
+            state.total_height = nh;
             state.status = long_status_hint(next);
         }
         crate::perf::log_diag(&format!("long-capture: axis switched to {}", next.label()));
@@ -1579,23 +1904,28 @@ impl OverlayView {
 
     /// 完成 on the bar: stitch whatever was captured and export it like a
     /// finished shot, then close the overlay without another export.
+    ///
+    /// The worker owns the stitcher now, so 完成 is a terminal hand-off: it
+    /// folds the headroom away, rotates a horizontal capture back to screen
+    /// space and returns the pixels. That wait is bounded by one pass over the
+    /// already-captured buffer and only happens when the user ends the session.
     fn finish_long_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(state) = self.long.take() else {
+        let Some(mut state) = self.long.take() else {
             return;
         };
         set_long_passthrough(crate::platform::hwnd_of(window), None);
         self.phase = Phase::Active;
-        let axis = state.axis;
-        let (px, w, h) = state.stitcher.into_pixels();
-        // Rotate the stitched image back to screen space. The cap was applied
-        // on the matcher's long side, so the exported width (horizontal) or
-        // height (vertical) is the dimension bounded by LONG_MAX_H. The
-        // vertical path moves the buffer instead of copying it.
-        let (px, w, h) = match axis {
-            Axis::Vertical => (px, w as usize, h as usize),
-            Axis::Horizontal => rotate_bgra270(&px, w as usize, h as usize),
-        };
-        crate::app::export_long_capture(px, w as u32, h as u32);
+        match state.worker.finish(FINISH_WAIT) {
+            Ok((px, w, h)) => crate::app::export_long_capture(px, w, h),
+            Err(msg) => {
+                // The stitched buffer was already within budget, so this is a
+                // failed allocation or a stopped worker rather than a size
+                // refusal; keep the reason visible instead of closing silently.
+                crate::perf::log_app(&format!("long capture export: {msg}"));
+                self.show_panel("长截图失败", msg, false, cx);
+                return;
+            }
+        }
         self.finish(empty_result(), window, cx);
     }
 
@@ -1607,6 +1937,34 @@ impl OverlayView {
         set_long_passthrough(crate::platform::hwnd_of(window), None);
         self.phase = Phase::Active;
         cx.notify();
+    }
+
+    /// The GPU device was lost/reset under a running long capture. The WGC
+    /// live session and every stitched GPU crop are stale, so end the session
+    /// with a status the user can read instead of keeping the poll loop alive.
+    fn abort_long_for_gpu_reset(&mut self, cx: &mut Context<Self>) {
+        if self.long.take().is_none() {
+            return;
+        }
+        self.phase = Phase::Active;
+        self.show_panel(
+            "显示设备已重置",
+            "长截图已停止，请重新开始".to_string(),
+            false,
+            cx,
+        );
+        // Clearing the click-through hole needs the window; do it once the
+        // foreground task can borrow the overlay handle again.
+        cx.spawn(async move |_this, cx| {
+            cx.update(|cx| {
+                if let Some(handle) = OVERLAY_WINDOW.with(|s| *s.borrow()) {
+                    let _ = handle.update(cx, |_view, window, _cx| {
+                        set_long_passthrough(crate::platform::hwnd_of(window), None);
+                    });
+                }
+            });
+        })
+        .detach();
     }
 
     fn run_ocr(&mut self, cx: &mut Context<Self>) {
@@ -2274,6 +2632,7 @@ impl EntityInputHandler for OverlayView {
 
 impl Render for OverlayView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.maybe_recover_gpu(cx);
         if self.visible {
             window.request_animation_frame();
         }

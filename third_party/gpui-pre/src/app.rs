@@ -1966,6 +1966,13 @@ impl App {
         self.platform.on_gpu_reset_begin(Box::new(callback));
     }
 
+    /// Registers a callback that runs on the main thread after the DirectX
+    /// devices were recreated. Receives the new `gpu_generation`.
+    #[cfg(target_os = "windows")]
+    pub fn on_gpu_reset_end(&self, callback: impl FnMut(u64) + 'static) {
+        self.platform.on_gpu_reset_end(Box::new(callback));
+    }
+
     /// Releases the platform's DirectX devices (and stops vsync). Only valid
     /// while no window is open.
     pub fn release_gpu_devices(&self) {

@@ -1,6 +1,6 @@
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/Cargo.toml b/Cargo.toml
---- a/Cargo.toml	2026-11-10 18:14:27.270948400 +0800
-+++ b/Cargo.toml	2026-11-10 18:14:27.425316600 +0800
+--- a/Cargo.toml	2026-11-12 17:50:29.468200800 +0800
++++ b/Cargo.toml	2026-11-12 17:50:29.658639300 +0800
 @@ -636,6 +636,19 @@
      "Win32_System_WindowsProgramming",
  ]
@@ -22,9 +22,9 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
  dbg_macro = "deny"
  declare_interior_mutable_const = "deny"
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/app.rs b/src/app.rs
---- a/src/app.rs	2026-11-10 18:14:27.210372500 +0800
-+++ b/src/app.rs	2026-11-10 18:14:27.363562900 +0800
-@@ -1924,6 +1924,54 @@
+--- a/src/app.rs	2026-11-12 17:50:29.353787900 +0800
++++ b/src/app.rs	2026-11-12 17:50:29.579087700 +0800
+@@ -1924,6 +1924,61 @@
          self.platform.should_auto_hide_scrollbars()
      }
  
@@ -70,6 +70,13 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
 +        self.platform.on_gpu_reset_begin(Box::new(callback));
 +    }
 +
++    /// Registers a callback that runs on the main thread after the DirectX
++    /// devices were recreated. Receives the new `gpu_generation`.
++    #[cfg(target_os = "windows")]
++    pub fn on_gpu_reset_end(&self, callback: impl FnMut(u64) + 'static) {
++        self.platform.on_gpu_reset_end(Box::new(callback));
++    }
++
 +    /// Releases the platform's DirectX devices (and stops vsync). Only valid
 +    /// while no window is open.
 +    pub fn release_gpu_devices(&self) {
@@ -80,9 +87,9 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
      pub fn restart(&mut self) {
          self.restart_observers
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform.rs b/src/platform.rs
---- a/src/platform.rs	2026-11-10 18:14:27.211684900 +0800
-+++ b/src/platform.rs	2026-11-10 18:14:27.365565800 +0800
-@@ -601,6 +601,44 @@
+--- a/src/platform.rs	2026-11-12 17:50:29.356788700 +0800
++++ b/src/platform.rs	2026-11-12 17:50:29.580086700 +0800
+@@ -601,6 +601,49 @@
      fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
      fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
      fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
@@ -121,13 +128,18 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
 +    #[cfg(target_os = "windows")]
 +    fn on_gpu_reset_begin(&self, _callback: Box<dyn FnMut()>) {}
 +
++    /// Registers a callback that runs on the main thread after the new DirectX
++    /// device set is installed. The argument is the new `gpu_generation`.
++    #[cfg(target_os = "windows")]
++    fn on_gpu_reset_end(&self, _callback: Box<dyn FnMut(u64)>) {}
++
 +    /// Releases the platform's DirectX devices (and stops vsync). Only valid
 +    /// while no window is open.
 +    fn release_gpu_devices(&self) {}
  }
  
  /// A handle to a platform's display, e.g. a monitor or laptop screen.
-@@ -1316,6 +1354,30 @@
+@@ -1316,6 +1359,30 @@
      #[cfg(target_os = "windows")]
      fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;
  
@@ -159,8 +171,8 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
      fn inner_window_bounds(&self) -> WindowBounds {
          self.window_bounds()
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/window.rs b/src/window.rs
---- a/src/window.rs	2026-11-10 18:14:27.178390800 +0800
-+++ b/src/window.rs	2026-11-10 18:14:27.333428600 +0800
+--- a/src/window.rs	2026-11-12 17:50:29.284933600 +0800
++++ b/src/window.rs	2026-11-12 17:50:29.539834600 +0800
 @@ -3061,6 +3061,34 @@
              .set_background_appearance(background_appearance);
      }

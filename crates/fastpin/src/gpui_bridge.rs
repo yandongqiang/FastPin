@@ -14,9 +14,10 @@ use windows::Win32::Graphics::Dxgi::{
 };
 
 use crate::capture::RestoreGpu;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
-static FREEZE_SWAP: Mutex<Option<(IDXGISwapChain1, u32, u32)>> = Mutex::new(None);
+/// Cached freeze swap chain plus the device generation it was created on.
+static FREEZE_SWAP: Mutex<Option<(IDXGISwapChain1, u32, u32, u64)>> = Mutex::new(None);
 
 /// Drop the cached freeze swapchain (GPU reset).
 pub fn drop_freeze_swapchain() {
@@ -24,21 +25,39 @@ pub fn drop_freeze_swapchain() {
 }
 
 /// Create or resize a composition swapchain, copy `src` into it, and Present.
+///
+/// `generation` is the device generation the source texture belongs to; a
+/// cached chain from another generation is discarded instead of reused.
 pub fn present_freeze_from_texture(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     src: &ID3D11Texture2D,
     width: u32,
     height: u32,
+    generation: u64,
 ) -> Result<IDXGISwapChain1> {
+    if !crate::gpu_lifecycle::is_usable(generation) {
+        return Err(Error::new(format!(
+            "stale freeze frame: generation {generation} is no longer usable"
+        )));
+    }
     let _restore = RestoreGpu(context);
     let width = width.max(1);
     let height = height.max(1);
-    let swap = reuse_or_create_swapchain(device, width, height)?;
+    let swap = reuse_or_create_swapchain(device, width, height, generation)?;
     unsafe {
-        let buf: ID3D11Texture2D = swap.GetBuffer(0)?;
+        let buf: ID3D11Texture2D = match swap.GetBuffer(0) {
+            Ok(buf) => buf,
+            Err(e) => {
+                crate::gpu_lifecycle::note_failed_device_operation(device);
+                return Err(e.into());
+            }
+        };
         context.CopyResource(&buf, src);
-        swap.Present(0, DXGI_PRESENT(0)).ok()?;
+        if let Err(e) = swap.Present(0, DXGI_PRESENT(0)).ok() {
+            crate::gpu_lifecycle::note_failed_device_operation(device);
+            return Err(e.into());
+        }
     }
     Ok(swap)
 }
@@ -47,31 +66,37 @@ fn reuse_or_create_swapchain(
     device: &ID3D11Device,
     width: u32,
     height: u32,
+    generation: u64,
 ) -> Result<IDXGISwapChain1> {
     let mut slot = FREEZE_SWAP.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((swap, w, h)) = slot.as_ref() {
-        if *w == width && *h == height {
-            return Ok(swap.clone());
-        }
-        unsafe {
-            if swap
-                .ResizeBuffers(
-                    2,
-                    width,
-                    height,
-                    DXGI_FORMAT_B8G8R8A8_UNORM,
-                    DXGI_SWAP_CHAIN_FLAG(0),
-                )
-                .is_ok()
-            {
-                let swap = swap.clone();
-                *slot = Some((swap.clone(), width, height));
-                return Ok(swap);
+    if let Some((swap, w, h, gen)) = slot.as_ref() {
+        if *gen == generation {
+            if *w == width && *h == height {
+                return Ok(swap.clone());
+            }
+            unsafe {
+                if swap
+                    .ResizeBuffers(
+                        2,
+                        width,
+                        height,
+                        DXGI_FORMAT_B8G8R8A8_UNORM,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                    .is_ok()
+                {
+                    let swap = swap.clone();
+                    *slot = Some((swap.clone(), width, height, generation));
+                    return Ok(swap);
+                }
             }
         }
     }
+    // A chain from an older device cannot be resized onto the new one, and a
+    // failed resize leaves it unusable; let it drop and create a fresh chain.
+    *slot = None;
     let swap = unsafe { create_composition_swapchain(device, width, height)? };
-    *slot = Some((swap.clone(), width, height));
+    *slot = Some((swap.clone(), width, height, generation));
     Ok(swap)
 }
 

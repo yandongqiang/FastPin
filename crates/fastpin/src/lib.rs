@@ -12,6 +12,7 @@ pub mod config;
 pub mod error;
 pub mod exclusive;
 pub mod geom;
+pub mod gpu_lifecycle;
 pub mod gpui_bridge;
 pub mod hdr;
 pub mod hotkey;

@@ -118,6 +118,10 @@ struct PlatformCallbacks {
     // FastPin overlay patch: runs on the main thread before DirectX devices are
     // recreated after a device reset, so the overlay can park its freeze frame.
     gpu_reset_begin: Cell<Option<Box<dyn FnMut()>>>,
+    // FastPin overlay patch: runs on the main thread after the new device set
+    // is installed, with the bumped generation, so the overlay can rebuild and
+    // re-publish its freeze frame.
+    gpu_reset_end: Cell<Option<Box<dyn FnMut(u64)>>>,
 }
 
 impl WindowsPlatformState {
@@ -640,6 +644,14 @@ impl Platform for WindowsPlatform {
             .state
             .callbacks
             .gpu_reset_begin
+            .set(Some(callback));
+    }
+
+    fn on_gpu_reset_end(&self, callback: Box<dyn FnMut(u64)>) {
+        self.inner
+            .state
+            .callbacks
+            .gpu_reset_end
             .set(Some(callback));
     }
 
@@ -1477,7 +1489,16 @@ impl WindowsPlatformInner {
         drop(current);
         // FastPin overlay patch: bump on the main thread next to the device swap
         // so observers can key caches to the new device set.
-        self.gpu_generation.fetch_add(1, Ordering::SeqCst);
+        let generation = self
+            .gpu_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        // FastPin overlay patch: tell the app the new device set is live so it
+        // can rebuild and re-publish the DirectComposition freeze frame.
+        self.with_callback(
+            |callbacks| &callbacks.gpu_reset_end,
+            |callback| callback(generation),
+        );
 
         Some(0)
     }

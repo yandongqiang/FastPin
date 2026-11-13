@@ -44,6 +44,7 @@ pub struct WgcReady {
 }
 
 pub fn start_monitor(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<WgcPending> {
+    gpu.ensure_current()?;
     let item = create_item_for_monitor(mon.handle)?;
     let size = item.Size()?;
     if size.Width <= 0 || size.Height <= 0 {
@@ -139,12 +140,17 @@ pub struct WgcLive {
     token: i64,
     latest: Arc<Mutex<Option<Direct3D11CaptureFrame>>>,
     hdr: bool,
+    /// Device generation the WinRT device was created on. After a reset the
+    /// session must be restarted; `take_latest` fails fast instead of handing
+    /// old-device frames to the new device.
+    generation: u64,
 }
 
 /// Starts a persistent session on `mon`, same pool/session setup as
 /// `start_item` but keeping every delivered frame in `latest` instead of a
 /// one-shot channel.
 pub fn start_live(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<WgcLive> {
+    gpu.ensure_current()?;
     let item = create_item_for_monitor(mon.handle)?;
     let size: SizeInt32 = item.Size()?;
     if size.Width <= 0 || size.Height <= 0 {
@@ -182,10 +188,15 @@ pub fn start_live(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<WgcLiv
         token,
         latest,
         hdr: mon.hdr && want_hdr,
+        generation: gpu.generation(),
     })
 }
 
 impl WgcLive {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Polls for the first frame, only used right after `start_live`.
     pub fn wait_first(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -208,6 +219,13 @@ impl WgcLive {
     /// Takes the newest frame if one arrived since the last call. `None`
     /// means nothing on screen changed -- not an error.
     pub fn take_latest(&self, gpu: &Gpu, ctx: &ID3D11DeviceContext) -> Result<Option<WgcFrame>> {
+        if self.generation != gpu.generation() || !crate::gpu_lifecycle::is_usable(self.generation)
+        {
+            return Err(Error::new(format!(
+                "stale WGC live session: generation {} is no longer usable",
+                self.generation
+            )));
+        }
         let frame = self.latest.lock().unwrap_or_else(|p| p.into_inner()).take();
         let Some(frame) = frame else {
             return Ok(None);

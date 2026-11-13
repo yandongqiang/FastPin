@@ -142,6 +142,9 @@ impl Drop for RestoreGpu<'_> {
 #[derive(Clone)]
 pub struct Gpu {
     pub device: ID3D11Device,
+    /// Device generation this handle was bound on. Never mix resources across
+    /// generations: after a reset the old COM pointers fail on the new device.
+    generation: u64,
     vs: ID3D11VertexShader,
     ps_tonemap: ID3D11PixelShader,
     ps_copy: ID3D11PixelShader,
@@ -153,12 +156,36 @@ impl Gpu {
     pub fn bind(device: &ID3D11Device, shaders: &GpuShaders) -> Self {
         Self {
             device: device.clone(),
+            generation: shaders.generation,
             vs: shaders.vs.clone(),
             ps_tonemap: shaders.ps_tonemap.clone(),
             ps_copy: shaders.ps_copy.clone(),
             ps_white_lift: shaders.ps_white_lift.clone(),
             sampler: shaders.sampler.clone(),
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Rejects a handle created on a device generation that has since been
+    /// replaced. Every public GPU operation starts with this check.
+    pub fn ensure_current(&self) -> Result<()> {
+        if crate::gpu_lifecycle::is_usable(self.generation) {
+            Ok(())
+        } else {
+            Err(Error::new(format!(
+                "stale GPU resource: generation {} is no longer usable",
+                self.generation
+            )))
+        }
+    }
+
+    /// Called on a failed D3D call: distinguishes a lost device from an
+    /// ordinary bad-argument failure and drives the reset state machine.
+    fn note_failure(&self) {
+        let _ = crate::gpu_lifecycle::note_failed_device_operation(&self.device);
     }
 
     pub fn winrt_device(&self) -> Result<windows::Graphics::DirectX::Direct3D11::IDirect3DDevice> {
@@ -172,8 +199,9 @@ impl Gpu {
         ctx: &ID3D11DeviceContext,
         src: &ID3D11Texture2D,
     ) -> Result<ID3D11Texture2D> {
+        self.ensure_current()?;
         let desc = texture_desc(src);
-        let owned = create_texture(
+        let owned = match create_texture(
             &self.device,
             desc.Width,
             desc.Height,
@@ -181,7 +209,13 @@ impl Gpu {
             D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
             D3D11_USAGE_DEFAULT,
             0,
-        )?;
+        ) {
+            Ok(tex) => tex,
+            Err(e) => {
+                self.note_failure();
+                return Err(e);
+            }
+        };
         unsafe {
             ctx.CopyResource(&owned, src);
         }
@@ -195,8 +229,9 @@ impl Gpu {
         src: &ID3D11Texture2D,
         sdr_white_nits: f32,
     ) -> Result<ID3D11Texture2D> {
+        self.ensure_current()?;
         let desc = texture_desc(src);
-        let dest = create_texture(
+        let dest = match create_texture(
             &self.device,
             desc.Width,
             desc.Height,
@@ -204,7 +239,13 @@ impl Gpu {
             D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
             D3D11_USAGE_DEFAULT,
             0,
-        )?;
+        ) {
+            Ok(tex) => tex,
+            Err(e) => {
+                self.note_failure();
+                return Err(e);
+            }
+        };
         let hdr = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
         let mode = if hdr {
             BlitMode::Tonemap
@@ -233,6 +274,7 @@ impl Gpu {
         dst_y: u32,
         sdr_white: f32,
     ) -> Result<()> {
+        self.ensure_current()?;
         let desc = texture_desc(src);
         self.blit(
             ctx,
@@ -257,12 +299,22 @@ impl Gpu {
         let (dst_x, dst_y, w, h) = dest_rect;
         unsafe {
             let mut srv = None;
-            self.device
-                .CreateShaderResourceView(src, None, Some(&mut srv))?;
+            if let Err(e) = self
+                .device
+                .CreateShaderResourceView(src, None, Some(&mut srv))
+            {
+                self.note_failure();
+                return Err(e.into());
+            }
             let srv = srv.ok_or_else(|| Error::new("SRV"))?;
             let mut rtv = None;
-            self.device
-                .CreateRenderTargetView(dest, None, Some(&mut rtv))?;
+            if let Err(e) = self
+                .device
+                .CreateRenderTargetView(dest, None, Some(&mut rtv))
+            {
+                self.note_failure();
+                return Err(e.into());
+            }
             let rtv: ID3D11RenderTargetView = rtv.ok_or_else(|| Error::new("RTV"))?;
 
             let vp = D3D11_VIEWPORT {
@@ -324,10 +376,11 @@ impl Gpu {
         w: u32,
         h: u32,
     ) -> Result<(Vec<u8>, u32, u32, u32)> {
+        self.ensure_current()?;
         let desc = texture_desc(src);
         let w = w.min(desc.Width.saturating_sub(x)).max(1);
         let h = h.min(desc.Height.saturating_sub(y)).max(1);
-        let staging = create_texture(
+        let staging = match create_texture(
             &self.device,
             w,
             h,
@@ -335,7 +388,13 @@ impl Gpu {
             Default::default(),
             D3D11_USAGE_STAGING,
             D3D11_CPU_ACCESS_READ.0 as u32,
-        )?;
+        ) {
+            Ok(tex) => tex,
+            Err(e) => {
+                self.note_failure();
+                return Err(e);
+            }
+        };
         unsafe {
             let box_ = D3D11_BOX {
                 left: x,
@@ -347,7 +406,10 @@ impl Gpu {
             };
             ctx.CopySubresourceRegion(&staging, 0, 0, 0, 0, src, 0, Some(&box_));
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            if let Err(e) = ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) {
+                self.note_failure();
+                return Err(e.into());
+            }
             let stride = mapped.RowPitch;
             let size = stride * h;
             let slice = std::slice::from_raw_parts(mapped.pData as *const u8, size as usize);
@@ -364,11 +426,12 @@ impl Gpu {
         ctx: &ID3D11DeviceContext,
         src: &ID3D11Texture2D,
     ) -> Result<(Vec<u8>, u32, u32, u32)> {
+        self.ensure_current()?;
         let desc = texture_desc(src);
         if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
             return Err(Error::new("read_bgra expects a BGRA8 texture"));
         }
-        let staging = create_texture(
+        let staging = match create_texture(
             &self.device,
             desc.Width,
             desc.Height,
@@ -376,11 +439,20 @@ impl Gpu {
             Default::default(),
             D3D11_USAGE_STAGING,
             D3D11_CPU_ACCESS_READ.0 as u32,
-        )?;
+        ) {
+            Ok(tex) => tex,
+            Err(e) => {
+                self.note_failure();
+                return Err(e);
+            }
+        };
         unsafe {
             ctx.CopyResource(&staging, src);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            if let Err(e) = ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) {
+                self.note_failure();
+                return Err(e.into());
+            }
             let stride = mapped.RowPitch;
             let size = stride * desc.Height;
             let slice = std::slice::from_raw_parts(mapped.pData as *const u8, size as usize);

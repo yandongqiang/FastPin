@@ -26,6 +26,9 @@ pub(super) const FRAME_WAIT: std::time::Duration = std::time::Duration::from_mil
 
 pub struct CapturedDesktop {
     pub gpu: Gpu,
+    /// Device generation this capture was taken on. A capture from an older
+    /// generation must never be cropped/presented on the replacement device.
+    pub generation: u64,
     /// GPU BGRA8 display texture used as overlay freeze background (no CPU blit).
     pub sdr_display: ID3D11Texture2D,
     pub width: u32,
@@ -275,8 +278,10 @@ pub fn capture_for_action(
     let sdr_display = gpu.to_sdr_bgra(ctx, &composite, sdr_white)?;
     perf.mark("T5");
 
+    let generation = gpu.generation();
     Ok(CapturedDesktop {
         gpu,
+        generation,
         sdr_display,
         width,
         height,
@@ -297,6 +302,12 @@ pub fn crop_sdr_bgra(
     w: u32,
     h: u32,
 ) -> Result<(Vec<u8>, u32, u32, u32)> {
+    if !crate::gpu_lifecycle::is_usable(cap.generation) {
+        return Err(Error::new(format!(
+            "stale capture: generation {} is no longer usable",
+            cap.generation
+        )));
+    }
     let _restore = d3d::RestoreGpu(ctx);
     cap.gpu.read_bgra_region(ctx, &cap.sdr_display, x, y, w, h)
 }

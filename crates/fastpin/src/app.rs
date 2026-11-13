@@ -42,8 +42,8 @@ use crate::platform::{
     action_from_wparam, action_wparam, add_tray_icon, handle_tray, install_ll_hook, load_app_icon,
     register_emergency_quit, register_fallback_hotkeys, remove_tray_icon, set_dpi_aware,
     set_hook_target, taskbar_created_message, uninstall_ll_hook, unpack_hotkey,
-    unregister_fallback_hotkeys, SingleInstance, TrayCommand, EMERGENCY_QUIT_ID, WM_TRAYICON,
-    WM_FASTPIN_HOTKEY, WM_FASTPIN_HOTKEY_RECORDED, WM_FASTPIN_PIN_MENU, WM_FASTPIN_SETTINGS,
+    unregister_fallback_hotkeys, SingleInstance, TrayCommand, EMERGENCY_QUIT_ID, WM_FASTPIN_HOTKEY,
+    WM_FASTPIN_HOTKEY_RECORDED, WM_FASTPIN_PIN_MENU, WM_FASTPIN_SETTINGS, WM_TRAYICON,
 };
 
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -94,19 +94,32 @@ fn with_gpui_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 
 fn install_gpu_lifecycle(cx: &App) {
     bind_gpui_app(cx);
+    crate::gpu_lifecycle::init(cx.gpu_generation());
     cx.on_gpu_reset_begin(|| {
+        let _ = crate::gpu_lifecycle::begin_reset();
         drop_gpu_resources();
         drop_freeze_swapchain();
     });
+    // Patched gpui-pre hook: fires after the platform swapped in the new
+    // device set and bumped `gpu_generation()`, before windows are repainted.
+    cx.on_gpu_reset_end(|generation| {
+        let _ = crate::gpu_lifecycle::note_device_recreated(generation);
+    });
 }
 
-fn capture_from_app(
+pub(crate) fn capture_from_app(
     cx: &mut App,
     region: bool,
     region_hint: Option<(i32, i32, u32, u32)>,
     perf: &mut PerfSession,
 ) -> Result<CapturedDesktop> {
     let generation = cx.gpu_generation();
+    // A reset-end callback may have been missed; trust the platform's
+    // generation so a capture is not refused forever.
+    crate::gpu_lifecycle::observe_generation(generation);
+    if !crate::gpu_lifecycle::accepts_new_work() {
+        return Err(Error::new("GPU device is resetting; capture refused"));
+    }
     let overlay_luid = cx.adapter_luid().unwrap_or((0, 0));
     // Borrow GPU only long enough to clone the device and compile shaders — do not hold
     // with_gpu_context across the parallel WGC wait.

@@ -636,6 +636,11 @@ pub trait Platform: 'static {
     #[cfg(target_os = "windows")]
     fn on_gpu_reset_begin(&self, _callback: Box<dyn FnMut()>) {}
 
+    /// Registers a callback that runs on the main thread after the new DirectX
+    /// device set is installed. The argument is the new `gpu_generation`.
+    #[cfg(target_os = "windows")]
+    fn on_gpu_reset_end(&self, _callback: Box<dyn FnMut(u64)>) {}
+
     /// Releases the platform's DirectX devices (and stops vsync). Only valid
     /// while no window is open.
     fn release_gpu_devices(&self) {}

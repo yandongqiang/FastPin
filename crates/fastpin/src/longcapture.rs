@@ -897,8 +897,10 @@ pub fn frame_change_ratio(previous: &[u8], current: &[u8]) -> f64 {
 // saying "keep scrolling" while nothing can ever be stitched. Polling forever
 // also burns a WGC crop and a full-frame memcpy every 150 ms. The tracker
 // turns consecutive no-progress ticks into a state the host can surface, and
-// keeps a genuinely paused page alive at a reduced poll rate instead of
-// killing a session the user has only briefly stopped reading.
+// keeps both a genuinely paused page and an unalignable (stalled) one alive at
+// a reduced poll rate instead of killing a session the user has only briefly
+// stopped reading. A stall is never a terminal state: only 完成/取消 and the
+// hard limits end a session.
 
 /// Consecutive no-progress ticks before the host reports a stall. At the
 /// 150 ms poll this is 1.5 s -- long enough for one slow scroll tick to be
@@ -915,8 +917,10 @@ pub enum StallPhase {
     /// The page did not change for `STALL_TICKS` ticks: the user paused. Keep
     /// the session (and the bar) alive, but poll far less often.
     Paused,
-    /// The frame kept changing but no offset could be confirmed: a static band
-    /// ate the strip, or the content is unalignable. Stop capturing and say so.
+    /// The page kept changing for `STALL_TICKS` ticks but no offset could be
+    /// confirmed: a static band ate the strip, or the content is unalignable.
+    /// Recoverable -- the host keeps the session and the bar alive at a
+    /// reduced poll rate, and any later stitched tick restores full speed.
     Stalled,
 }
 
@@ -936,9 +940,15 @@ impl StallTracker {
         self.idle
     }
 
-    /// `Paused`: the host may decimate its polling.
+    /// `Paused` or `Stalled`: the host should decimate its polling. Both are
+    /// recoverable states -- a still page and an unalignable one both deserve
+    /// a lower poll rate, never an ended session; a later stitched tick clears
+    /// this again.
     pub fn paused(&self) -> bool {
-        self.phase == Some(StallPhase::Paused)
+        matches!(
+            self.phase,
+            Some(StallPhase::Paused) | Some(StallPhase::Stalled)
+        )
     }
 
     /// Folds one tick's report into the counter. A stitched tick always
@@ -2769,14 +2779,27 @@ mod tests {
         assert!(r.inner_content_moved, "the page did move behind the band");
         assert_eq!(r.inner_new_rows, 8);
 
-        // 完成 is never automatic: the session stops only after the threshold,
-        // with the reason visible, and no rows were added meanwhile.
+        // 完成 is never automatic. After the threshold the tracker reports a
+        // stall (a state the bar surfaces and decimates polling for), and a
+        // later aligned tick must clear it again instead of the session being
+        // over; no rows were added meanwhile.
         let mut stall = StallTracker::new();
         let mut phase = StallPhase::Watching;
         for _ in 0..STALL_TICKS {
             phase = stall.observe(&r, 0.45);
         }
-        assert_eq!(phase, StallPhase::Stalled);
+        assert_eq!(phase, StallPhase::Stalled, "a stall is a recoverable state");
+        assert!(
+            stall.paused(),
+            "a stalled page is polled slowly, not dropped"
+        );
+        let aligned = ScrollReport {
+            direction: Some((false, 8, 8)),
+            ..ScrollReport::default()
+        };
+        assert_eq!(stall.observe(&aligned, 0.45), StallPhase::Progress);
+        assert_eq!(stall.idle_ticks(), 0);
+        assert!(!stall.paused());
     }
 
     #[test]
@@ -2924,7 +2947,15 @@ mod tests {
                 assert_eq!(phase, StallPhase::Stalled, "tick {i}");
             }
         }
-        assert!(!stall.paused());
+        // Stalled is a state the host slows down for, not an end: the next
+        // tick may still be stalled, and an aligned one clears it.
+        assert!(stall.paused(), "a stall decimates polling");
+        assert_eq!(
+            stall.observe(&changed, 0.45),
+            StallPhase::Stalled,
+            "the stall persists while nothing aligns"
+        );
+        assert!(stall.paused());
 
         // A stitch resets the run.
         let stitched = ScrollReport {

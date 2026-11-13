@@ -22,8 +22,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::longcapture::{
-    bgra_to_gray, classify_scroll_diag, normalize_bgra, rotate_bgra270, Axis, StallPhase,
-    StallTracker, StitchError, StitchStats, Stitcher, ACCEPT_SCORE,
+    bgra_to_gray, classify_scroll_diag, normalize_bgra, rotate_bgra270, Axis, ScrollReport,
+    StallPhase, StallTracker, StitchError, StitchStats, Stitcher, ACCEPT_SCORE,
 };
 
 /// Sampled pixel-change fraction above which a rejected tick is reported as
@@ -103,18 +103,20 @@ pub enum Verdict {
     StaticEdge,
     /// The scroll outran the overlap strip.
     FastScroll,
+    /// `STALL_TICKS` consecutive frames changed without a confirmed offset
+    /// (P1-05). This is a state, never an end: the host keeps polling at the
+    /// decimated rate and the next stitched tick restores full speed.
+    Stalled { static_edge: bool },
 }
 
-/// Why the worker ended the session. The bar stays up for 完成/取消, exactly
-/// like the height-cap and stall paths did before.
+/// Why the worker ended the session. The bar stays up for 完成/取消 after any
+/// of these, exactly like the height-cap path did before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
     /// Adding the segment would pass the stitcher's height cap.
     HeightCap,
     /// A frame or the stitcher canvas no longer fits the image budget.
     Budget,
-    /// Consecutive changing frames that never aligned (P1-05).
-    Stalled { static_edge: bool },
     /// Any other stitch refusal (width mismatch, short frame, empty rows).
     Frame,
 }
@@ -626,29 +628,12 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
             spans.log = ms(t);
             state.last_log_ms = spans.log;
             // P1-05: consecutive no-progress ticks are a state, not silence.
+            // A stall is reported (and, via `paused`, decimated) but never
+            // ends the session: the user may still be scrolling, and a hard
+            // stop here was the regression that made 完成 the only exit.
             let phase = state.stall.observe(&report, FAST_SCROLL_CHANGED);
             spans.process = ms(started);
-            let verdict = match phase {
-                StallPhase::Stalled => {
-                    return Outcome::Stopped {
-                        reason: StopReason::Stalled {
-                            static_edge: report.static_edge,
-                        },
-                    };
-                }
-                StallPhase::Paused => Verdict::Paused,
-                _ => {
-                    if report.static_edge {
-                        Verdict::StaticEdge
-                    } else if report.changed > FAST_SCROLL_CHANGED {
-                        // The scroll outran the overlap strip: not a reason to
-                        // end the session, just to nudge the user.
-                        Verdict::FastScroll
-                    } else {
-                        Verdict::Idle
-                    }
-                }
-            };
+            let verdict = idle_verdict(phase, &report);
             Outcome::Frame(FrameResult {
                 verdict,
                 paused: state.stall.paused(),
@@ -657,6 +642,33 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                 stats: state.stitcher.stats(),
                 spans,
             })
+        }
+    }
+}
+
+/// Maps one no-progress tick to the verdict the host shows.
+///
+/// `Stalled` deliberately becomes a [`Verdict`] instead of an
+/// [`Outcome::Stopped`]: it is the state "the page changed but no offset could
+/// be confirmed", which a later tick may leave again (the user resumed
+/// scrolling, or the fixed band scrolled out of the strip). Only hard limits
+/// and the user's 完成/取消 end a session.
+fn idle_verdict(phase: StallPhase, report: &ScrollReport) -> Verdict {
+    match phase {
+        StallPhase::Stalled => Verdict::Stalled {
+            static_edge: report.static_edge,
+        },
+        StallPhase::Paused => Verdict::Paused,
+        _ => {
+            if report.static_edge {
+                Verdict::StaticEdge
+            } else if report.changed > FAST_SCROLL_CHANGED {
+                // The scroll outran the overlap strip: not a reason to end
+                // the session, just to nudge the user.
+                Verdict::FastScroll
+            } else {
+                Verdict::Idle
+            }
         }
     }
 }
@@ -672,6 +684,7 @@ fn stop_reason(e: &StitchError) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::longcapture::STALL_TICKS;
 
     const W: usize = 8;
     const H: usize = 32;
@@ -911,5 +924,197 @@ mod tests {
         assert!(f.spans.capture >= 1.5);
         assert!(f.spans.process >= f.spans.sad);
         assert!(f.spans.total() >= f.spans.process);
+    }
+
+    /// A viewport whose interior changed but whose edge strips did not: the
+    /// shape a fixed header/footer band produces. The bottom/top strip still
+    /// finds itself in place, so no offset is confirmed, while `changed` stays
+    /// above `STATIC_EDGE_CHANGED` and below `FAST_SCROLL_CHANGED` -- the
+    /// stall-tracker path that used to end the session.
+    fn altered_frame(page: &[u8], start_row: usize, from_row: usize, rows: usize) -> Vec<u8> {
+        let mut f = frame(page, W, start_row, H);
+        let row = W * 4;
+        for r in from_row..(from_row + rows).min(H) {
+            for b in &mut f[r * row..(r + 1) * row] {
+                *b = 255 - *b;
+            }
+        }
+        f
+    }
+
+    fn is_state_verdict(verdict: Verdict) -> bool {
+        matches!(
+            verdict,
+            Verdict::Idle
+                | Verdict::Paused
+                | Verdict::StaticEdge
+                | Verdict::FastScroll
+                | Verdict::Stalled { .. }
+        )
+    }
+
+    /// P1-05 regression: `StallPhase::Stalled` used to return
+    /// `Outcome::Stopped`, so the poll loop ended and further scrolling was
+    /// captured nowhere. A stall is now a recoverable verdict.
+    #[test]
+    fn stall_does_not_end_the_session() {
+        let page = synthetic_page(W, H + 24, 0x5A11_0001);
+        let first = frame(&page, W, 0, H);
+        let worker = worker(&first, 1);
+        let mut gate = ResultGate::new(1);
+        let stalled = altered_frame(&page, 0, 8, 10);
+
+        let mut stalled_seen = false;
+        for tick in 0..(STALL_TICKS + 5) {
+            let seq = gate.issue(gate.epoch()).expect("one job at a time");
+            assert!(worker.submit(job(seq, 1, 0, stalled.clone())));
+            let done = wait(&worker);
+            assert!(gate.accept(&done), "tick {tick} was dropped");
+            match &done.outcome {
+                Outcome::Frame(f) => {
+                    assert!(
+                        is_state_verdict(f.verdict),
+                        "tick {tick}: unexpected verdict {:?}",
+                        f.verdict
+                    );
+                    stalled_seen |= matches!(f.verdict, Verdict::Stalled { .. });
+                }
+                other => panic!("tick {tick}: a stall must not end the session, got {other:?}"),
+            }
+        }
+        assert!(
+            stalled_seen,
+            "the synthetic band must reach the Stalled state, not just Idle"
+        );
+        // The worker is still alive and answers one more frame.
+        let seq = gate.issue(gate.epoch()).unwrap();
+        assert!(worker.submit(job(seq, 1, 0, first.clone())));
+        assert!(matches!(wait(&worker).outcome, Outcome::Frame(_)));
+    }
+
+    /// The decimated session resumes the moment a tick confirms an offset:
+    /// progress, full-speed polling and a growing stitcher, all without
+    /// restarting the session.
+    #[test]
+    fn capture_resumes_after_a_stall() {
+        let page = synthetic_page(W, H + 40, 0x5A11_0002);
+        let first = frame(&page, W, 0, H);
+        let worker = worker(&first, 2);
+        let mut gate = ResultGate::new(2);
+        let stalled = altered_frame(&page, 0, 8, 10);
+
+        let mut paused_seen = false;
+        for tick in 0..(STALL_TICKS + 2) {
+            let seq = gate.issue(gate.epoch()).unwrap();
+            assert!(worker.submit(job(seq, 2, 0, stalled.clone())));
+            let done = wait(&worker);
+            assert!(gate.accept(&done), "tick {tick} was dropped");
+            let Outcome::Frame(f) = done.outcome else {
+                panic!("tick {tick}: the session must not stop");
+            };
+            paused_seen |= f.paused;
+        }
+        assert!(paused_seen, "a stalled session must decimate its polling");
+
+        // `prev_gray` was never replaced, so this is a confirmed 5-row scroll
+        // against the session baseline.
+        let seq = gate.issue(gate.epoch()).unwrap();
+        assert!(worker.submit(job(seq, 2, 0, frame(&page, W, 5, H))));
+        let done = wait(&worker);
+        assert!(gate.accept(&done));
+        let Outcome::Frame(f) = done.outcome else {
+            panic!("a confirmed shift must produce a frame");
+        };
+        assert!(
+            matches!(
+                f.verdict,
+                Verdict::Progress {
+                    is_up: false,
+                    new_rows: 5
+                }
+            ),
+            "expected 5 stitched rows, got {:?}",
+            f.verdict
+        );
+        assert!(!f.paused, "a stitched tick restores the full poll rate");
+        assert_eq!(f.segments, 2, "the stitch added a segment");
+        assert_eq!(f.total_height, H + 5);
+    }
+
+    /// A still page is decimated, never ended: the result stream keeps
+    /// producing frames, `paused` rises, and the next scroll is stitched.
+    #[test]
+    fn paused_polling_keeps_capturing() {
+        let page = synthetic_page(W, H + 40, 0x5A11_0003);
+        let first = frame(&page, W, 0, H);
+        let worker = worker(&first, 3);
+        let mut gate = ResultGate::new(3);
+
+        let mut paused_seen = false;
+        for tick in 0..(STALL_TICKS + 4) {
+            let seq = gate.issue(gate.epoch()).unwrap();
+            assert!(worker.submit(job(seq, 3, 0, first.clone())));
+            let done = wait(&worker);
+            assert!(gate.accept(&done), "tick {tick} was dropped");
+            let Outcome::Frame(f) = done.outcome else {
+                panic!("tick {tick}: a still page must not end the session");
+            };
+            assert!(is_state_verdict(f.verdict), "tick {tick}: {:?}", f.verdict);
+            paused_seen |= f.paused;
+        }
+        assert!(paused_seen, "a still page must lower the poll rate");
+
+        // The decimated loop is still sampling, so a resumed scroll stitches.
+        let seq = gate.issue(gate.epoch()).unwrap();
+        assert!(worker.submit(job(seq, 3, 0, frame(&page, W, 4, H))));
+        let done = wait(&worker);
+        assert!(gate.accept(&done));
+        let Outcome::Frame(f) = done.outcome else {
+            panic!("the resumed scroll must be captured");
+        };
+        assert!(
+            matches!(
+                f.verdict,
+                Verdict::Progress {
+                    is_up: false,
+                    new_rows: 4
+                }
+            ),
+            "expected 4 stitched rows, got {:?}",
+            f.verdict
+        );
+        assert!(!f.paused);
+        assert_eq!(f.segments, 2);
+    }
+
+    /// The mapping itself: `Stalled` is a verdict (with the band flag for the
+    /// status line), never a stop.
+    #[test]
+    fn stalled_phase_maps_to_a_recoverable_verdict() {
+        let band = ScrollReport {
+            changed: 0.2,
+            static_edge: true,
+            ..ScrollReport::default()
+        };
+        assert_eq!(
+            idle_verdict(StallPhase::Stalled, &band),
+            Verdict::Stalled { static_edge: true }
+        );
+        let unalignable = ScrollReport {
+            changed: 0.2,
+            ..ScrollReport::default()
+        };
+        assert_eq!(
+            idle_verdict(StallPhase::Stalled, &unalignable),
+            Verdict::Stalled { static_edge: false }
+        );
+        assert_eq!(
+            idle_verdict(StallPhase::Paused, &unalignable),
+            Verdict::Paused
+        );
+        assert_eq!(
+            idle_verdict(StallPhase::Watching, &band),
+            Verdict::StaticEdge
+        );
     }
 }

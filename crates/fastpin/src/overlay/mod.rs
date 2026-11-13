@@ -233,9 +233,6 @@ struct LongCaptureState {
     /// started. `None` falls back to `capture_region_bgra` per tick (a fresh
     /// WGC start every poll), same as before this session existed.
     live: Option<LongLive>,
-    /// Stall detected: polling stops, the bar stays up for 完成/取消 with the
-    /// reason in `status`.
-    stalled: bool,
     /// Polls served, used by the paused-page decimation.
     poll_ticks: u64,
     /// Polls that found the previous frame still in the worker: the tick that
@@ -259,6 +256,18 @@ fn long_status_hint(axis: Axis) -> String {
         Axis::Vertical => "滚动页面以继续截图".to_string(),
         Axis::Horizontal => "左右滚动页面以继续截图".to_string(),
     }
+}
+
+/// Whether the long-capture poll loop must keep running.
+///
+/// A stall, a pause, a static edge or a fast scroll is a *state* the bar
+/// reflects; none of them appears here, so no status can end the loop. Only a
+/// superseded session (`generation_matches == false`), a hard stop (`maxed`:
+/// height cap, image budget, GPU reset, worker gone) or leaving the capture
+/// phase (完成/取消) stops it. A later stitched tick brings the session back
+/// to full speed, and the decimation keeps sampling meanwhile.
+fn should_keep_polling(generation_matches: bool, maxed: bool, capturing: bool) -> bool {
+    generation_matches && !maxed && capturing
 }
 
 /// A running WGC session plus what `capture_region_live` needs to crop it:
@@ -1500,7 +1509,6 @@ impl OverlayView {
             gpu_generation,
             maxed: false,
             live,
-            stalled: false,
             poll_ticks: 0,
             late_ticks: 0,
             stall_paused: false,
@@ -1623,7 +1631,11 @@ impl OverlayView {
         let Some(state) = self.long.as_ref() else {
             return false;
         };
-        if state.gen != gen || state.maxed || state.stalled || self.phase != Phase::LongCapturing {
+        if !should_keep_polling(
+            state.gen == gen,
+            state.maxed,
+            self.phase == Phase::LongCapturing,
+        ) {
             return false;
         }
         // Fold in whatever the worker finished since the last poll. Only one
@@ -1656,7 +1668,7 @@ impl OverlayView {
         let Some(state) = self.long.as_mut() else {
             return false;
         };
-        if state.maxed || state.stalled || self.phase != Phase::LongCapturing {
+        if !should_keep_polling(true, state.maxed, self.phase == Phase::LongCapturing) {
             return false;
         }
         // Still processing the previous frame: skip this sample. The cadence
@@ -1742,29 +1754,16 @@ impl OverlayView {
         }
         match done.outcome {
             Outcome::Discarded => true,
-            Outcome::Stopped { reason, .. } => {
-                match reason {
-                    StopReason::Stalled { static_edge } => {
-                        state.stalled = true;
-                        state.status = if static_edge {
-                            "固定页眉/页脚遮挡，请缩小选区".to_string()
-                        } else {
-                            "未检测到滚动/内容未变化".to_string()
-                        };
-                    }
-                    // Every other refusal is surfaced: the bar keeps the last
-                    // frame and 完成/取消 available, and the status says which
-                    // cap was hit instead of a bare "已达最大高度" for all of
-                    // them.
-                    other => {
-                        state.maxed = true;
-                        state.status = match other {
-                            StopReason::HeightCap => "已达最大高度".to_string(),
-                            StopReason::Budget => "图像超出内存预算".to_string(),
-                            _ => "画面变化过大，已停止".to_string(),
-                        };
-                    }
-                }
+            Outcome::Stopped { reason } => {
+                // Every hard stop is surfaced: the bar keeps the last frame
+                // and 完成/取消 available, and the status says which cap was
+                // hit instead of a bare "已达最大高度" for all of them.
+                state.maxed = true;
+                state.status = match reason {
+                    StopReason::HeightCap => "已达最大高度".to_string(),
+                    StopReason::Budget => "图像超出内存预算".to_string(),
+                    StopReason::Frame => "画面变化过大，已停止".to_string(),
+                };
                 cx.notify();
                 false
             }
@@ -1791,6 +1790,18 @@ impl OverlayView {
                     }
                     Verdict::FastScroll => {
                         state.status = "滚动过快，请慢一点".to_string();
+                    }
+                    // The stall threshold was reached without a confirmed
+                    // offset. Say what it looks like, but keep the session:
+                    // `frame.paused` already put the loop on the slow cadence,
+                    // and the next stitched tick restores full speed and the
+                    // "已捕获 N 段" status.
+                    Verdict::Stalled { static_edge } => {
+                        state.status = if static_edge {
+                            "固定页眉/页脚遮挡，请缩小选区".to_string()
+                        } else {
+                            "未检测到滚动/内容未变化".to_string()
+                        };
                     }
                 }
                 cx.notify();
@@ -1891,8 +1902,6 @@ impl OverlayView {
             state.gate.rebaseline(epoch);
             state.axis = next;
             state.maxed = false;
-            // A fresh baseline on the other axis starts a fresh progress run.
-            state.stalled = false;
             state.stall_paused = false;
             state.segments = 1;
             state.total_height = nh;
@@ -3117,6 +3126,32 @@ mod tests {
         };
         let cut = hole_clear_of_bar(tiny, 90, 134);
         assert!(cut.top <= cut.bottom, "{cut:?}");
+    }
+
+    /// A stall, a pause or a static edge is a state the bar reflects; the poll
+    /// predicate has no input for any of them, so no status the worker reports
+    /// can end the loop (the P1-05 regression this fix removes).
+    #[test]
+    fn a_stall_never_stops_the_long_poll_loop() {
+        assert!(should_keep_polling(true, false, true));
+    }
+
+    /// Only the hard stops end the loop: a superseded session, `maxed` (height
+    /// cap, image budget, GPU reset, worker gone) and leaving the phase.
+    #[test]
+    fn only_hard_stops_end_the_long_poll_loop() {
+        assert!(
+            !should_keep_polling(false, false, true),
+            "a stale generation must stop the old loop"
+        );
+        assert!(
+            !should_keep_polling(true, true, true),
+            "maxed keeps the bar but stops the polling"
+        );
+        assert!(
+            !should_keep_polling(true, false, false),
+            "完成/取消 leaves the capture phase"
+        );
     }
 
     #[test]

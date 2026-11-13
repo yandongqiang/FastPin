@@ -120,9 +120,12 @@ pub(crate) fn start(cx: &mut App, group: u64, tiles: &[TileSnapshot]) {
             zoom: 1.0,
         })
         .collect();
-    let Some((backdrop, bw, bh)) = compose(&images) else {
-        crate::perf::log_app("pin edit: group too large to annotate");
-        return;
+    let (backdrop, bw, bh) = match compose(&images) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::perf::log_app(&format!("pin edit: {e}"));
+            return;
+        }
     };
     let edit = Rc::new(RefCell::new(GroupEdit {
         session: Session::new(),
@@ -211,9 +214,12 @@ fn flatten(elements: &[Element], tiles: &[TileSnapshot]) -> Vec<(u64, Vec<u8>, u
     ) else {
         return Vec::new();
     };
-    let Some((mut canvas, cw, ch)) = compose(&images) else {
-        crate::perf::log_app("pin edit: group too large to flatten");
-        return Vec::new();
+    let (mut canvas, cw, ch) = match compose(&images) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::perf::log_app(&format!("pin edit: {e}"));
+            return Vec::new();
+        }
     };
     // Elements are screen pixels relative to the bounding box; the canvas is
     // that space scaled by k about the same corner.

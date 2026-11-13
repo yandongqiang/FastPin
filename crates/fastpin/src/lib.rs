@@ -15,6 +15,7 @@ pub mod geom;
 pub mod gpui_bridge;
 pub mod hdr;
 pub mod hotkey;
+pub mod image_budget;
 pub mod longcapture;
 pub mod longworker;
 mod migrate;

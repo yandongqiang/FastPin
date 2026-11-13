@@ -23,8 +23,13 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 
 use crate::error::{Error, Result};
+use crate::image_budget::{BudgetError, BUDGET};
 
 pub fn encode_png_bgra(pixels: &[u8], width: u32, height: u32, stride: u32) -> Result<Vec<u8>> {
+    // Refuse an oversized or short input before touching WIC: `WritePixels`
+    // reads `stride * height` bytes from this slice.
+    let budget = BUDGET;
+    budget.check_image(width as u64, height as u64, stride as u64, pixels.len())?;
     unsafe {
         let factory: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
@@ -51,7 +56,14 @@ pub fn encode_png_bgra(pixels: &[u8], width: u32, height: u32, stride: u32) -> R
             return Err(Error::new("GlobalLock failed for PNG stream"));
         }
         let size = GlobalSize(hg);
-        let bytes = slice::from_raw_parts(ptr as *const u8, size).to_vec();
+        // The encoded PNG of an in-budget image fits the budget; the copy out
+        // of the HGLOBAL is fallible instead of an aborting `to_vec`.
+        budget.checked_len(size as u64)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| BudgetError::AllocFailed { bytes: size as u64 })?;
+        bytes.extend_from_slice(slice::from_raw_parts(ptr as *const u8, size));
         let _ = GlobalUnlock(hg);
         Ok(trim_png(bytes))
     }
@@ -96,10 +108,15 @@ pub fn write_png_file(
 }
 
 pub fn set_clipboard_dib(pixels: &[u8], width: u32, height: u32, stride: u32) -> Result<()> {
+    let budget = BUDGET;
+    // Checked before the `u32` math below: `width * 4 * height` used to wrap,
+    // and the DIB copy reads `stride * height` bytes from `pixels`.
+    budget.check_image(width as u64, height as u64, stride as u64, pixels.len())?;
     let header_size = std::mem::size_of::<BITMAPINFOHEADER>();
     let packed_stride = width * 4;
-    let image_size = (packed_stride * height) as usize;
-    let total = header_size + image_size;
+    let image_size = budget.checked_bytes(width as u64, height as u64, 4)?;
+    let total = budget.checked_len(image_size as u64 + header_size as u64)?;
+    let image_size = image_size as u32;
     unsafe {
         let hg = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total)?;
         let ptr = GlobalLock(hg) as *mut u8;
@@ -117,7 +134,7 @@ pub fn set_clipboard_dib(pixels: &[u8], width: u32, height: u32, stride: u32) ->
         (*header).biPlanes = 1;
         (*header).biBitCount = 32;
         (*header).biCompression = BI_RGB.0;
-        (*header).biSizeImage = image_size as u32;
+        (*header).biSizeImage = image_size;
         let dest = ptr.add(header_size);
         for y in 0..height as usize {
             let src = (height as usize - 1 - y) * stride as usize;
@@ -202,6 +219,19 @@ mod tests {
         assert_eq!(&bytes[..8], SIG, "missing PNG signature");
         assert!(bytes.windows(4).any(|w| w == b"IEND"));
         assert!(bytes.len() > 32);
+    }
+
+    #[test]
+    fn encode_png_rejects_short_and_oversized_buffers() {
+        // 2x2 at stride 8 needs 16 bytes; fewer must be an error rather than
+        // a read past the slice inside WIC.
+        let err = encode_png_bgra(&[0u8; 8], 2, 2, 8).unwrap_err();
+        assert!(err.to_string().contains("16"), "{err}");
+        // A side past the shared budget is refused before WIC is created.
+        let err = encode_png_bgra(&[], 16_385, 1, 16_385 * 4).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("16385"), "{msg}");
+        assert!(msg.contains("16384"), "{msg}");
     }
 
     /// Diagnosis for 'copy-only pastes nothing': the DIB must come back out

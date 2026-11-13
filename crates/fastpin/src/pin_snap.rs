@@ -258,8 +258,36 @@ pub struct TileImage<'a> {
 }
 
 /// Largest canvas side `compose` will produce; matches the long-capture
-/// budget and the D3D texture limit the result may be shown with.
-pub const MAX_CANVAS_SIDE: i32 = 16384;
+/// budget and the D3D texture limit the result may be shown with. Derived from
+/// the shared image budget so the two cannot drift apart.
+pub const MAX_CANVAS_SIDE: i32 = crate::image_budget::MAX_SIDE as i32;
+
+/// Why a group could not be composited. The budget is the interesting case —
+/// the previous `None` could not tell "no tiles" from "too large to allocate".
+#[derive(Debug)]
+pub enum ComposeError {
+    /// No tiles, or a layout with a zero-sized canvas.
+    Empty,
+    /// The canvas or one resampled tile exceeds the image budget.
+    Budget(crate::image_budget::BudgetError),
+}
+
+impl std::fmt::Display for ComposeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ComposeError::Empty => f.write_str("pin group has no tiles to compose"),
+            ComposeError::Budget(e) => write!(f, "pin group too large: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ComposeError {}
+
+impl From<crate::image_budget::BudgetError> for ComposeError {
+    fn from(e: crate::image_budget::BudgetError) -> Self {
+        ComposeError::Budget(e)
+    }
+}
 
 /// How a set of tiles maps onto one canvas: `k` scales screen pixels to
 /// canvas pixels about `anchor` (the bounding box's top-left), and `canvas`
@@ -309,20 +337,35 @@ pub fn tile_dest(rect: Rect, lay: &Layout) -> IRect {
 }
 
 /// Composites the tiles at their screen layout into one tight BGRA image.
-/// Gaps stay transparent; see `layout` for the resolution rule.
-pub fn compose(tiles: &[TileImage]) -> Option<(Vec<u8>, u32, u32)> {
-    let lay = layout(&tiles.iter().map(|t| (t.rect, t.zoom)).collect::<Vec<_>>())?;
+/// Gaps stay transparent; see `layout` for the resolution rule. The canvas and
+/// every resampled tile are budget checked and fallibly allocated, so an
+/// oversized group is an error instead of a 1 GiB `vec!` that can abort.
+pub fn compose(tiles: &[TileImage]) -> Result<(Vec<u8>, u32, u32), ComposeError> {
+    let budget = crate::image_budget::BUDGET;
+    let lay = layout(&tiles.iter().map(|t| (t.rect, t.zoom)).collect::<Vec<_>>())
+        .ok_or(ComposeError::Empty)?;
     let canvas = lay.canvas;
     let (cw, ch) = (canvas.width(), canvas.height());
-    if cw <= 0 || ch <= 0 || cw > MAX_CANVAS_SIDE || ch > MAX_CANVAS_SIDE {
-        return None;
+    if cw <= 0 || ch <= 0 {
+        return Err(ComposeError::Empty);
     }
     let (cw, ch) = (cw as u32, ch as u32);
-    let row = cw as usize * 4;
-    let mut out = vec![0u8; row * ch as usize];
+    // `alloc_rgba` applies `MAX_CANVAS_SIDE` (the budget's `MAX_SIDE`), the
+    // pixel count and the byte count, and reports which one failed.
+    let mut out = budget.alloc_rgba(cw as u64, ch as u64)?;
 
     for t in tiles {
-        if t.pixels.len() < (t.width * t.height * 4) as usize || t.width == 0 || t.height == 0 {
+        let tile_bytes = (t.width as u64)
+            .checked_mul(t.height as u64)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or(ComposeError::Budget(
+                crate::image_budget::BudgetError::Overflow {
+                    width: t.width as u64,
+                    height: t.height as u64,
+                    bytes_per_pixel: 4,
+                },
+            ))?;
+        if t.width == 0 || t.height == 0 || (t.pixels.len() as u64) < tile_bytes {
             continue;
         }
         let dest = tile_dest(t.rect, &lay);
@@ -331,17 +374,22 @@ pub fn compose(tiles: &[TileImage]) -> Option<(Vec<u8>, u32, u32)> {
         let src: &[u8] = if (dw, dh) == (t.width, t.height) {
             t.pixels
         } else {
+            // The resampler allocates `dw * dh * 4` internally and cannot fail
+            // softly; check it against the budget first.
+            budget.checked_bytes(dw as u64, dh as u64, 4)?;
+            let tile_len = tile_bytes as usize;
             let img = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(
                 t.width,
                 t.height,
-                &t.pixels[..(t.width * t.height * 4) as usize],
-            )?;
+                &t.pixels[..tile_len],
+            )
+            .ok_or(ComposeError::Empty)?;
             resized = image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Triangle);
             resized.as_raw()
         };
         blit(&mut out, (cw, ch), src, (dw, dh), dest.left, dest.top);
     }
-    Some((out, cw, ch))
+    Ok((out, cw, ch))
 }
 
 /// Copies `src` (tight BGRA, `src_size`) into `dst` (`dst_size`) at
@@ -379,7 +427,12 @@ pub fn crop(canvas: &[u8], cw: u32, ch: u32, rect: IRect) -> Option<Vec<u8>> {
         return None;
     }
     let row = rect.width() as usize * 4;
-    let mut out = Vec::with_capacity(row * rect.height() as usize);
+    let height = rect.height() as usize;
+    // `crop` only ever slices a canvas that already passed the image budget,
+    // but its arguments are public: refuse a size that would overflow rather
+    // than panic in `with_capacity`/the row loop.
+    let len = row.checked_mul(height)?;
+    let mut out = Vec::with_capacity(len);
     for y in rect.top..rect.bottom {
         let s = (y as usize * cw as usize + rect.left as usize) * 4;
         out.extend_from_slice(&canvas[s..s + row]);
@@ -640,7 +693,18 @@ mod tests {
                 zoom: 1.0,
             },
         ];
-        assert!(compose(&tiles).is_none());
+        let err = compose(&tiles).expect_err("oversized canvas must be refused");
+        assert!(
+            matches!(
+                err,
+                ComposeError::Budget(crate::image_budget::BudgetError::TooWide { .. })
+            ),
+            "{err}"
+        );
+        // The message names the request and the limit, so the export log can
+        // say why nothing was written.
+        assert!(err.to_string().contains("16390"), "{err}");
+        assert!(err.to_string().contains("16384"), "{err}");
     }
 
     #[test]

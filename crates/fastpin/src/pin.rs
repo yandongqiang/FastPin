@@ -147,11 +147,7 @@ pub(crate) fn resize_edge_at(pos: (f32, f32), size: (f32, f32), band: f32) -> Op
     if pos.0 < 0.0 || pos.1 < 0.0 || pos.0 > size.0 || pos.1 > size.1 {
         return None;
     }
-    let band = band
-        .max(1.0)
-        .min(size.0 * 0.25)
-        .min(size.1 * 0.25)
-        .max(0.5);
+    let band = band.max(1.0).min(size.0 * 0.25).min(size.1 * 0.25).max(0.5);
     let edge = ResizeEdge {
         left: pos.0 <= band,
         right: pos.0 >= size.0 - band,
@@ -1299,13 +1295,7 @@ impl PinView {
         cx.notify();
     }
 
-    fn apply_zoom(
-        &mut self,
-        window: &mut Window,
-        cx: &mut App,
-        anchor: (i32, i32),
-        factor: f32,
-    ) {
+    fn apply_zoom(&mut self, window: &mut Window, cx: &mut App, anchor: (i32, i32), factor: f32) {
         let Some(client) = client_rect(crate::platform::hwnd_of(window)) else {
             return;
         };
@@ -1370,9 +1360,14 @@ impl PinView {
                     zoom: t.zoom,
                 })
                 .collect();
-            let Some((mut px, w, h)) = compose(&images) else {
-                crate::perf::log_app("pin export: group too large to compose");
-                return;
+            let (mut px, w, h) = match compose(&images) {
+                Ok(v) => v,
+                Err(e) => {
+                    // Background thread: the log is this path's error channel
+                    // today, but it now names the requested size and limit.
+                    crate::perf::log_app(&format!("pin export: {e}"));
+                    return;
+                }
             };
             if copy {
                 flatten_gaps(&mut px, [255, 255, 255, 255]);
@@ -2055,7 +2050,10 @@ mod tests {
         // x stays anchored on the left edge; y grows both ways about the
         // original centre.
         assert_eq!(out.rect, Rect::new(100.0, 75.0, 300.0, 150.0));
-        assert_eq!(out.rect.y + out.rect.height / 2.0, start.y + start.height / 2.0);
+        assert_eq!(
+            out.rect.y + out.rect.height / 2.0,
+            start.y + start.height / 2.0
+        );
         assert!((out.zoom - 1.5).abs() < 1e-6);
         assert!((out.factor - 1.5).abs() < 1e-6);
         // The invariant the group path relies on.
@@ -2073,7 +2071,10 @@ mod tests {
         assert_eq!(out.rect.y, start.y);
         assert_eq!(out.rect.height, 150.0);
         assert_eq!(out.rect.width, 300.0);
-        assert_eq!(out.rect.x + out.rect.width / 2.0, start.x + start.width / 2.0);
+        assert_eq!(
+            out.rect.x + out.rect.width / 2.0,
+            start.x + start.width / 2.0
+        );
     }
 
     /// A corner drag anchors the opposite corner and uses the mean of the two
@@ -2221,13 +2222,25 @@ mod tests {
             }
             // A member flush on the anchored side keeps meeting the tile.
             if e.right {
-                let neighbour = zoom_rect(Rect::new(0.0, 80.0, 120.0, 120.0), out.anchor, out.factor);
-                assert_eq!(rounded_rect(neighbour).right, window.left, "seam stays closed");
+                let neighbour =
+                    zoom_rect(Rect::new(0.0, 80.0, 120.0, 120.0), out.anchor, out.factor);
+                assert_eq!(
+                    rounded_rect(neighbour).right,
+                    window.left,
+                    "seam stays closed"
+                );
             }
             if e.bottom {
-                let neighbour =
-                    zoom_rect(Rect::new(120.0, -40.0, 240.0, 120.0), out.anchor, out.factor);
-                assert_eq!(rounded_rect(neighbour).bottom, window.top, "seam stays closed");
+                let neighbour = zoom_rect(
+                    Rect::new(120.0, -40.0, 240.0, 120.0),
+                    out.anchor,
+                    out.factor,
+                );
+                assert_eq!(
+                    rounded_rect(neighbour).bottom,
+                    window.top,
+                    "seam stays closed"
+                );
             }
         }
     }

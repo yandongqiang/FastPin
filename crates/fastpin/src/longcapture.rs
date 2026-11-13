@@ -106,12 +106,13 @@ const STATIC_EDGE_CHANGED: f64 = MOTION_CHANGED;
 /// essentially unchanged, exactly where it already was.
 const STATIC_EDGE_SCORE: f64 = 0.97;
 
-/// Independent-band agreement required by [`verify_shift`]. A correct offset
-/// reproduces a band that took no part in the search almost exactly; a
-/// periodic-content guess or a one-period slip does not (unless the page
-/// really is periodic over its whole height, which no check can tell apart).
-/// 0.85 leaves room for antialiasing, sub-pixel drift and a small dynamic
-/// region (a video thumbnail, a blinking caret) inside the band.
+/// Per-band agreement required by [`verify_shift`] / [`overlap_agreement`]. A
+/// correct offset reproduces bands that took no part in the search almost
+/// exactly; a periodic-content guess or a one-period slip spoils every band
+/// (unless the page really is periodic over its whole height, which no check
+/// can tell apart). 0.85 leaves room for antialiasing and sub-pixel drift;
+/// larger local dynamic regions are handled by the multi-band majority, not by
+/// lowering this bar.
 const VERIFY_MIN_SCORE: f64 = 0.85;
 
 /// How much worse the seam row pair may be than the frame's own row-to-row
@@ -128,6 +129,15 @@ const SEAM_BASELINE_FLOOR: f64 = 6.0;
 
 /// Rows averaged on each side of the seam.
 const SEAM_ROWS: usize = 3;
+
+/// Independent-band agreement is measured over this many horizontal bands,
+/// spread across the whole overlap instead of one contiguous middle window. A
+/// local dynamic region (video, caret, banner, floating widget) spoils at most
+/// one or two; a wrong offset spoils them all.
+const VERIFY_BANDS: usize = 5;
+/// Each band's sampled rows are split into this many column blocks, so a
+/// dynamic region covering only part of the width spoils only those blocks.
+const VERIFY_COL_BLOCKS: usize = 4;
 
 /// Adaptive acceptance: a high score needs only the original 2x rival margin;
 /// a medium score must be even less ambiguous. `accept_score` is a floor the
@@ -409,8 +419,10 @@ impl SeamCheck {
 /// repetitive page can satisfy the strip perfectly at a wrong offset. Two
 /// independent checks catch that:
 ///
-/// 1. a band at the middle of the overlap -- never the strip used for the
-///    search -- must land on the same content at the implied shift;
+/// 1. several bands spread over the overlap -- never the strip used for the
+///    search -- must land on the same content at the implied shift (see
+///    [`overlap_agreement`]); a strict majority must agree so a local dynamic
+///    region cannot sink a genuine scroll;
 /// 2. the rows straddling the seam must not differ much more than the frame's
 ///    own adjacent rows differ, i.e. the joint must look like page content.
 ///
@@ -441,34 +453,16 @@ pub fn verify_shift(
     if band < 4 {
         return SeamCheck::rejected();
     }
-    // The band lives in the overlap and nowhere near the searched strip:
-    // down `previous[b + j] == current[b + j - new_rows]`, up
-    // `previous[b + j] == current[b + j + new_rows]`.
-    let b = if is_up {
-        (height - band - new_rows) / 2
-    } else {
-        new_rows + (height - new_rows - band) / 2
-    };
-    // Per-row agreement, then a trimmed mean over the best 3/4 of the rows: a
-    // small dynamic region (video, caret, animated banner) spoils a few rows
-    // and must not fail the check, while a wrong offset spoils them all.
-    let mut rows_scored: Vec<f64> = Vec::with_capacity(band);
-    for j in 0..band {
-        let p = (b + j) * width;
-        let c = if is_up {
-            (b + j + new_rows) * width
-        } else {
-            (b + j - new_rows) * width
-        };
-        let mut row_sad = 0u64;
-        for i in 0..width {
-            row_sad += previous[p + i].abs_diff(current[c + i]) as u64;
-        }
-        rows_scored.push(1.0 - row_sad as f64 / (width * 255) as f64);
-    }
-    rows_scored.sort_by(|a, b| b.total_cmp(a));
-    let keep = (rows_scored.len() * 3 / 4).max(1);
-    let overlap_score = rows_scored[..keep].iter().sum::<f64>() / keep as f64;
+    // Independent-band agreement, now robust to a *local* dynamic region. A
+    // single contiguous middle band with a best-3/4 trim mean still failed
+    // when a video/banner covered more than a quarter of that band: the bad
+    // rows stopped being a minority, and the refusal stuck for the whole
+    // session because `prev_gray` only advances on a successful stitch.
+    // [`overlap_agreement`] spreads the samples over several bands and column
+    // blocks and requires a strict majority of bands to agree. The seam check
+    // below and both acceptance thresholds are deliberately unchanged, so a
+    // periodic/wrong offset is still refused.
+    let overlap_score = overlap_agreement(previous, current, width, height, band, new_rows, is_up);
 
     // Seam rows: the last `rows` adjacent page-row pairs around the joint.
     // Down, page row (h-1-j) is `previous[height-1-j]` and page row
@@ -511,6 +505,77 @@ pub fn verify_shift(
         seam_ratio,
         accepted: overlap_score >= VERIFY_MIN_SCORE && seam_ratio <= SEAM_MAX_RATIO,
     }
+}
+
+/// Independent-band agreement at the implied shift, robust to a *local*
+/// dynamic region (P1-05 follow-up). A single contiguous band scored by a
+/// trimmed mean over its rows still failed when a video/banner covered more
+/// than a quarter of that band -- the bad rows were no longer a minority, so a
+/// genuine natural scroll was refused.
+///
+/// Here the overlap is split into [`VERIFY_BANDS`] horizontal bands spread over
+/// its whole height; each sampled row is split into [`VERIFY_COL_BLOCKS`]
+/// column blocks, and every tile is scored as `1 - mean(|prev-curr|)/255`.
+/// Each band's score is the trimmed mean (best 3/4) of its tiles, so a small
+/// animation inside a band cannot sink it. The returned score is the worst of
+/// the best strict majority of band scores: at least half the bands must
+/// independently clear [`VERIFY_MIN_SCORE`]. A local animation (or a floating
+/// widget / lazy-loaded block that does not shift with the page) spoils one or
+/// two bands; a wrong offset spoils every one of them, so the
+/// periodic-content false-positive guard is unchanged.
+///
+/// Pure function of the two gray planes and their geometry. The score has the
+/// same meaning and range as the old single-band score, so [`verify_shift`]'s
+/// acceptance rule and both thresholds stay exactly as they were.
+fn overlap_agreement(
+    previous: &[u8],
+    current: &[u8],
+    width: usize,
+    height: usize,
+    sample_rows: usize,
+    new_rows: usize,
+    is_up: bool,
+) -> f64 {
+    // `previous` rows in this range have a counterpart in `current` at the
+    // implied shift: down at `[new_rows, height)`, up at `[0, height-new_rows)`.
+    let overlap_start = if is_up { 0 } else { new_rows };
+    let overlap_len = height - new_rows;
+    let n_bands = VERIFY_BANDS.min(overlap_len).max(1);
+    // A strict majority of the bands must agree. Keep the sample budget
+    // unchanged: distribute the old single band's rows over the new bands
+    // instead of multiplying the work.
+    let good = (n_bands / 2 + 1).min(n_bands);
+    let rows_per_band = (sample_rows / n_bands).max(1);
+    let n_blocks = VERIFY_COL_BLOCKS.min(width).max(1);
+    let mut band_scores: Vec<f64> = Vec::with_capacity(n_bands);
+    for k in 0..n_bands {
+        let y0 = overlap_start + k * overlap_len / n_bands;
+        let y1 = overlap_start + (k + 1) * overlap_len / n_bands;
+        let span = (y1 - y0).max(1);
+        let count = span.min(rows_per_band).max(1);
+        let mut tiles: Vec<f64> = Vec::with_capacity(count * n_blocks);
+        for s in 0..count {
+            let y = y0 + s * span / count;
+            let cy = if is_up { y + new_rows } else { y - new_rows };
+            let p = y * width;
+            let c = cy * width;
+            for cb in 0..n_blocks {
+                let x0 = cb * width / n_blocks;
+                let x1 = (cb + 1) * width / n_blocks;
+                let mut sad = 0u64;
+                for x in x0..x1 {
+                    sad += previous[p + x].abs_diff(current[c + x]) as u64;
+                }
+                let cols = (x1 - x0).max(1);
+                tiles.push(1.0 - sad as f64 / (cols * 255) as f64);
+            }
+        }
+        tiles.sort_by(|a, b| b.total_cmp(a));
+        let keep = (tiles.len() * 3 / 4).max(1);
+        band_scores.push(tiles[..keep].iter().sum::<f64>() / keep as f64);
+    }
+    band_scores.sort_by(|a, b| b.total_cmp(a));
+    band_scores[good - 1]
 }
 
 /// SAD of the previous strip against `current` starting at row `y`.
@@ -3022,6 +3087,148 @@ mod tests {
             }
             other => panic!("dynamic region rejected the scroll: {other:?}"),
         }
+    }
+
+    /// The regression the user reported: natural vertical scrolling kept
+    /// showing "未通过校验" and never advanced. A genuine down scroll whose
+    /// overlap contains a *large* local dynamic region (a video / animated
+    /// banner that changed between the frames) must still be confirmed and
+    /// stitched -- the old single contiguous band's best-3/4 trim could not
+    /// tolerate a region covering most of that one band.
+    #[test]
+    fn natural_scroll_survives_a_local_dynamic_region() {
+        let (width, height, strip) = (32, 240, 32);
+        let page = Page::new(400, width, height, 0x0D1D_0A11);
+        let prev = page.frame(100);
+        let mut curr = page.frame(108); // true down shift is 8
+        let rb = width * 4;
+        // A 48-row, full-width "video"/banner in the middle of the overlap,
+        // well away from the searched strip and the seam; it changed between
+        // the two frames.
+        for y in 96..144 {
+            for x in 0..width {
+                let i = y * rb + x * 4;
+                curr[i] = 255 - curr[i];
+                curr[i + 1] = 255 - curr[i + 1];
+                curr[i + 2] = 255 - curr[i + 2];
+            }
+        }
+        let (prev_g, curr_g) = (gray_of(&prev, width, height), gray_of(&curr, width, height));
+        // The strip is clean, so a strong, unique correct offset is still found.
+        let down = align_vertical(&prev_g, &curr_g, width, height, strip, ACCEPT_SCORE);
+        assert!(down.accepted, "strip score {}", down.score);
+        assert_eq!(height - down.offset_y, 8, "correct offset is 8 rows");
+        // The independent-band/seam check must accept despite the dynamic band.
+        let seam = verify_shift(&prev_g, &curr_g, width, height, strip, 8, false);
+        assert!(
+            seam.accepted,
+            "overlap={} seam_ratio={} -- a natural scroll must not be refused",
+            seam.overlap_score, seam.seam_ratio
+        );
+        // The classifier reports the stitch, so the session actually advances.
+        let r = classify_scroll_diag(&prev_g, &curr_g, width, height, strip, ACCEPT_SCORE);
+        match r.direction {
+            Some((false, offset, rows)) => {
+                assert_eq!(rows, 8);
+                assert_eq!(offset, height - 8);
+            }
+            other => panic!("natural scroll with a local dynamic region was rejected: {other:?}"),
+        }
+    }
+
+    /// False-positive guard: even with the more robust multi-band score, an
+    /// offset the strip matched only because part of the frame repeats must
+    /// still be refused. A wrong shift spoils every band, so no majority can
+    /// pass; the correct shift is still confirmed.
+    #[test]
+    fn wrong_offset_still_rejected_by_verification() {
+        let (width, height, strip) = (32, 240, 32);
+        let page = Page::new(400, width, height, 0x0BAD_00A5);
+        let prev = page.frame(100);
+        let mut curr = page.frame(116); // true shift is 16
+        let rb = width * 4;
+        // Splice the previous bottom strip 32 rows higher than it belongs: the
+        // strip then scores 1.0 at a wrong offset (32) while the rest says 16.
+        curr[(height - 64) * rb..(height - 32) * rb]
+            .copy_from_slice(&prev[(height - 32) * rb..height * rb]);
+        let (prev_g, curr_g) = (gray_of(&prev, width, height), gray_of(&curr, width, height));
+        let down = align_vertical(&prev_g, &curr_g, width, height, strip, ACCEPT_SCORE);
+        assert!(down.accepted, "strip score {}", down.score);
+        assert_eq!(
+            height - down.offset_y,
+            32,
+            "strip claims the spliced offset"
+        );
+        // The true 16-row shift is confirmed; the spliced 32-row one is not.
+        assert!(verify_shift(&prev_g, &curr_g, width, height, strip, 16, false).accepted);
+        assert!(!verify_shift(&prev_g, &curr_g, width, height, strip, 32, false).accepted);
+        let r = classify_scroll_diag(&prev_g, &curr_g, width, height, strip, ACCEPT_SCORE);
+        assert_eq!(r.direction, None, "a wrong offset must not be stitched");
+        assert!(r.rejected_by_verification);
+    }
+
+    /// A clean uniform scroll (no dynamic region) of course still passes.
+    #[test]
+    fn uniform_scroll_passes() {
+        let (width, height, strip) = (32, 240, 32);
+        let page = Page::new(400, width, height, 0x51A7_0001);
+        let prev = page.frame(100);
+        let curr = page.frame(108);
+        let (prev_g, curr_g) = (gray_of(&prev, width, height), gray_of(&curr, width, height));
+        let seam = verify_shift(&prev_g, &curr_g, width, height, strip, 8, false);
+        assert!(
+            seam.accepted,
+            "overlap={} seam_ratio={}",
+            seam.overlap_score, seam.seam_ratio
+        );
+        assert!(seam.overlap_score > 0.9, "overlap={}", seam.overlap_score);
+        let r = classify_scroll_diag(&prev_g, &curr_g, width, height, strip, ACCEPT_SCORE);
+        match r.direction {
+            Some((false, offset, rows)) => {
+                assert_eq!(rows, 8);
+                assert_eq!(offset, height - 8);
+            }
+            other => panic!("uniform scroll rejected: {other:?}"),
+        }
+    }
+
+    /// The multi-band score is a pure function: a local dynamic region sinks
+    /// one band (still a passing majority) at the true shift, but a wrong shift
+    /// sinks every band. This is the property that keeps natural scrolls while
+    /// preserving the periodic-content false-positive guard.
+    #[test]
+    fn overlap_agreement_is_robust_to_a_local_dynamic_band() {
+        let (width, height, new_rows, sample_rows) = (32, 240, 8, 64);
+        let page = Page::new(400, width, height, 0xA9C0_0001);
+        let prev = page.gray(100);
+        let mut curr = page.gray(100 + new_rows);
+        // A 48-row, full-width dynamic band in the middle of the overlap that
+        // changed between the two frames (a video / animated banner).
+        for y in 96..144 {
+            for x in 0..width {
+                let i = y * width + x;
+                curr[i] = 255 - curr[i];
+            }
+        }
+        let at_true = overlap_agreement(&prev, &curr, width, height, sample_rows, new_rows, false);
+        assert!(
+            at_true >= VERIFY_MIN_SCORE,
+            "true shift should survive one bad band, got {at_true}"
+        );
+        // Eight rows off the true shift: every band compares unrelated rows.
+        let at_wrong = overlap_agreement(
+            &prev,
+            &curr,
+            width,
+            height,
+            sample_rows,
+            new_rows + 8,
+            false,
+        );
+        assert!(
+            at_wrong < VERIFY_MIN_SCORE,
+            "a wrong shift must fail every band, got {at_wrong}"
+        );
     }
 
     /// The regression the user hit: while the page keeps moving, an unmatched

@@ -640,7 +640,7 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                  norm_ms={:.1} gray_ms={:.1} sad_ms={:.1} log_prev_ms={:.1} \
                  score={:.3}/{:.3} runner_up={:.2}/{:.2} is_up=- new_rows=0 \
                  changed={:.2} static_edge={} inner_moved={}({}) \
-                 rejected_by_verify={} idle={} late={}",
+                 rejected_by_verify={} verify={:.3} seam={:.3} idle={} late={}",
                 state.ticks,
                 state.axis.label(),
                 spans.total(),
@@ -659,6 +659,8 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                 report.inner_content_moved,
                 report.inner_new_rows,
                 report.rejected_by_verification,
+                report.overlap_score,
+                report.seam_score,
                 state.stall.idle_ticks() + 1,
                 job.late,
             ));
@@ -1233,6 +1235,62 @@ mod tests {
                 "tick {tick}"
             );
         }
+    }
+
+    /// A frame whose accepted offset is refused by the independent-band/seam
+    /// check must keep the session alive: every tick is a recoverable
+    /// `Outcome::Frame` (`Unaligned { verification_failed: true }`), never
+    /// `Outcome::Stopped`, never a pause, and the captured buffer stays intact
+    /// so a later real scroll can still stitch.
+    #[test]
+    fn verification_failure_does_not_end_the_session() {
+        const TW: usize = 32;
+        const TH: usize = 240;
+        let page = synthetic_page(TW, 400, 0x0BAD_0005);
+        let first = frame(&page, TW, 100, TH);
+        let mut stitcher = Stitcher::new(TW, TH, MAX_H).unwrap();
+        assert!(stitcher.fill_first(&first));
+        let gray = bgra_to_gray(&first, TW, TH).unwrap();
+        let mut worker = LongWorker::new(1, Axis::Vertical, stitcher, gray).unwrap();
+        let mut gate = ResultGate::new(1);
+
+        // A frame whose bottom strip is spliced to a wrong offset: the strip
+        // matches, but classify_scroll_diag's verify_shift refuses the stitch.
+        let mut bad = frame(&page, TW, 108, TH);
+        let rb = TW * 4;
+        bad[(TH - 48) * rb..(TH - 16) * rb].copy_from_slice(&first[(TH - 32) * rb..TH * rb]);
+
+        for tick in 0..(STALL_TICKS + 5) {
+            let seq = gate.issue(gate.epoch()).expect("one job at a time");
+            let j = Job {
+                generation: 1,
+                epoch: gate.epoch(),
+                seq,
+                axis: Axis::Vertical,
+                width: TW,
+                height: TH,
+                bgra: bad.clone(),
+                capture_ms: 0.0,
+                late: 0,
+            };
+            assert!(worker.submit(j));
+            let done = wait(&worker);
+            assert!(gate.accept(&done), "tick {tick} dropped");
+            match &done.outcome {
+                Outcome::Frame(f) => assert_eq!(
+                    f.verdict,
+                    Verdict::Unaligned {
+                        verification_failed: true
+                    },
+                    "tick {tick}: a verification failure is a recoverable Frame, not a stop"
+                ),
+                other => panic!("tick {tick}: verification failure must not stop: {other:?}"),
+            }
+        }
+        // The session is still finishable and no captured row was lost.
+        let (px, w, h) = worker.finish(FINISH_WAIT).unwrap();
+        assert_eq!((w as usize, h as usize), (TW, TH));
+        assert_eq!(px, first, "stitched content is untouched");
     }
 
     /// A fixed header/footer band keeps its hint while the page moves behind

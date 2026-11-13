@@ -2054,7 +2054,9 @@ impl OverlayView {
                         verification_failed,
                     } => {
                         state.status = if verification_failed {
-                            "本次位移未通过校验，请继续滚动".to_string()
+                            // Soft, actionable wording: a refused offset is
+                            // not a failure and does not stop the session.
+                            "本次位移未确认，请继续滚动".to_string()
                         } else {
                             "画面移动但未能对齐，请稍慢或稍等…".to_string()
                         };

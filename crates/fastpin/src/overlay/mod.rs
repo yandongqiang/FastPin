@@ -1791,16 +1791,27 @@ impl OverlayView {
                     Verdict::FastScroll => {
                         state.status = "滚动过快，请慢一点".to_string();
                     }
-                    // The stall threshold was reached without a confirmed
-                    // offset. Say what it looks like, but keep the session:
-                    // `frame.paused` already put the loop on the slow cadence,
-                    // and the next stitched tick restores full speed and the
-                    // "已捕获 N 段" status.
+                    // The page moved but no offset could be confirmed. This is
+                    // the normal mid-scroll state, never a pause: say what the
+                    // matcher saw instead of "no scrolling detected".
+                    Verdict::Unaligned {
+                        verification_failed,
+                    } => {
+                        state.status = if verification_failed {
+                            "本次位移未通过校验，请继续滚动".to_string()
+                        } else {
+                            "画面移动但未能对齐，请稍慢或稍等…".to_string()
+                        };
+                    }
+                    // The stall threshold was reached while the page itself
+                    // did not move. Keep the session: `frame.paused` already
+                    // put the loop on the slow cadence, and the next stitched
+                    // tick restores full speed and the "已捕获 N 段" status.
                     Verdict::Stalled { static_edge } => {
                         state.status = if static_edge {
                             "固定页眉/页脚遮挡，请缩小选区".to_string()
                         } else {
-                            "未检测到滚动/内容未变化".to_string()
+                            "内容未能对齐，请继续滚动".to_string()
                         };
                     }
                 }

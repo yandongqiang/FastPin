@@ -88,10 +88,19 @@ const COARSE_MIN_DIM: usize = 64;
 /// Real UI text measures 8-60; a solid fill measures 0.
 const MIN_STRIP_TEXTURE: f64 = 4.0;
 
+/// A frame that changed at least this fraction of its sampled pixels is
+/// *moving*. Only a frame below this may count towards a pause: a slow scroll,
+/// or a scroll that stops for a moment to read, still changes 5-40 % of the
+/// sampled pixels, while a still page measures 0.00 -- the real diagnostic log
+/// of a slow scroll reads 0.13-0.17 on every unaligned tick. Counting those
+/// ticks as idle was what reported "no scrolling detected" mid-scroll.
+pub const MOTION_CHANGED: f64 = 0.02;
+
 /// A frame that changed at least this fraction of its sampled pixels did move,
 /// so a zero-row match on the edge strip means the band at that edge is fixed
-/// content (sticky header/footer) rather than a still page.
-const STATIC_EDGE_CHANGED: f64 = 0.02;
+/// content (sticky header/footer) rather than a still page. Deliberately the
+/// same floor as [`MOTION_CHANGED`]: both answer "did the page move at all?".
+const STATIC_EDGE_CHANGED: f64 = MOTION_CHANGED;
 
 /// Score a static-band match has to clear on its own: the strip found itself,
 /// essentially unchanged, exactly where it already was.
@@ -902,10 +911,11 @@ pub fn frame_change_ratio(previous: &[u8], current: &[u8]) -> f64 {
 // stopped reading. A stall is never a terminal state: only 完成/取消 and the
 // hard limits end a session.
 
-/// Consecutive no-progress ticks before the host reports a stall. At the
-/// 150 ms poll this is 1.5 s -- long enough for one slow scroll tick to be
-/// absorbed, short enough that a stuck capture is visible.
-pub const STALL_TICKS: u32 = 10;
+/// Consecutive *unchanged* ticks before the host reports a pause. At the
+/// 150 ms poll this is 3 s: reading a paragraph or thinking about where to
+/// scroll next is normal operation, and a shorter window turned those pauses
+/// into a premature "no scrolling detected".
+pub const STALL_TICKS: u32 = 20;
 
 /// What the last tick's progress state means for the session.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -917,10 +927,11 @@ pub enum StallPhase {
     /// The page did not change for `STALL_TICKS` ticks: the user paused. Keep
     /// the session (and the bar) alive, but poll far less often.
     Paused,
-    /// The page kept changing for `STALL_TICKS` ticks but no offset could be
-    /// confirmed: a static band ate the strip, or the content is unalignable.
-    /// Recoverable -- the host keeps the session and the bar alive at a
-    /// reduced poll rate, and any later stitched tick restores full speed.
+    /// The page did not move, yet the strip kept offering an offset that the
+    /// seam check refused: unalignable content, not a user pause. Recoverable
+    /// like [`StallPhase::Paused`] -- the host keeps the session and the bar
+    /// alive at a reduced poll rate, and any later stitched tick restores full
+    /// speed. Never reported as "no scrolling detected".
     Stalled,
 }
 
@@ -951,28 +962,32 @@ impl StallTracker {
         )
     }
 
-    /// Folds one tick's report into the counter. A stitched tick always
-    /// resets it. So does a tick whose frame changed more than `fast_changed`
-    /// *without* the static-band signature: the page is clearly scrolling,
-    /// the matcher just cannot follow it, and the host keeps nudging "slow
-    /// down" instead of ending the session. Everything else counts towards a
-    /// stationary pause (frame unchanged) or a stall (frame changed but no
-    /// offset confirmed) -- including a static band that moves fast enough to
-    /// look like a fast scroll, because a band that never stitches never will.
-    pub fn observe(&mut self, report: &ScrollReport, fast_changed: f64) -> StallPhase {
-        let fast = report.changed > fast_changed && !report.static_edge;
-        let phase = if report.direction.is_some() || fast {
+    /// Folds one tick's report into the counter.
+    ///
+    /// Only a frame that did not move may count towards a pause. A confirmed
+    /// offset is progress; so is a frame whose sampled pixels changed by more
+    /// than [`MOTION_CHANGED`], even when the matcher could not lock onto that
+    /// motion. A slow scroll, a sub-pixel scroll and a scroll that paused just
+    /// long enough to be caught mid-step all land in that second group, and
+    /// counting them as idle is what made a moving page report "no scrolling
+    /// detected". Every such tick resets the counter and restores full speed,
+    /// and no state below the threshold ever ends a session.
+    pub fn observe(&mut self, report: &ScrollReport) -> StallPhase {
+        let phase = if report.direction.is_some() {
             self.idle = 0;
-            if report.direction.is_some() {
-                StallPhase::Progress
-            } else {
-                StallPhase::Watching
-            }
+            StallPhase::Progress
+        } else if report.changed > MOTION_CHANGED {
+            // The page is moving; the matcher just could not confirm an
+            // offset. Never a pause, never a stall.
+            self.idle = 0;
+            StallPhase::Watching
         } else {
             self.idle = self.idle.saturating_add(1);
             if self.idle < STALL_TICKS {
                 StallPhase::Watching
-            } else if report.changed >= STATIC_EDGE_CHANGED {
+            } else if report.rejected_by_verification {
+                // Still page, but a candidate offset keeps failing the seam
+                // check: unalignable, not a user pause.
                 StallPhase::Stalled
             } else {
                 StallPhase::Paused
@@ -2654,7 +2669,7 @@ mod tests {
             let r = classify_scroll_diag(&frame, &frame, width, height, strip, ACCEPT_SCORE);
             assert_eq!(r.direction, None, "blank page cannot align: {r:?}");
             assert!(r.changed < STATIC_EDGE_CHANGED);
-            stall.observe(&r, 0.45);
+            stall.observe(&r);
         }
         assert_eq!(s.total_height(), height, "nothing may be appended");
         assert_eq!(s.segment_count(), 1);
@@ -2663,7 +2678,7 @@ mod tests {
         let r = classify_scroll_diag(&frame, &frame, width, height, strip, ACCEPT_SCORE);
         let mut phase = StallPhase::Watching;
         for _ in 0..STALL_TICKS {
-            phase = stall.observe(&r, 0.45);
+            phase = stall.observe(&r);
         }
         assert_eq!(phase, StallPhase::Paused);
         assert!(stall.paused());
@@ -2779,25 +2794,25 @@ mod tests {
         assert!(r.inner_content_moved, "the page did move behind the band");
         assert_eq!(r.inner_new_rows, 8);
 
-        // 完成 is never automatic. After the threshold the tracker reports a
-        // stall (a state the bar surfaces and decimates polling for), and a
-        // later aligned tick must clear it again instead of the session being
-        // over; no rows were added meanwhile.
-        let mut stall = StallTracker::new();
-        let mut phase = StallPhase::Watching;
-        for _ in 0..STALL_TICKS {
-            phase = stall.observe(&r, 0.45);
-        }
-        assert_eq!(phase, StallPhase::Stalled, "a stall is a recoverable state");
+        // A fixed band while the page keeps moving is motion, not a pause: the
+        // tracker must stay at full speed and never report a still page. The
+        // band hint itself (StaticEdge) is asserted at the verdict level.
         assert!(
-            stall.paused(),
-            "a stalled page is polled slowly, not dropped"
+            r.changed > MOTION_CHANGED,
+            "the page moved behind the band: changed {}",
+            r.changed
         );
+        let mut stall = StallTracker::new();
+        for _ in 0..STALL_TICKS * 2 {
+            assert_eq!(stall.observe(&r), StallPhase::Watching, "{r:?}");
+        }
+        assert_eq!(stall.idle_ticks(), 0, "motion must never accumulate idle");
+        assert!(!stall.paused(), "a moving page keeps the full poll rate");
         let aligned = ScrollReport {
             direction: Some((false, 8, 8)),
             ..ScrollReport::default()
         };
-        assert_eq!(stall.observe(&aligned, 0.45), StallPhase::Progress);
+        assert_eq!(stall.observe(&aligned), StallPhase::Progress);
         assert_eq!(stall.idle_ticks(), 0);
         assert!(!stall.paused());
     }
@@ -2868,7 +2883,7 @@ mod tests {
         let mut stall = StallTracker::new();
         for _ in 0..STALL_TICKS * 2 {
             assert_eq!(
-                stall.observe(&r, 0.45),
+                stall.observe(&r),
                 StallPhase::Watching,
                 "a fast scroll keeps the session alive"
             );
@@ -2930,17 +2945,62 @@ mod tests {
         }
     }
 
+    /// The regression the user hit: while the page keeps moving, an unmatched
+    /// tick must not count as a pause. A slow scroll changes 0.13-0.17 of the
+    /// sampled pixels with no confirmed offset on every tick.
+    #[test]
+    fn moving_frame_never_reads_as_idle() {
+        let mut stall = StallTracker::new();
+        let changes = [0.05, 0.15, 0.40];
+        for tick in 0..30 {
+            let report = ScrollReport {
+                changed: changes[tick % changes.len()],
+                ..ScrollReport::default()
+            };
+            let phase = stall.observe(&report);
+            assert_eq!(phase, StallPhase::Watching, "tick {tick}");
+            assert_eq!(stall.idle_ticks(), 0, "tick {tick}");
+            assert!(!stall.paused(), "tick {tick}");
+        }
+    }
+
+    #[test]
+    fn a_still_page_pauses_only_after_the_longer_threshold() {
+        let mut stall = StallTracker::new();
+        let still = ScrollReport::default();
+        for tick in 1..STALL_TICKS {
+            assert_eq!(stall.observe(&still), StallPhase::Watching, "tick {tick}");
+            assert_eq!(stall.idle_ticks(), tick);
+            assert!(!stall.paused());
+        }
+        assert_eq!(
+            stall.observe(&still),
+            StallPhase::Paused,
+            "tick {STALL_TICKS}"
+        );
+        assert!(stall.paused());
+
+        // Motion restores full speed on the very same tick.
+        let moving = ScrollReport {
+            changed: 0.15,
+            ..ScrollReport::default()
+        };
+        assert_eq!(stall.observe(&moving), StallPhase::Watching);
+        assert_eq!(stall.idle_ticks(), 0);
+        assert!(!stall.paused());
+    }
+
     #[test]
     fn stall_tracker_reaches_paused_and_stalled() {
+        // A candidate offset that keeps failing the seam check on an otherwise
+        // still page is the one remaining stall: unalignable, not a pause.
         let mut stall = StallTracker::new();
-        // Changed frame, no offset: a static band or an unalignable page.
-        let changed = ScrollReport {
-            changed: 0.2,
-            static_edge: true,
+        let rejected = ScrollReport {
+            rejected_by_verification: true,
             ..ScrollReport::default()
         };
         for i in 1..=STALL_TICKS {
-            let phase = stall.observe(&changed, 0.45);
+            let phase = stall.observe(&rejected);
             if i < STALL_TICKS {
                 assert_eq!(phase, StallPhase::Watching, "tick {i}");
             } else {
@@ -2951,7 +3011,7 @@ mod tests {
         // tick may still be stalled, and an aligned one clears it.
         assert!(stall.paused(), "a stall decimates polling");
         assert_eq!(
-            stall.observe(&changed, 0.45),
+            stall.observe(&rejected),
             StallPhase::Stalled,
             "the stall persists while nothing aligns"
         );
@@ -2963,14 +3023,15 @@ mod tests {
             changed: 0.3,
             ..ScrollReport::default()
         };
-        assert_eq!(stall.observe(&stitched, 0.45), StallPhase::Progress);
+        assert_eq!(stall.observe(&stitched), StallPhase::Progress);
         assert_eq!(stall.idle_ticks(), 0);
 
-        // A still page is a pause after the threshold, not a stall.
+        // A still page with no rejected candidate is a plain pause, not a
+        // stall.
         let still = ScrollReport::default();
         let mut phase = StallPhase::Watching;
         for _ in 0..STALL_TICKS {
-            phase = stall.observe(&still, 0.45);
+            phase = stall.observe(&still);
         }
         assert_eq!(phase, StallPhase::Paused);
         assert!(stall.paused());

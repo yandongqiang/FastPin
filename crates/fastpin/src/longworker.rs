@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use crate::longcapture::{
     bgra_to_gray, classify_scroll_diag, normalize_bgra, rotate_bgra270, Axis, ScrollReport,
-    StallPhase, StallTracker, StitchError, StitchStats, Stitcher, ACCEPT_SCORE,
+    StallPhase, StallTracker, StitchError, StitchStats, Stitcher, ACCEPT_SCORE, MOTION_CHANGED,
 };
 
 /// Sampled pixel-change fraction above which a rejected tick is reported as
@@ -101,11 +101,17 @@ pub enum Verdict {
     Paused,
     /// A fixed header/footer band is covering the strip.
     StaticEdge,
+    /// The frame moved but no offset could be confirmed: a slow, sub-pixel or
+    /// otherwise unalignable scroll. Not a pause -- the host keeps the full
+    /// poll rate and nudges the user. `verification_failed` distinguishes a
+    /// candidate that the independent-band check refused.
+    Unaligned { verification_failed: bool },
     /// The scroll outran the overlap strip.
     FastScroll,
-    /// `STALL_TICKS` consecutive frames changed without a confirmed offset
-    /// (P1-05). This is a state, never an end: the host keeps polling at the
-    /// decimated rate and the next stitched tick restores full speed.
+    /// The page stayed still for `STALL_TICKS` frames while every candidate
+    /// offset failed verification (P1-05). This is a state, never an end: the
+    /// host keeps polling at the decimated rate and the next stitched tick
+    /// restores full speed.
     Stalled { static_edge: bool },
 }
 
@@ -532,7 +538,7 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
 
     match report.direction {
         Some((is_up, offset_y, new_rows)) => {
-            state.stall.observe(&report, FAST_SCROLL_CHANGED);
+            state.stall.observe(&report);
             let t = Instant::now();
             // Both directions enforce the height cap and the image budget
             // inside the stitcher; a refusal leaves the buffer untouched.
@@ -628,10 +634,10 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
             spans.log = ms(t);
             state.last_log_ms = spans.log;
             // P1-05: consecutive no-progress ticks are a state, not silence.
-            // A stall is reported (and, via `paused`, decimated) but never
-            // ends the session: the user may still be scrolling, and a hard
-            // stop here was the regression that made 完成 the only exit.
-            let phase = state.stall.observe(&report, FAST_SCROLL_CHANGED);
+            // Only a still page counts towards the pause; a moving one keeps
+            // the full poll rate and gets an "unaligned" nudge instead of
+            // "no scrolling detected".
+            let phase = state.stall.observe(&report);
             spans.process = ms(started);
             let verdict = idle_verdict(phase, &report);
             Outcome::Frame(FrameResult {
@@ -649,23 +655,40 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
 /// Maps one no-progress tick to the verdict the host shows.
 ///
 /// `Stalled` deliberately becomes a [`Verdict`] instead of an
-/// [`Outcome::Stopped`]: it is the state "the page changed but no offset could
-/// be confirmed", which a later tick may leave again (the user resumed
-/// scrolling, or the fixed band scrolled out of the strip). Only hard limits
-/// and the user's 完成/取消 end a session.
+/// [`Outcome::Stopped`]: it is the state "the strip offered an offset that the
+/// seam check refused", which a later tick may leave again (the page changed
+/// under it). Only hard limits and the user's 完成/取消 end a session.
+///
+/// A moving frame is never reported as still: a confirmed motion with no
+/// offset is an "unaligned" nudge, and only a frame that really stopped
+/// (and stayed stopped for `STALL_TICKS`) reaches [`Verdict::Paused`].
 fn idle_verdict(phase: StallPhase, report: &ScrollReport) -> Verdict {
+    let band = report.static_edge && report.inner_content_moved;
     match phase {
-        StallPhase::Stalled => Verdict::Stalled {
-            static_edge: report.static_edge,
-        },
+        // No motion for the whole threshold: the strip cannot be trusted to
+        // describe a user pause, but an unalignable one is still not "still".
+        StallPhase::Stalled => Verdict::Stalled { static_edge: band },
         StallPhase::Paused => Verdict::Paused,
-        _ => {
-            if report.static_edge {
+        StallPhase::Progress | StallPhase::Watching => {
+            if band {
+                // A fixed band covering the strip while the page moves behind
+                // it: the actionable hint, not a stall.
                 Verdict::StaticEdge
+            } else if report.rejected_by_verification {
+                // A candidate was found but the seam/band check refused it.
+                Verdict::Unaligned {
+                    verification_failed: true,
+                }
             } else if report.changed > FAST_SCROLL_CHANGED {
                 // The scroll outran the overlap strip: not a reason to end
                 // the session, just to nudge the user.
                 Verdict::FastScroll
+            } else if report.changed > MOTION_CHANGED {
+                // The page clearly moved, the matcher just could not lock on
+                // (a slow or sub-pixel scroll). Never "no scrolling detected".
+                Verdict::Unaligned {
+                    verification_failed: false,
+                }
             } else {
                 Verdict::Idle
             }
@@ -948,14 +971,16 @@ mod tests {
             Verdict::Idle
                 | Verdict::Paused
                 | Verdict::StaticEdge
+                | Verdict::Unaligned { .. }
                 | Verdict::FastScroll
                 | Verdict::Stalled { .. }
         )
     }
 
-    /// P1-05 regression: `StallPhase::Stalled` used to return
+    /// P1-05 regression: an unalignable frame used to return
     /// `Outcome::Stopped`, so the poll loop ended and further scrolling was
-    /// captured nowhere. A stall is now a recoverable verdict.
+    /// captured nowhere. It is now a recoverable verdict, and a frame that
+    /// moved is reported as unaligned, never as a still page.
     #[test]
     fn stall_does_not_end_the_session() {
         let page = synthetic_page(W, H + 24, 0x5A11_0001);
@@ -964,7 +989,7 @@ mod tests {
         let mut gate = ResultGate::new(1);
         let stalled = altered_frame(&page, 0, 8, 10);
 
-        let mut stalled_seen = false;
+        let mut hint_seen = false;
         for tick in 0..(STALL_TICKS + 5) {
             let seq = gate.issue(gate.epoch()).expect("one job at a time");
             assert!(worker.submit(job(seq, 1, 0, stalled.clone())));
@@ -977,14 +1002,22 @@ mod tests {
                         "tick {tick}: unexpected verdict {:?}",
                         f.verdict
                     );
-                    stalled_seen |= matches!(f.verdict, Verdict::Stalled { .. });
+                    assert!(
+                        !matches!(f.verdict, Verdict::Paused),
+                        "tick {tick}: a moving frame must not read as still"
+                    );
+                    assert!(!f.paused, "tick {tick}: motion keeps the full poll rate");
+                    hint_seen |= matches!(
+                        f.verdict,
+                        Verdict::Unaligned { .. } | Verdict::StaticEdge | Verdict::FastScroll
+                    );
                 }
                 other => panic!("tick {tick}: a stall must not end the session, got {other:?}"),
             }
         }
         assert!(
-            stalled_seen,
-            "the synthetic band must reach the Stalled state, not just Idle"
+            hint_seen,
+            "an unalignable moving frame must surface a hint, not silence"
         );
         // The worker is still alive and answers one more frame.
         let seq = gate.issue(gate.epoch()).unwrap();
@@ -1001,12 +1034,12 @@ mod tests {
         let first = frame(&page, W, 0, H);
         let worker = worker(&first, 2);
         let mut gate = ResultGate::new(2);
-        let stalled = altered_frame(&page, 0, 8, 10);
 
+        // A still page decimates the poll rate after the longer threshold.
         let mut paused_seen = false;
         for tick in 0..(STALL_TICKS + 2) {
             let seq = gate.issue(gate.epoch()).unwrap();
-            assert!(worker.submit(job(seq, 2, 0, stalled.clone())));
+            assert!(worker.submit(job(seq, 2, 0, first.clone())));
             let done = wait(&worker);
             assert!(gate.accept(&done), "tick {tick} was dropped");
             let Outcome::Frame(f) = done.outcome else {
@@ -1014,7 +1047,7 @@ mod tests {
             };
             paused_seen |= f.paused;
         }
-        assert!(paused_seen, "a stalled session must decimate its polling");
+        assert!(paused_seen, "a still page must decimate its polling");
 
         // `prev_gray` was never replaced, so this is a confirmed 5-row scroll
         // against the session baseline.
@@ -1094,6 +1127,7 @@ mod tests {
         let band = ScrollReport {
             changed: 0.2,
             static_edge: true,
+            inner_content_moved: true,
             ..ScrollReport::default()
         };
         assert_eq!(
@@ -1115,6 +1149,74 @@ mod tests {
         assert_eq!(
             idle_verdict(StallPhase::Watching, &band),
             Verdict::StaticEdge
+        );
+        // A moving frame without an offset is a nudge, never "still".
+        assert_eq!(
+            idle_verdict(StallPhase::Watching, &unalignable),
+            Verdict::Unaligned {
+                verification_failed: false
+            }
+        );
+    }
+
+    /// A seam-check refusal is its own message ("continue scrolling"), not
+    /// "no scrolling detected", and it never decimates polling.
+    #[test]
+    fn rejected_stitch_is_reported_as_unaligned_not_still() {
+        let rejected = ScrollReport {
+            changed: 0.2,
+            rejected_by_verification: true,
+            ..ScrollReport::default()
+        };
+        let mut stall = StallTracker::new();
+        for tick in 0..(STALL_TICKS * 2) {
+            let phase = stall.observe(&rejected);
+            assert_eq!(phase, StallPhase::Watching, "tick {tick}");
+            assert!(!stall.paused(), "tick {tick}: motion is never a pause");
+            assert_eq!(
+                idle_verdict(phase, &rejected),
+                Verdict::Unaligned {
+                    verification_failed: true
+                },
+                "tick {tick}"
+            );
+        }
+    }
+
+    /// A fixed header/footer band keeps its hint while the page moves behind
+    /// it; without confirmed inner motion the same signature is an alignment
+    /// problem, and neither case reads as a still page.
+    #[test]
+    fn static_band_still_reports_the_band_hint() {
+        let band = ScrollReport {
+            changed: 0.2,
+            static_edge: true,
+            inner_content_moved: true,
+            ..ScrollReport::default()
+        };
+        let mut stall = StallTracker::new();
+        for tick in 0..(STALL_TICKS + 5) {
+            let phase = stall.observe(&band);
+            assert!(
+                !stall.paused(),
+                "tick {tick}: a moving page keeps full speed"
+            );
+            assert_eq!(
+                idle_verdict(phase, &band),
+                Verdict::StaticEdge,
+                "tick {tick}"
+            );
+        }
+        let unconfirmed = ScrollReport {
+            changed: 0.2,
+            static_edge: true,
+            ..ScrollReport::default()
+        };
+        assert_eq!(
+            idle_verdict(StallPhase::Watching, &unconfirmed),
+            Verdict::Unaligned {
+                verification_failed: false
+            }
         );
     }
 }

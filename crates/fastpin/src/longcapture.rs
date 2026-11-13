@@ -949,6 +949,98 @@ pub fn classify_scroll_diag(
     report
 }
 
+/// A stitch the edge path could not confirm, with the row count it is allowed
+/// to commit and where that count came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlideStitch {
+    pub is_up: bool,
+    /// End of the overlap for a downward stitch, number of new rows for an
+    /// upward one -- the same convention as [`classify_scroll`].
+    pub offset_y: usize,
+    /// Rows to commit.
+    pub new_rows: usize,
+    /// `true` when `new_rows` was measured anchor-to-current, `false` when it
+    /// is the tick-by-tick sum.
+    pub measured: bool,
+}
+
+/// Row count for a stitch the edge path could not confirm.
+///
+/// The sliding fallback commits rows straight from the current frame, so its
+/// row count *is* the seam: it must equal the displacement from the anchor.
+/// Summing one verified delta per tick only has that property while every tick
+/// of the run was measurable. A tick whose delta is refused -- a blank edge
+/// strip that matches everywhere, a seam the check rejects -- silently drops
+/// its own displacement, because the sliding reference advances anyway and the
+/// rows can never be credited again. The next seam then writes a strip taken
+/// from a frame that is already past those rows and deletes them from the
+/// output: the text line that appears compressed, doubled or cut at the seam.
+///
+/// So the count is measured ONCE, anchor to current, with the interior probe
+/// ([`align_inner`]: textured, unambiguous, strictly inside the search range,
+/// at most half a frame) and corroborated by the independent-band check over
+/// the whole overlap. The accumulated sum -- a lower bound, never more than
+/// really scrolled, so it can never duplicate a row -- is only a fallback for
+/// a frame the probe cannot lock onto (a uniform strip, or a mid-animation
+/// frame the anchor does not resemble).
+///
+/// The seam term of [`verify_shift`] is deliberately not applied on this path:
+/// it scores a joint that was derived from content, and on a sparse text page
+/// its baseline estimate is exactly what refused the natural scroll in the
+/// machine log (`verify=1.000 seam=0.917 rejected_by_verify=true`, repeated on
+/// every tick of a real scroll). The independent-band check, the strip score,
+/// the runner-up ratio and the texture floor are all unchanged.
+pub fn slide_stitch_rows(
+    anchor: &[u8],
+    current: &[u8],
+    width: usize,
+    height: usize,
+    strip: usize,
+    pending: i64,
+) -> Option<SlideStitch> {
+    if pending == 0 || width == 0 || height < 8 {
+        return None;
+    }
+    let is_up = pending < 0;
+    // One-shot measurement first: this is the only count that cannot drift.
+    let anchor_row = if is_up { height / 4 } else { height * 3 / 4 };
+    if let Some(m) = align_inner(anchor, current, width, height, strip, anchor_row, is_up) {
+        if m.accepted && m.new_rows > MIN_NEW_ROWS && m.new_rows < height {
+            let band = strip
+                .saturating_mul(2)
+                .clamp(4, (height / 3).max(4))
+                .min(height - m.new_rows)
+                .max(1);
+            let agreement =
+                overlap_agreement(anchor, current, width, height, band, m.new_rows, is_up);
+            if agreement >= VERIFY_MIN_SCORE {
+                let offset_y = if is_up {
+                    m.new_rows
+                } else {
+                    height - m.new_rows
+                };
+                return Some(SlideStitch {
+                    is_up,
+                    offset_y,
+                    new_rows: m.new_rows,
+                    measured: true,
+                });
+            }
+        }
+    }
+    let rows = pending.unsigned_abs() as usize;
+    if rows <= MIN_NEW_ROWS || rows > height.saturating_sub(strip) {
+        return None;
+    }
+    let offset_y = if is_up { rows } else { height - rows };
+    Some(SlideStitch {
+        is_up,
+        offset_y,
+        new_rows: rows,
+        measured: false,
+    })
+}
+
 /// Sampled fraction of pixels that changed by more than `CHANGE_DELTA` levels.
 /// Used only to tell "the page moved but too fast to align" from "nothing
 /// happened"; sampling every 4th pixel keeps it cheap on the reject path.
@@ -3444,5 +3536,220 @@ mod tests {
         // It must keep the old "page is moving / band hint" behaviour.
         let (prev, curr) = local_animation_pair(w, h, 16..32);
         assert!(!change_is_local(&prev, &curr, w, h));
+    }
+
+    // ---- A1 seam regression: a row count must never come from a short sum --
+
+    /// Document rows that carry their own index in the first two columns and
+    /// per-row texture after that, so a stitched image can be decoded back row
+    /// by row: a row that appears twice, or not at all, is visible without a
+    /// reference image.
+    fn indexed_doc(total: usize, width: usize) -> Vec<u8> {
+        let mut out = vec![0u8; total * width];
+        for i in 0..total {
+            let row = &mut out[i * width..(i + 1) * width];
+            row[0] = (i >> 8) as u8;
+            row[1] = (i & 0xFF) as u8;
+            let mut state = (i as u32)
+                .wrapping_mul(747_796_405)
+                .wrapping_add(2_891_336_453);
+            for p in row.iter_mut().skip(2) {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *p = (state >> 24) as u8;
+            }
+        }
+        out
+    }
+
+    /// The first two pixels of a packed BGRA row hold the row's document index
+    /// (the gray value of `gray_to_bgra` is replicated into every channel).
+    fn doc_row_index_bgra(row: &[u8]) -> usize {
+        ((row[0] as usize) << 8) | row[4] as usize
+    }
+
+    fn doc_window(doc: &[u8], width: usize, offset: usize, height: usize) -> Vec<u8> {
+        doc[offset * width..(offset + height) * width].to_vec()
+    }
+
+    /// Gray plane -> packed BGRA, so the real [`Stitcher`] can be used.
+    fn gray_to_bgra(gray: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(gray.len() * 4);
+        for v in gray {
+            out.extend_from_slice(&[*v, *v, *v, 255]);
+        }
+        out
+    }
+
+    /// The tick sequence that produced the real-machine defect: the page
+    /// scrolled 30 rows from the anchor, but one tick's delta could not be
+    /// verified (a blank edge strip matched everywhere), so the running sum
+    /// only knows 20 of them. Stitching the sum deletes 10 rows at the seam.
+    struct SlidingRun {
+        doc: Vec<u8>,
+        width: usize,
+        height: usize,
+        strip: usize,
+        /// Rows that really scrolled since the anchor.
+        total: usize,
+        /// What the tick-by-tick sum believes.
+        pending: i64,
+        current: Vec<u8>,
+    }
+
+    fn sliding_run() -> SlidingRun {
+        let (width, height, strip) = (48usize, 64usize, 16usize);
+        let total = 30usize;
+        // Long enough for the current window plus a seam to compare against.
+        let doc = indexed_doc(total + height + 128, width);
+        let current = doc_window(&doc, width, total, height);
+        SlidingRun {
+            doc,
+            width,
+            height,
+            strip,
+            total,
+            pending: 20,
+            current,
+        }
+    }
+
+    /// Stitches the run the way the worker does and returns the decoded row
+    /// indices of the finished image.
+    fn stitch_sliding_run(run: &SlidingRun) -> (Vec<usize>, SlideStitch) {
+        let anchor = doc_window(&run.doc, run.width, 0, run.height);
+        let stitch = slide_stitch_rows(
+            &anchor,
+            &run.current,
+            run.width,
+            run.height,
+            run.strip,
+            run.pending,
+        )
+        .expect("an anchor-to-current measurement must stitch");
+        let mut stitcher = Stitcher::new(run.width, run.height, 4096).expect("first frame");
+        assert!(stitcher.fill_first(&gray_to_bgra(&anchor)));
+        stitcher
+            .append(
+                &gray_to_bgra(&run.current),
+                run.width,
+                run.height,
+                run.height - stitch.new_rows,
+            )
+            .expect("append");
+        let (pixels, _, height) = stitcher.into_pixels();
+        let rows = (0..height as usize)
+            .map(|y| {
+                let at = y * run.width * 4;
+                doc_row_index_bgra(&pixels[at..])
+            })
+            .collect();
+        (rows, stitch)
+    }
+
+    #[test]
+    fn a_sliding_stitch_never_duplicates_rows() {
+        let run = sliding_run();
+        let (rows, stitch) = stitch_sliding_run(&run);
+        assert!(
+            stitch.measured,
+            "the count must be measured anchor-to-current, not summed"
+        );
+        assert_eq!(stitch.new_rows, run.total);
+        let mut seen = vec![0usize; rows.len()];
+        for (y, &index) in rows.iter().enumerate() {
+            assert_eq!(index, y, "row {y} holds document row {index}");
+            seen[index] += 1;
+        }
+        assert!(
+            seen.iter().all(|&n| n == 1),
+            "every row appears exactly once (no duplicated seam rows)"
+        );
+    }
+
+    #[test]
+    fn a_sliding_stitch_never_drops_rows() {
+        let run = sliding_run();
+        let (rows, stitch) = stitch_sliding_run(&run);
+        assert_eq!(rows.len(), run.height + run.total);
+        assert_eq!(
+            rows,
+            (0..rows.len()).collect::<Vec<_>>(),
+            "the finished image is the document's first {} rows, in order",
+            rows.len()
+        );
+        // The sum that the old code committed is demonstrably short: that is
+        // exactly the deletion the user saw at the seam.
+        assert!((stitch.new_rows as i64) > run.pending);
+    }
+
+    #[test]
+    fn pending_accumulation_matches_the_total_offset() {
+        let run = sliding_run();
+        let anchor = doc_window(&run.doc, run.width, 0, run.height);
+        // The sum the old code committed as its row count: short by exactly
+        // the tick whose delta was refused (that is the seam deletion).
+        assert!((run.pending as usize) < run.total);
+        // The one-shot measurement is the displacement the document really
+        // scrolled, so the corrupted count can never reach the stitcher.
+        let measured = slide_stitch_rows(
+            &anchor,
+            &run.current,
+            run.width,
+            run.height,
+            run.strip,
+            run.pending,
+        )
+        .expect("the total is measurable from the anchor");
+        assert!(measured.measured);
+        assert_eq!(measured.new_rows, run.total);
+        assert_eq!(measured.new_rows as i64 - run.pending, 10);
+        // A run whose ticks were all measured agrees with the measurement:
+        // the two counts are the same number, not two guesses.
+        let complete = slide_stitch_rows(
+            &anchor,
+            &run.current,
+            run.width,
+            run.height,
+            run.strip,
+            run.total as i64,
+        )
+        .expect("complete run");
+        assert_eq!(complete.new_rows, run.total);
+        // When nothing can be measured (a uniform strip), the sum is the only
+        // evidence left: it is a lower bound, so it may not exceed the truth.
+        let blank = vec![255u8; run.width * run.height];
+        let sum = slide_stitch_rows(
+            &blank,
+            &blank,
+            run.width,
+            run.height,
+            run.strip,
+            run.pending,
+        )
+        .expect("the sum still stitches when nothing can be measured");
+        assert!(!sum.measured);
+        assert_eq!(sum.new_rows as i64, run.pending);
+    }
+
+    #[test]
+    fn seam_rows_are_single_layer() {
+        let run = sliding_run();
+        let (rows, stitch) = stitch_sliding_run(&run);
+        // The seam is where the first row taken from the current frame lands:
+        // right after the anchor's last row.
+        let seam = run.height;
+        assert_eq!(stitch.new_rows, run.total);
+        assert_eq!(rows[seam - 1], seam - 1);
+        assert_eq!(rows[seam], seam);
+        assert_eq!(rows[seam + 1], seam + 1);
+        let mut counts = std::collections::BTreeMap::new();
+        for &index in &rows {
+            *counts.entry(index).or_insert(0usize) += 1;
+        }
+        assert!(
+            counts.values().all(|&n| n == 1),
+            "seam rows are single layer"
+        );
+        assert_eq!(counts.len(), rows.len());
     }
 }

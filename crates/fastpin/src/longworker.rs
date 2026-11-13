@@ -22,8 +22,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::longcapture::{
-    bgra_to_gray, classify_scroll_diag, normalize_bgra, rotate_bgra270, Axis, ScrollReport,
-    StallPhase, StallTracker, StitchError, StitchStats, Stitcher, ACCEPT_SCORE, MIN_NEW_ROWS,
+    bgra_to_gray, classify_scroll_diag, normalize_bgra, rotate_bgra270, slide_stitch_rows, Axis,
+    ScrollReport, StallPhase, StallTracker, StitchError, StitchStats, Stitcher, ACCEPT_SCORE,
     MOTION_CHANGED,
 };
 
@@ -284,9 +284,11 @@ struct SessionState {
     align_gray: Vec<u8>,
     /// Rows scrolled since the anchor, each confirmed by a verified
     /// frame-to-frame alignment, but not yet committed to the stitcher.
-    /// Signed: positive is downward, negative upward. Stitching always takes
-    /// the whole `pending` from the CURRENT frame, so a rejected tick can
-    /// never drop the rows that scrolled past.
+    /// Signed: positive is downward, negative upward. This is a SUM: it is a
+    /// lower bound of the displacement from the anchor (a tick whose delta was
+    /// refused contributes nothing), so [`slide_stitch_rows`] measures that
+    /// displacement anchor-to-current and only falls back to this when the
+    /// measurement is not available.
     pending: i64,
     stall: StallTracker,
     /// Frames processed, for the diagnostic `t{n}` column.
@@ -584,35 +586,28 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
     // every un-stitched row, so no BGRA history / image_budget is needed.
     state.align_gray = gray.clone();
 
-    // Accumulate the verified per-frame delta since the anchor. `slide`
-    // already ran the same down/up SAD + independent-band/seam verification
-    // as the primary report, against a fresh reference, so a cumulative
-    // stitch of `pending` rows is as trustworthy as any single-frame stitch.
+    // Accumulate the verified per-frame delta since the anchor. The deltas
+    // telescope into the displacement from the anchor while every tick of the
+    // run is measured, which is the common case; a refused tick leaves its own
+    // rows out (see `slide_stitch_rows`, which re-measures the total instead of
+    // trusting this sum). `pending` is still what the diagnostic line prints.
     if let Some((is_up, _, d)) = slide.direction {
         state.pending += if is_up { -(d as i64) } else { d as i64 };
     }
 
     // Decide the stitch. The anchor report wins (it verified the cumulative
-    // offset against the anchor itself). Otherwise a sliding-confirmed offset
-    // stitches ALL pending rows from THIS frame: its bottom `rows` rows are
-    // exactly the rows scrolled since the anchor, so reject ticks cannot drop
-    // content. `rows` is capped at the overlap the frame can still show.
+    // offset against the anchor itself); otherwise the row count comes from
+    // `slide_stitch_rows`, which measures the displacement anchor-to-current
+    // instead of trusting the accumulated sum. A refused stitch keeps
+    // `pending` for a later tick.
     let stitch = match report.direction {
-        Some((is_up, offset, new_rows)) => Some((is_up, offset, new_rows)),
-        None => {
-            let rows = state.pending.unsigned_abs() as usize;
-            if rows > MIN_NEW_ROWS && rows <= nh.saturating_sub(strip) {
-                let is_up = state.pending < 0;
-                let offset = if is_up { rows } else { nh - rows };
-                Some((is_up, offset, rows))
-            } else {
-                None
-            }
-        }
+        Some((is_up, offset, new_rows)) => Some((is_up, offset, new_rows, false)),
+        None => slide_stitch_rows(&state.prev_gray, &gray, nw, nh, strip, state.pending)
+            .map(|s| (s.is_up, s.offset_y, s.new_rows, s.measured)),
     };
 
     match stitch {
-        Some((is_up, offset_y, new_rows)) => {
+        Some((is_up, offset_y, new_rows, measured)) => {
             let via_slide = report.direction.is_none();
             if via_slide {
                 // A sliding-driven stitch: make the stall tracker and the log
@@ -651,7 +646,7 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                  norm_ms={:.1} gray_ms={:.1} sad_ms={:.1} stitch_ms={:.1} \
                  log_prev_ms={:.1} score={score:.3} runner_up={ratio:.2} seam={:.3} \
                  verify={:.3} is_up={is_up} new_rows={new_rows} total={total}px \
-                 seg={segments} late={} copied={} slide={}",
+                 seg={segments} late={} copied={} slide={} src={}",
                 state.ticks,
                 state.axis.label(),
                 spans.total(),
@@ -667,6 +662,13 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                 job.late,
                 state.stitcher.stats().copied_bytes,
                 via_slide as u8,
+                if !via_slide {
+                    "edge"
+                } else if measured {
+                    "measure"
+                } else {
+                    "sum"
+                },
             ));
             spans.log = ms(t);
             state.last_log_ms = spans.log;
@@ -703,8 +705,8 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                 };
             }
             // Re-anchor on this frame: it is now both the stitch anchor and
-            // (already) the sliding reference. The whole pending run was
-            // committed above, so nothing carries over to the next tick.
+            // (already) the sliding reference. The committed rows cover the
+            // whole run, so the sum carries nothing over to the next tick.
             state.prev_gray = gray;
             state.pending = 0;
             Outcome::Frame(FrameResult {

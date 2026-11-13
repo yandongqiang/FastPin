@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 
 use crate::longcapture::{
     bgra_to_gray, classify_scroll_diag, normalize_bgra, rotate_bgra270, Axis, ScrollReport,
-    StallPhase, StallTracker, StitchError, StitchStats, Stitcher, ACCEPT_SCORE, MOTION_CHANGED,
+    StallPhase, StallTracker, StitchError, StitchStats, Stitcher, ACCEPT_SCORE, MIN_NEW_ROWS,
+    MOTION_CHANGED,
 };
 
 /// Sampled pixel-change fraction above which a rejected tick is reported as
@@ -271,7 +272,22 @@ struct SessionState {
     epoch: u64,
     axis: Axis,
     stitcher: Stitcher,
+    /// The stitch ANCHOR: grayscale of the last frame whose rows were
+    /// committed. Only a successful stitch replaces it. The primary report,
+    /// the stall tracker, the verdict and the diagnostic line are all measured
+    /// against it, exactly as before this fix.
     prev_gray: Vec<u8>,
+    /// The ALIGNMENT reference: grayscale of the most recently captured frame.
+    /// Advanced on EVERY tick, not only on a stitch, so a smooth / sub-pixel
+    /// frame can never leave the baseline frozen at a clean settled frame it
+    /// can no longer match (the deadlock the diagnostic log showed).
+    align_gray: Vec<u8>,
+    /// Rows scrolled since the anchor, each confirmed by a verified
+    /// frame-to-frame alignment, but not yet committed to the stitcher.
+    /// Signed: positive is downward, negative upward. Stitching always takes
+    /// the whole `pending` from the CURRENT frame, so a rejected tick can
+    /// never drop the rows that scrolled past.
+    pending: i64,
     stall: StallTracker,
     /// Frames processed, for the diagnostic `t{n}` column.
     ticks: u64,
@@ -287,7 +303,9 @@ impl SessionState {
             epoch: rb.epoch,
             axis: rb.axis,
             stitcher: rb.stitcher,
+            align_gray: rb.prev_gray.clone(),
             prev_gray: rb.prev_gray,
+            pending: 0,
             stall: StallTracker::new(),
             ticks: 0,
             last_log_ms: 0.0,
@@ -335,7 +353,9 @@ impl LongWorker {
             epoch: 0,
             axis,
             stitcher,
+            align_gray: prev_gray.clone(),
             prev_gray,
+            pending: 0,
             stall: StallTracker::new(),
             ticks: 0,
             last_log_ms: 0.0,
@@ -545,11 +565,66 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
     // down was rejected, then confirms every accepted offset with the
     // independent-band/seam check (P1-05).
     let t = Instant::now();
-    let report = classify_scroll_diag(&state.prev_gray, &gray, nw, nh, strip, ACCEPT_SCORE);
+    // Primary: against the anchor (last stitched frame). Unchanged semantics
+    // -- it drives the stall tracker, the verdict and the diagnostic line, so
+    // a repeated unalignable frame still reads as motion, not a pause.
+    let mut report = classify_scroll_diag(&state.prev_gray, &gray, nw, nh, strip, ACCEPT_SCORE);
+    // Sliding: against the most recently captured frame, a fresh reference.
+    // After a stitch at a clean settled frame, the very next in-flight
+    // (sub-pixel / smooth-scroll) frame cannot be aligned to that clean
+    // anchor; freezing the anchor on every reject then re-judges every later
+    // frame against the same dead baseline until the accumulated scroll
+    // outruns the overlap strip (the 83% `verify=0` deadlock).
+    let slide = classify_scroll_diag(&state.align_gray, &gray, nw, nh, strip, ACCEPT_SCORE);
     spans.sad = ms(t);
 
-    match report.direction {
+    // THE FIX: advance the sliding alignment reference on EVERY tick, so it
+    // can never go stale. Only grayscale is retained (one extra plane); the
+    // rows we stitch always come from the CURRENT frame, which already holds
+    // every un-stitched row, so no BGRA history / image_budget is needed.
+    state.align_gray = gray.clone();
+
+    // Accumulate the verified per-frame delta since the anchor. `slide`
+    // already ran the same down/up SAD + independent-band/seam verification
+    // as the primary report, against a fresh reference, so a cumulative
+    // stitch of `pending` rows is as trustworthy as any single-frame stitch.
+    if let Some((is_up, _, d)) = slide.direction {
+        state.pending += if is_up { -(d as i64) } else { d as i64 };
+    }
+
+    // Decide the stitch. The anchor report wins (it verified the cumulative
+    // offset against the anchor itself). Otherwise a sliding-confirmed offset
+    // stitches ALL pending rows from THIS frame: its bottom `rows` rows are
+    // exactly the rows scrolled since the anchor, so reject ticks cannot drop
+    // content. `rows` is capped at the overlap the frame can still show.
+    let stitch = match report.direction {
+        Some((is_up, offset, new_rows)) => Some((is_up, offset, new_rows)),
+        None => {
+            let rows = state.pending.unsigned_abs() as usize;
+            if rows > MIN_NEW_ROWS && rows <= nh.saturating_sub(strip) {
+                let is_up = state.pending < 0;
+                let offset = if is_up { rows } else { nh - rows };
+                Some((is_up, offset, rows))
+            } else {
+                None
+            }
+        }
+    };
+
+    match stitch {
         Some((is_up, offset_y, new_rows)) => {
+            let via_slide = report.direction.is_none();
+            if via_slide {
+                // A sliding-driven stitch: make the stall tracker and the log
+                // describe the progress the primary (deadlocked) report hid.
+                report.direction = Some((is_up, offset_y, new_rows));
+                report.down_score = slide.down_score;
+                report.down_ratio = slide.down_ratio;
+                report.up_score = slide.up_score;
+                report.up_ratio = slide.up_ratio;
+                report.overlap_score = slide.overlap_score;
+                report.seam_score = slide.seam_score;
+            }
             state.stall.observe(&report);
             let t = Instant::now();
             // Both directions enforce the height cap and the image budget
@@ -576,7 +651,7 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                  norm_ms={:.1} gray_ms={:.1} sad_ms={:.1} stitch_ms={:.1} \
                  log_prev_ms={:.1} score={score:.3} runner_up={ratio:.2} seam={:.3} \
                  verify={:.3} is_up={is_up} new_rows={new_rows} total={total}px \
-                 seg={segments} late={} copied={}",
+                 seg={segments} late={} copied={} slide={}",
                 state.ticks,
                 state.axis.label(),
                 spans.total(),
@@ -591,6 +666,7 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                 report.overlap_score,
                 job.late,
                 state.stitcher.stats().copied_bytes,
+                via_slide as u8,
             ));
             spans.log = ms(t);
             state.last_log_ms = spans.log;
@@ -605,6 +681,12 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                     // good frame still aligns against a baseline whose width
                     // matches the stitcher. No stitched content is dropped and
                     // the session keeps polling.
+                    //
+                    // The glitch frame is also a bad sliding reference: keep
+                    // both references (and the pending rows) at the anchor so
+                    // the next good frame aligns against a width-matching one.
+                    state.align_gray = state.prev_gray.clone();
+                    state.pending = 0;
                     crate::perf::log_diag(&format!("long-tick skip: {e}"));
                     return Outcome::Frame(FrameResult {
                         verdict: Verdict::FrameSkipped,
@@ -620,9 +702,11 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                     reason: stop_reason(&e),
                 };
             }
-            // Align the next tick against the latest captured frame, not the
-            // stitched buffer, so switching direction works frame-to-frame.
+            // Re-anchor on this frame: it is now both the stitch anchor and
+            // (already) the sliding reference. The whole pending run was
+            // committed above, so nothing carries over to the next tick.
             state.prev_gray = gray;
+            state.pending = 0;
             Outcome::Frame(FrameResult {
                 verdict: Verdict::Progress { is_up, new_rows },
                 paused: state.stall.paused(),
@@ -640,7 +724,8 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                  norm_ms={:.1} gray_ms={:.1} sad_ms={:.1} log_prev_ms={:.1} \
                  score={:.3}/{:.3} runner_up={:.2}/{:.2} is_up=- new_rows=0 \
                  changed={:.2} static_edge={} inner_moved={}({}) \
-                 rejected_by_verify={} verify={:.3} seam={:.3} idle={} late={}",
+                 rejected_by_verify={} verify={:.3} seam={:.3} idle={} late={} \
+                 pending={}",
                 state.ticks,
                 state.axis.label(),
                 spans.total(),
@@ -663,6 +748,7 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
                 report.seam_score,
                 state.stall.idle_ticks() + 1,
                 job.late,
+                state.pending,
             ));
             spans.log = ms(t);
             state.last_log_ms = spans.log;
@@ -1558,5 +1644,331 @@ mod tests {
             "an image-budget limit must still stop: {:?}",
             done.outcome
         );
+    }
+
+    // ---- regression: the alignment baseline deadlocks between stitches ----
+
+    /// A "smooth-scroll / compositor" frame: every row is a 3-row box blur of
+    /// the page starting at `start_row`, i.e. the sub-pixel resampling of an
+    /// in-flight wheel animation. All such frames share the same resampling,
+    /// so two of them align exactly; a clean settled frame does NOT match a
+    /// blurred one (their overlap never clears `VERIFY_MIN_SCORE`).
+    ///
+    /// This models the diagnostic log: after a stitch at a clean settled
+    /// frame, the first in-flight frame cannot align against that clean
+    /// baseline, and because `prev_gray` only advanced on a stitch the session
+    /// then re-judged every later frame against the same dead baseline -- the
+    /// 22-46 identical `verify=0` ticks and no stitches.
+    fn smooth_frame(page: &[u8], width: usize, start_row: usize, height: usize) -> Vec<u8> {
+        let row = width * 4;
+        let mut out = vec![0u8; row * height];
+        for y in 0..height {
+            for x in 0..row {
+                let a = page[(start_row + y) * row + x] as u32;
+                let b = page[(start_row + y + 1) * row + x] as u32;
+                let c = page[(start_row + y + 2) * row + x] as u32;
+                out[y * row + x] = ((a + b + c) / 3) as u8;
+            }
+        }
+        out
+    }
+
+    fn tall_worker(first: &[u8], w: usize, h: usize, generation: u64) -> LongWorker {
+        let mut stitcher = Stitcher::new(w, h, MAX_H).unwrap();
+        assert!(stitcher.fill_first(first));
+        let gray = bgra_to_gray(first, w, h).unwrap();
+        LongWorker::new(generation, Axis::Vertical, stitcher, gray).unwrap()
+    }
+
+    fn tall_job(seq: u64, generation: u64, epoch: u64, w: usize, h: usize, bgra: Vec<u8>) -> Job {
+        Job {
+            generation,
+            epoch,
+            seq,
+            axis: Axis::Vertical,
+            width: w,
+            height: h,
+            bgra,
+            capture_ms: 0.0,
+            late: 0,
+        }
+    }
+
+    fn is_progress(done: &Done) -> bool {
+        matches!(
+            done.outcome,
+            Outcome::Frame(FrameResult {
+                verdict: Verdict::Progress { .. },
+                ..
+            })
+        )
+    }
+
+    /// RED on the current code: a clean settled anchor followed by a run of
+    /// smooth-scroll frames (all sub-pixel resampled) can never be aligned
+    /// against the frozen clean baseline, so no frame stitches. The fixed
+    /// worker keeps a sliding alignment reference and stitches every scroll
+    /// frame.
+    #[test]
+    fn reject_baseline_deadlocks_after_a_smooth_scroll() {
+        const TW: usize = 32;
+        const TH: usize = 240;
+        let page = synthetic_page(TW, TH + 8 * 40 + 8, 0x5A00_0001);
+        let first = frame(&page, TW, 0, TH);
+        let mut worker = tall_worker(&first, TW, TH, 1);
+        let mut gate = ResultGate::new(1);
+
+        let mut progress = 0usize;
+        // tick 0 is the same scroll position but resampled (no new rows);
+        // ticks 1.. are 40-row smooth-scroll steps.
+        for (i, start) in [0usize, 40, 80, 120, 160, 200, 240, 280].iter().enumerate() {
+            let seq = gate.issue(gate.epoch()).unwrap();
+            let f = smooth_frame(&page, TW, *start, TH);
+            assert!(worker.submit(tall_job(seq, 1, 0, TW, TH, f)));
+            let done = wait(&worker);
+            assert!(gate.accept(&done), "tick {i} dropped");
+            if is_progress(&done) {
+                progress += 1;
+            }
+        }
+        assert!(
+            progress >= 7,
+            "every smooth-scroll frame after the first must stitch, got {progress}/8"
+        );
+        // No row scrolled during the rejects was dropped or duplicated.
+        let (px, w, h) = worker.finish(FINISH_WAIT).unwrap();
+        assert_eq!((w as usize, h as usize), (TW, TH + 7 * 40));
+        let row = TW * 4;
+        let mut expected = first.clone();
+        for start in [40usize, 80, 120, 160, 200, 240, 280] {
+            let f = smooth_frame(&page, TW, start, TH);
+            expected.extend_from_slice(&f[(TH - 40) * row..TH * row]);
+        }
+        assert_eq!(px, expected, "every smooth-scrolled row is in the image");
+    }
+
+    /// RED on the current code: 105-row wheel notches captured as in-flight
+    /// smooth frames never match the frozen clean baseline, so the session
+    /// stitches nothing; the fixed worker stitches every frame.
+    #[test]
+    fn natural_wheel_scroll_stitches_every_frame() {
+        const TW: usize = 32;
+        const TH: usize = 400;
+        let page = synthetic_page(TW, TH + 6 * 105 + 8, 0x5A00_0002);
+        let first = frame(&page, TW, 0, TH);
+        let mut worker = tall_worker(&first, TW, TH, 1);
+        let mut gate = ResultGate::new(1);
+
+        let mut progress = 0usize;
+        for (i, start) in [0usize, 105, 210, 315, 420, 525, 630].iter().enumerate() {
+            let seq = gate.issue(gate.epoch()).unwrap();
+            let f = smooth_frame(&page, TW, *start, TH);
+            assert!(worker.submit(tall_job(seq, 1, 0, TW, TH, f)));
+            let done = wait(&worker);
+            assert!(gate.accept(&done), "tick {i} dropped");
+            if is_progress(&done) {
+                progress += 1;
+            }
+        }
+        assert_eq!(
+            progress, 6,
+            "every 105-row wheel step must stitch, got {progress}/7"
+        );
+        // No wheel step was dropped or duplicated.
+        let (px, w, h) = worker.finish(FINISH_WAIT).unwrap();
+        assert_eq!((w as usize, h as usize), (TW, TH + 6 * 105));
+        let row = TW * 4;
+        let mut expected = first.clone();
+        for start in [105usize, 210, 315, 420, 525, 630] {
+            let f = smooth_frame(&page, TW, start, TH);
+            expected.extend_from_slice(&f[(TH - 105) * row..TH * row]);
+        }
+        assert_eq!(px, expected, "every 105-row wheel step is in the image");
+    }
+
+    /// "不丢内容": ticks that the anchor report rejects but during which no
+    /// rows scroll (static / local animation) must not create gaps. Every
+    /// scrolled row still lands in the exported image.
+    #[test]
+    fn rejected_ticks_stitch_every_scrolled_row() {
+        const TW: usize = 32;
+        const TH: usize = 240;
+        let page = synthetic_page(TW, TH + 4 * 40 + 8, 0x5A00_0003);
+        let first = frame(&page, TW, 0, TH);
+        let mut worker = tall_worker(&first, TW, TH, 1);
+        let mut gate = ResultGate::new(1);
+
+        // A no-scroll resampled frame primes the sliding reference; then each
+        // 40-row step is followed by a static frame at the same position, so
+        // half the ticks are rejected by the anchor report.
+        let starts = [0usize, 40, 40, 80, 80, 120, 120, 160, 160];
+        let mut progress = 0usize;
+        for (i, start) in starts.iter().enumerate() {
+            let seq = gate.issue(gate.epoch()).unwrap();
+            let f = smooth_frame(&page, TW, *start, TH);
+            assert!(worker.submit(tall_job(seq, 1, 0, TW, TH, f)));
+            let done = wait(&worker);
+            assert!(gate.accept(&done), "tick {i} dropped");
+            if is_progress(&done) {
+                progress += 1;
+            }
+        }
+        assert_eq!(progress, 4, "one stitch per scroll step");
+
+        let (px, w, h) = worker.finish(FINISH_WAIT).unwrap();
+        assert_eq!((w as usize, h as usize), (TW, TH + 4 * 40));
+        let row = TW * 4;
+        let mut expected = first.clone();
+        for start in [40usize, 80, 120, 160] {
+            let f = smooth_frame(&page, TW, start, TH);
+            expected.extend_from_slice(&f[(TH - 40) * row..TH * row]);
+        }
+        assert_eq!(px, expected, "no row was dropped across the reject ticks");
+    }
+
+    /// "不误拼": exactly periodic rows match the strip several ways at once.
+    /// The sliding pass must NOT turn that ambiguity into a stitch -- the
+    /// runner-up / independent-band guards still refuse every offset.
+    #[test]
+    fn periodic_content_is_not_stitched_via_the_sliding_path() {
+        const TW: usize = 32;
+        const TH: usize = 240;
+        const PERIOD: usize = 8;
+        let row = TW * 4;
+        // 8 distinct rows repeated: the 32-row strip matches itself 4 ways.
+        let mut base = vec![0u8; PERIOD * row];
+        let mut state = 0x9E37_0007u32;
+        for b in base.iter_mut() {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (state >> 24) as u8;
+        }
+        let mut page = vec![0u8; (TH + 40) * row];
+        for r in 0..TH + 40 {
+            let src = (r % PERIOD) * row;
+            page[r * row..(r + 1) * row].copy_from_slice(&base[src..src + row]);
+        }
+        let first = frame(&page, TW, 0, TH);
+        let mut worker = tall_worker(&first, TW, TH, 1);
+        let mut gate = ResultGate::new(1);
+
+        let mut progress = 0usize;
+        for (i, start) in [0usize, 3, 6, 9, 12, 15, 18, 21].iter().enumerate() {
+            let seq = gate.issue(gate.epoch()).unwrap();
+            let f = frame(&page, TW, *start, TH);
+            assert!(worker.submit(tall_job(seq, 1, 0, TW, TH, f)));
+            let done = wait(&worker);
+            assert!(gate.accept(&done), "tick {i} dropped");
+            if is_progress(&done) {
+                progress += 1;
+            }
+        }
+        assert_eq!(progress, 0, "periodic content must never be stitched");
+        let (px, w, h) = worker.finish(FINISH_WAIT).unwrap();
+        assert_eq!((w as usize, h as usize), (TW, TH), "stitcher untouched");
+        assert_eq!(px, first);
+    }
+
+    /// The signed `pending` handles upward smooth scrolls: fresh rows enter at
+    /// the top and are prepended, still covering every step.
+    #[test]
+    fn upward_smooth_scroll_stitches_every_frame() {
+        const TW: usize = 32;
+        const TH: usize = 240;
+        let page = synthetic_page(TW, TH + 8 * 40 + 8, 0x5A00_0004);
+        let first = frame(&page, TW, 320, TH);
+        let mut worker = tall_worker(&first, TW, TH, 1);
+        let mut gate = ResultGate::new(1);
+
+        let mut progress = 0usize;
+        let mut stitched_rows = 0usize;
+        for (i, start) in [320usize, 280, 240, 200, 160, 120, 80, 40]
+            .iter()
+            .enumerate()
+        {
+            let seq = gate.issue(gate.epoch()).unwrap();
+            let f = smooth_frame(&page, TW, *start, TH);
+            assert!(worker.submit(tall_job(seq, 1, 0, TW, TH, f)));
+            let done = wait(&worker);
+            assert!(gate.accept(&done), "tick {i} dropped");
+            if let Outcome::Frame(fr) = &done.outcome {
+                if let Verdict::Progress { new_rows, .. } = fr.verdict {
+                    progress += 1;
+                    stitched_rows += new_rows;
+                }
+            }
+        }
+        // The session must never deadlock. A tick that the matcher refused is
+        // fine: its rows are carried in `pending` and stitched together with
+        // the next confirmed frame (a single 80-row stitch here), so the total
+        // is exactly the 7 * 40 rows the page scrolled.
+        assert!(progress >= 6, "an up-scroll must keep progressing");
+        assert_eq!(stitched_rows, 7 * 40, "no up-scrolled row is lost");
+
+        let (px, w, h) = worker.finish(FINISH_WAIT).unwrap();
+        assert_eq!((w as usize, h as usize), (TW, TH + 7 * 40));
+        let row = TW * 4;
+        let mut expected = Vec::new();
+        // Prepend order: the last up step ends up at the very top.
+        for start in [40usize, 80, 120, 160, 200, 240, 280] {
+            let f = smooth_frame(&page, TW, start, TH);
+            expected.extend_from_slice(&f[..40 * row]);
+        }
+        expected.extend_from_slice(&first);
+        assert_eq!(px, expected, "every up-scrolled row is in the image");
+    }
+
+    /// A re-baseline (axis switch / new epoch) rebuilds BOTH references and
+    /// clears the pending rows, so no stale sliding baseline or accumulated
+    /// offset from the old epoch can leak into the new session.
+    #[test]
+    fn rebaseline_resets_the_sliding_reference() {
+        const TW: usize = 32;
+        const TH: usize = 240;
+        let page = synthetic_page(TW, TH + 40 + 8, 0x5A00_0005);
+        let first = frame(&page, TW, 0, TH);
+        let mut worker = tall_worker(&first, TW, TH, 1);
+        let mut gate = ResultGate::new(1);
+
+        // Move the sliding reference away from the anchor with a smooth frame.
+        let seq = gate.issue(0).unwrap();
+        assert!(worker.submit(tall_job(seq, 1, 0, TW, TH, smooth_frame(&page, TW, 0, TH))));
+        let _ = wait(&worker);
+
+        gate.rebaseline(1);
+        let (norm, nw, nh) = normalize_bgra(&first, TW, TH, Axis::Vertical).unwrap();
+        let mut stitcher = Stitcher::new(nw, nh, MAX_H).unwrap();
+        assert!(stitcher.fill_first(norm.as_ref()));
+        let gray = bgra_to_gray(norm.as_ref(), nw, nh).unwrap();
+        worker.rebaseline(Rebase {
+            generation: 1,
+            epoch: 1,
+            axis: Axis::Vertical,
+            stitcher,
+            prev_gray: gray,
+        });
+
+        // A clean 5-row scroll must stitch exactly 5 rows against the fresh
+        // baseline, not a leftover pending offset from the previous epoch.
+        let seq = gate.issue(1).unwrap();
+        assert!(worker.submit(tall_job(seq, 1, 1, TW, TH, frame(&page, TW, 5, TH))));
+        let done = wait(&worker);
+        assert!(gate.accept(&done), "the new epoch must apply");
+        match &done.outcome {
+            Outcome::Frame(f) => assert!(
+                matches!(
+                    f.verdict,
+                    Verdict::Progress {
+                        is_up: false,
+                        new_rows: 5
+                    }
+                ),
+                "unexpected verdict {:?}",
+                f.verdict
+            ),
+            other => panic!("expected a frame, got {other:?}"),
+        }
+        let (px, w, h) = worker.finish(FINISH_WAIT).unwrap();
+        assert_eq!((w as usize, h as usize), (TW, TH + 5));
+        assert_eq!(px.len(), TW * (TH + 5) * 4);
     }
 }

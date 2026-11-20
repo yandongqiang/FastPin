@@ -1,6 +1,6 @@
 //! Shared D3D11 helpers, GPU copies, HDR tonemap pass, staging readback.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::core::{Interface, PCSTR};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
@@ -166,6 +166,10 @@ pub struct Gpu {
     ps_copy: ID3D11PixelShader,
     ps_white_lift: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
+    /// One dynamic cbuffer reused for every tonemap/white-lift blit. Creating
+    /// a 16-byte buffer per capture per monitor was pure GPU allocation churn.
+    /// Shared across clones; a device reset rebuilds `Gpu` with a fresh slot.
+    cbuffer: Arc<Mutex<Option<windows::Win32::Graphics::Direct3D11::ID3D11Buffer>>>,
 }
 
 impl Gpu {
@@ -178,6 +182,7 @@ impl Gpu {
             ps_copy: shaders.ps_copy.clone(),
             ps_white_lift: shaders.ps_white_lift.clone(),
             sampler: shaders.sampler.clone(),
+            cbuffer: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -351,8 +356,24 @@ impl Gpu {
             };
             ctx.PSSetShader(ps, None);
             if !matches!(mode, BlitMode::Copy) {
-                let cb_data = [sdr_white.max(1.0), 0.0, 0.0, 0.0];
-                let cb = create_cbuffer(&self.device, &cb_data)?;
+                // Reuse one dynamic cbuffer and just rewrite sdrWhite; the old
+                // path created (and destroyed) a buffer for every single blit.
+                let cb = {
+                    let mut slot = self.cbuffer.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(create_cbuffer(&self.device, &[1.0; 4])?);
+                    }
+                    slot.as_ref().cloned().expect("cbuffer just created")
+                };
+                {
+                    use windows::Win32::Graphics::Direct3D11::{
+                        D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD,
+                    };
+                    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                    ctx.Map(&cb, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+                    *(mapped.pData as *mut f32) = sdr_white.max(1.0);
+                    ctx.Unmap(&cb, 0);
+                }
                 ctx.PSSetConstantBuffers(0, Some(&[Some(cb)]));
             }
             ctx.PSSetShaderResources(0, Some(&[Some(srv)]));

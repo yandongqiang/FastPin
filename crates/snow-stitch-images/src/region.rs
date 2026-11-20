@@ -683,11 +683,15 @@ impl SimilarityMap {
     }
 
     fn median_filtered(mut self) -> Self {
-        let source = self.values.clone();
         let columns = self.layout.columns as usize;
         let rows = self.layout.rows as usize;
+        // 不再 clone 整个 values：邻居始终从原始数组读，滤波结果写进一个等长
+        // 的新缓冲区，最后整体替换。省掉了每次 between() 的整块 memcpy；
+        // 无效格保持原值（初始化即为 0.0），数值结果与 clone 版完全一致。
+        let mut filtered = Vec::with_capacity(self.values.len());
         for index in 0..self.layout.len() {
             if !self.valid[index] {
+                filtered.push(self.values[index]);
                 continue;
             }
             let mut neighbors = [0.0_f32; 9];
@@ -703,18 +707,19 @@ impl SimilarityMap {
                 for neighbor_column in first_column..=last_column {
                     let neighbor = row_start + neighbor_column;
                     if self.valid[neighbor] {
-                        neighbors[count] = source[neighbor];
+                        neighbors[count] = self.values[neighbor];
                         count += 1;
                     }
                 }
             }
-            self.values[index] = if count == 9 {
+            filtered.push(if count == 9 {
                 median_of_nine(&mut neighbors)
             } else {
                 neighbors[..count].sort_by(f32::total_cmp);
                 neighbors[count / 2]
-            };
+            });
         }
+        self.values = filtered;
         self
     }
 

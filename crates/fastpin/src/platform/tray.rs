@@ -1,7 +1,3 @@
-use std::fs::{create_dir_all, OpenOptions};
-use std::io::Write;
-use std::path::PathBuf;
-
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -80,51 +76,13 @@ pub fn load_app_icon() -> Result<HICON> {
 }
 
 /// Release builds have no console, so every shell step is mirrored into
-/// `%LOCALAPPDATA%\FastPin\logs\tray.log` through its own append+flush channel.
-/// It deliberately does NOT rely on `perf::log_app`: field reports showed
-/// app.log full of capture/clipboard lines but no `[tray]` ladder, so tray
-/// diagnostics get an independent file with no buffering or global state.
-/// If the profile dir is missing or denied (locked-down / sandboxed token),
-/// fall back to a file next to the executable so the ladder still lands.
+/// app.log through `perf::log_app`; the singleton background writer in `perf`
+/// owns all disk I/O (batching, path caching, dir setup, fallback). This keeps
+/// the `[tray]` ladder available without duplicating a synchronous, per-call
+/// append+flush here — that used to block tray startup on every step.
 /// Best-effort: a logging failure must never affect tray startup.
 fn tray_log(msg: &str) {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let line = format!("t={ts} [tray] {msg}\n");
-
-    let mut targets: Vec<PathBuf> = Vec::with_capacity(2);
-    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        targets.push(
-            PathBuf::from(base)
-                .join("FastPin")
-                .join("logs")
-                .join("tray.log"),
-        );
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            targets.push(dir.join("tray.log"));
-        }
-    }
-    for path in targets {
-        if let Some(parent) = path.parent() {
-            if create_dir_all(parent).is_err() {
-                continue;
-            }
-        }
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = f.write_all(line.as_bytes());
-            let _ = f.flush();
-            break;
-        }
-    }
-
-    // Legacy shared channel, kept so app.log still shows the ladder where it
-    // is writable; eprintln is only useful in dev / with an attached console.
     crate::perf::log_app(&format!("[tray] {msg}"));
-    eprintln!("[tray] {msg}");
 }
 
 /// Build a fully-populated NID. `cb_size` / `use_guid` are parameterised so the

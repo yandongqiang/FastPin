@@ -159,6 +159,15 @@ pub(crate) fn load_thumb(path: &PathBuf) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(frame)])))
 }
 
+/// Modification time of a stored image in unix millis, used to decide whether
+/// a cached thumbnail is still valid. `None` (file missing/unreadable) forces a
+/// fresh decode, mirroring the cache in `settings::mod`.
+fn history_file_mtime(path: &PathBuf) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(duration.as_millis() as u64)
+}
+
 /// Total bytes across all records, formatted like "27.8 MB".
 fn total_size(records: &[HistoryRecord]) -> SharedString {
     let bytes: u64 = records.iter().map(|r| r.bytes).sum();
@@ -169,7 +178,12 @@ pub struct HistoryWindowView {
     focus_handle: FocusHandle,
     store: HistoryStore,
     records: Vec<HistoryRecord>,
+    /// Thumbnail cache keyed by record id. Survives reloads; entries whose
+    /// record disappeared are dropped and unchanged files are never re-decoded.
     thumbs: HashMap<String, Option<Arc<RenderImage>>>,
+    /// Mtime the cached thumb was built from. A thumb is reused only while this
+    /// still matches the file's current modification time.
+    thumbs_mtime: HashMap<String, u64>,
     /// Bumped on every decode request so a slow, stale batch cannot overwrite
     /// the thumbnails of a newer refresh when it finally finishes.
     thumb_seq: u64,
@@ -184,6 +198,7 @@ impl HistoryWindowView {
             store,
             records,
             thumbs: HashMap::new(),
+            thumbs_mtime: HashMap::new(),
             thumb_seq: 0,
             selected: None,
             status: SharedString::default(),
@@ -192,32 +207,59 @@ impl HistoryWindowView {
         this
     }
 
-    /// Decodes thumbnails off the UI thread. `image::open` plus `thumbnail`
-    /// touches the disk and does pixel work for every record; doing that inside
-    /// a `Render` or refresh cycle made opening a large history visibly stall.
+    /// Decodes thumbnails off the UI thread, reusing cached ones whose image
+    /// file is unchanged. Only new/changed records are decoded; caches of
+    /// deleted records are dropped. A sequence number prevents a stale batch
+    /// from overwriting a newer refresh's thumbnails.
     fn load_thumbs_async(&mut self, cx: &mut Context<Self>) {
         let seq = {
             self.thumb_seq = self.thumb_seq.wrapping_add(1);
             self.thumb_seq
         };
-        let jobs: Vec<(String, PathBuf)> = self
-            .records
-            .iter()
-            .map(|r| (r.id.clone(), self.store.image_path(r)))
-            .collect();
+        // Keep only cache entries for records that still exist, then work out
+        // which images actually need (re)decoding. A file is unchanged when its
+        // mtime still matches the one the cached thumb was built from.
+        let live_ids: std::collections::HashSet<String> =
+            self.records.iter().map(|r| r.id.clone()).collect();
+        self.thumbs.retain(|id, _| live_ids.contains(id));
+        self.thumbs_mtime.retain(|id, _| live_ids.contains(id));
+
+        let mut jobs: Vec<(String, PathBuf)> = Vec::new();
+        for r in &self.records {
+            let path = self.store.image_path(r);
+            let mtime = history_file_mtime(&path);
+            let cached = self.thumbs.contains_key(&r.id)
+                && self.thumbs_mtime.get(&r.id).copied() == mtime
+                && mtime.is_some();
+            if !cached {
+                jobs.push((r.id.clone(), path));
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let decoded = cx
                 .background_executor()
                 .spawn(async move {
                     jobs.into_iter()
-                        .map(|(id, path)| (id, load_thumb(&path)))
+                        .map(|(id, path)| {
+                            let mtime = history_file_mtime(&path);
+                            let thumb = load_thumb(&path);
+                            (id, mtime, thumb)
+                        })
                         .collect::<Vec<_>>()
                 })
                 .await;
             this.update(cx, |this, cx| {
                 // Ignore a batch that was queued before a newer refresh.
                 if this.thumb_seq == seq {
-                    this.thumbs = decoded.into_iter().collect();
+                    for (id, mtime, thumb) in decoded {
+                        if let Some(m) = mtime {
+                            this.thumbs_mtime.insert(id.clone(), m);
+                        }
+                        this.thumbs.insert(id, thumb);
+                    }
                     cx.notify();
                 }
             })

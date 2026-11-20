@@ -121,9 +121,21 @@ fn forget(id: u64) {
 
 /// BGRA buffer → GPUI image. Same conversion as `longpreview::render_image`:
 /// the buffer is handed over as-is and GPUI's upload handles channel order.
-fn render_image(pixels: &Arc<Vec<u8>>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
+fn render_image(
+    pixels: &Arc<Vec<u8>>,
+    w: u32,
+    h: u32,
+) -> Option<(Arc<RenderImage>, crate::image_budget::MemoryPermit)> {
+    // `from_raw` copies the whole buffer into the RenderImage. Reserve that copy
+    // against the process-wide ledger and keep the permit on the view alongside
+    // the image/pixels so several windows cannot sum to an OOM.
+    let bytes = (w as u64).checked_mul(h as u64)?.checked_mul(4)?;
+    let permit = crate::image_budget::try_reserve(bytes).ok()?;
     let rgba = image::RgbaImage::from_raw(w, h, pixels.as_ref().clone())?;
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+    Some((
+        Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])),
+        permit,
+    ))
 }
 
 fn placeholder_image() -> Arc<RenderImage> {
@@ -137,6 +149,9 @@ pub struct SplitWindowView {
     width: u32,
     height: u32,
     image: Arc<RenderImage>,
+    /// Ledger reservation for the RenderImage copy; replaced with the next
+    /// image, dropped when the window closes.
+    permit: Option<crate::image_budget::MemoryPermit>,
     image_name: String,
     settings: SplitSettings,
     layout: SplitLayout,
@@ -155,6 +170,7 @@ impl SplitWindowView {
             width: 0,
             height: 0,
             image: placeholder_image(),
+            permit: None,
             image_name: "split".to_string(),
             settings: SplitSettings::default(),
             layout: calculate_layout(0, 0, &SplitSettings::default()),
@@ -170,7 +186,16 @@ impl SplitWindowView {
     }
 
     fn set_image(&mut self, pixels: Arc<Vec<u8>>, w: u32, h: u32, name: String) {
-        self.image = render_image(&pixels, w, h).unwrap_or_else(placeholder_image);
+        match render_image(&pixels, w, h) {
+            Some((image, permit)) => {
+                self.image = image;
+                self.permit = Some(permit); // releases the previous reservation
+            }
+            None => {
+                self.image = placeholder_image();
+                self.permit = None;
+            }
+        }
         self.pixels = pixels;
         self.width = w;
         self.height = h;

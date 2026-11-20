@@ -272,6 +272,8 @@ pub fn run() -> Result<()> {
     // retention to records accumulated while the app was closed. No-op when
     // history is disabled.
     crate::history::startup_maintenance();
+    // Drop installer .part files left behind by a killed or failed download.
+    crate::update::cleanup_downloads();
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         attach_parent_console();

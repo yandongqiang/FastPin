@@ -1271,9 +1271,22 @@ impl VerticalMotionEstimator {
             + 0.15 * margin)
             .clamp(0.0, 1.0);
         diagnostics.selected_offset = Some(best.offset);
-        diagnostics.candidates = scored.clone();
 
-        if best.offset == 0 {
+        // 先把后续判定需要的标量从 best / scored 中取出来，再把整个候选数组
+        // 直接移动进诊断，避免每帧 clone 一份 Vec<CandidateDiagnostics>。
+        // `best` 是指向 scored 的引用，其最后一次使用在下面这些标量读取处，
+        // 随后的移动由 NLL 保证不会与借用冲突。
+        let best_offset = best.offset;
+        let best_raw_inliers = best.raw_inliers;
+        let best_inlier_tiles = best.inlier_tiles;
+        let best_residual_gain = best.residual_gain;
+        let scene_cut = direct_similarity < 0.5
+            && scored
+                .iter()
+                .all(|candidate| candidate.alignment_error > 0.6);
+        diagnostics.candidates = scored;
+
+        if best_offset == 0 {
             diagnostics.stage = MotionStage::SelectedNoMotion;
             return EvaluatedMotion {
                 estimate: MotionEstimate::no_motion(confidence, diagnostics),
@@ -1282,12 +1295,12 @@ impl VerticalMotionEstimator {
             };
         }
 
-        let accepted = best.raw_inliers >= MIN_INLIER_MATCHES
-            && best.inlier_tiles >= MIN_INLIER_TILES
-            && best.residual_gain >= MIN_RESIDUAL_GAIN
+        let accepted = best_raw_inliers >= MIN_INLIER_MATCHES
+            && best_inlier_tiles >= MIN_INLIER_TILES
+            && best_residual_gain >= MIN_RESIDUAL_GAIN
             && confidence >= self.options.min_confidence;
         if accepted {
-            let selected_offset = best.offset;
+            let selected_offset = best_offset;
             diagnostics.stage = MotionStage::Selected;
             return EvaluatedMotion {
                 estimate: MotionEstimate::motion(selected_offset, confidence, diagnostics),
@@ -1296,10 +1309,6 @@ impl VerticalMotionEstimator {
             };
         }
 
-        let scene_cut = direct_similarity < 0.5
-            && scored
-                .iter()
-                .all(|candidate| candidate.alignment_error > 0.6);
         diagnostics.stage = MotionStage::LowConfidence;
         EvaluatedMotion::rejected(scene_cut, confidence, diagnostics)
     }

@@ -81,7 +81,7 @@ pub fn show_long_preview(cx: &mut App, pixels: Vec<u8>, w: u32, h: u32) {
         return;
     }
     let pixels = Arc::new(pixels);
-    let Some(image) = render_image(&pixels, w, h) else {
+    let Some((image, permit)) = render_image(&pixels, w, h) else {
         // A size mismatch means the buffer and the reported geometry disagree.
         // Exporting blind is worse than the old behaviour only if the image is
         // wrong, so fall back to the historical path instead of losing the shot.
@@ -121,7 +121,7 @@ pub fn show_long_preview(cx: &mut App, pixels: Vec<u8>, w: u32, h: u32) {
         },
         |window, cx| {
             let fit = fit_zoom(window.viewport_size().width.into(), w as f32);
-            cx.new(|cx| LongPreviewView::new(cx, image, view_pixels, (w, h), fit))
+            cx.new(move |cx| LongPreviewView::new(cx, image, view_pixels, (w, h), fit, permit))
         },
     );
 
@@ -156,9 +156,21 @@ pub fn show_long_preview(cx: &mut App, pixels: Vec<u8>, w: u32, h: u32) {
 
 /// Same conversion the pins use: the stitched buffer goes in as-is and GPUI's
 /// image pipeline handles the channel order at upload time.
-fn render_image(pixels: &Arc<Vec<u8>>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
+fn render_image(
+    pixels: &Arc<Vec<u8>>,
+    w: u32,
+    h: u32,
+) -> Option<(Arc<RenderImage>, crate::image_budget::MemoryPermit)> {
+    // `from_raw` copies the whole buffer into the RenderImage. Reserve that copy
+    // against the process-wide ledger and hand the permit to the view so it is
+    // released only when the preview image goes away.
+    let bytes = (w as u64).checked_mul(h as u64)?.checked_mul(4)?;
+    let permit = crate::image_budget::try_reserve(bytes).ok()?;
     let rgba = image::RgbaImage::from_raw(w, h, pixels.as_ref().clone())?;
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+    Some((
+        Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])),
+        permit,
+    ))
 }
 
 fn bind_keys(cx: &mut App) {
@@ -206,6 +218,10 @@ fn fit_zoom(viewport_w: f32, image_w: f32) -> f32 {
 pub struct LongPreviewView {
     focus_handle: FocusHandle,
     image: Arc<RenderImage>,
+    /// Ledger reservation for the RenderImage copy, held for the view's life.
+    /// The field is intentionally never read — its Drop releases the bytes.
+    #[allow(dead_code)]
+    permit: crate::image_budget::MemoryPermit,
     pixels: Arc<Vec<u8>>,
     pixel_size: (u32, u32),
     zoom: f32,
@@ -220,10 +236,12 @@ impl LongPreviewView {
         pixels: Arc<Vec<u8>>,
         pixel_size: (u32, u32),
         zoom: f32,
+        permit: crate::image_budget::MemoryPermit,
     ) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             image,
+            permit,
             pixels,
             pixel_size,
             zoom,

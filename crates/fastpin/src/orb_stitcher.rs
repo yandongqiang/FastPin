@@ -223,7 +223,10 @@ impl OrbStitcher {
         }
         let options = StitchOptions {
             axis: StitchAxis::Vertical,
-            record_decisions: true, // useful for diagnostics / tests
+            // FastPin 需要最新一条诊断（场景切换 / 验证拒绝等）。orb 侧每帧读完
+            // 就调用 clear_decisions()，所以这里必须保持开启，否则 snow 不会
+            // 产生诊断，首帧/分支判定也会失去数据来源。
+            record_decisions: true,
             ..StitchOptions::default()
         };
         let inner = SnowStitcher::new(options).map_err(map_snow_error)?;
@@ -310,6 +313,9 @@ impl OrbStitcher {
             self.last_branch = StitchBranch::NoMovement;
             self.last_canvas_band = 0;
             self.last_growth = 0;
+            // 首帧 snow 没有产生诊断，clear 是空操作；放在这里只是让“读完即清”
+            // 的契约覆盖所有分支。
+            self.inner.clear_decisions();
             return Ok(Some(OrbFrameResult {
                 report: ScrollReport::default(),
                 accepted: false,
@@ -323,7 +329,14 @@ impl OrbStitcher {
         // Both are needed to redraw the preview edge the way upstream does.
         self.last_canvas_band = decision.canvas_band_height.unwrap_or(0);
         self.last_growth = decision.growth;
-        Ok(Some(map_decision(&decision)))
+        // `decision` 是 snow `push` 返回的 owned 值，这里按引用映射，不额外克隆。
+        let result = map_decision(&decision);
+        // 生产路径只消费最新一条诊断：读完立即清空，避免长截图数千帧时
+        // snow 的 decisions 数组单调增长占用内存。snow 的 `push` 用
+        // `decisions.len()` 定位本帧新增的那条；清空后下帧从索引 0 取，
+        // 仍然只拿到唯一的新诊断，首帧判定走上面的 `None` 分支，不受影响。
+        self.inner.clear_decisions();
+        Ok(Some(result))
     }
 
     /// Current canvas height in screen space.

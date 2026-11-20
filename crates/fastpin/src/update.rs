@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::core::PCWSTR;
 use windows::Win32::Networking::WinHttp::{
@@ -487,6 +487,48 @@ fn unique_temp_path(dir: &Path, version: &str) -> PathBuf {
     ))
 }
 
+/// `.part` 临时文件超过这个时长就视为崩溃/中断遗留，可以安全删除。
+const PART_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// 删除 `dir` 中过期的 `.part` 下载临时文件，返回删除的个数。
+///
+/// 只按修改时间删旧文件：新下载总是用 `unique_temp_path` 生成的唯一文件名，
+/// 且 `File::create` 会立即写入，所以按 24 小时门槛清理不会误删正在进行中的
+/// 下载。目录不存在或不可读时静默返回 0 —— 清理是尽力而为的，不能影响主流程。
+fn cleanup_part_files(dir: &Path, max_age: Duration) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file()
+            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("part")
+        {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        if stale && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 清理 downloads 目录中超过 24 小时的 `.part` 临时文件，供上层启动时调用。
+///
+/// 不返回错误也不打扰用户：磁盘清理失败不应阻止应用启动。
+pub fn cleanup_downloads() {
+    cleanup_part_files(&download_dir(), PART_MAX_AGE);
+}
+
 /// Read the response body in chunks, writing straight to `path` and reporting
 /// every chunk. Unlike `crate::net::read_response` this never buffers the whole
 /// asset in memory.
@@ -545,6 +587,12 @@ pub fn download_release_asset(
         return Err(Error::new("版本号无效"));
     }
 
+    // 新一次下载开始前，先清理同一下载目录里遗留的过期 .part：崩溃或中断
+    // 留下的临时文件从此有上限，不会无限堆积。新文件用唯一名字创建，不会
+    // 与（万一存在的）并发下载冲突。
+    let dir = download_dir();
+    cleanup_part_files(&dir, PART_MAX_AGE);
+
     let mut current = asset_download_url(version);
     let (mut session, mut head) = unsafe { begin_download(&current)? };
 
@@ -586,7 +634,6 @@ pub fn download_release_asset(
         )));
     }
 
-    let dir = download_dir();
     fs::create_dir_all(&dir)?;
     let path = unique_temp_path(&dir, version);
 

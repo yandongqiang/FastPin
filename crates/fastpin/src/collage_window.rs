@@ -55,6 +55,9 @@ actions!(
 const KEY_CONTEXT: &str = "CollageWindow";
 const PREVIEW_MAX_W: f32 = 720.0;
 const PREVIEW_MAX_H: f32 = 540.0;
+/// A4 at ~150 DPI is ~9 MB per page. Keep only the current page plus one
+/// neighbour resident instead of pre-rendering every page of a long document.
+const PDF_PREVIEW_CACHE: usize = 2;
 
 thread_local! {
     static COLLAGE_WINDOWS: RefCell<Vec<(u64, WindowHandle<CollageWindowView>)>> = const { RefCell::new(Vec::new()) };
@@ -157,9 +160,21 @@ fn forget(id: u64) {
 
 /// BGRA buffer → GPUI image. Same conversion as `longpreview::render_image`:
 /// the buffer is handed over as-is and GPUI's upload handles channel order.
-fn render_image(pixels: &Arc<Vec<u8>>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
+fn render_image(
+    pixels: &Arc<Vec<u8>>,
+    w: u32,
+    h: u32,
+) -> Option<(Arc<RenderImage>, crate::image_budget::MemoryPermit)> {
+    // `from_raw` copies the whole buffer into the RenderImage. Reserve that copy
+    // against the process-wide ledger and keep the permit alive alongside the
+    // image (on ImageEntry) so several open windows cannot sum to an OOM.
+    let bytes = (w as u64).checked_mul(h as u64)?.checked_mul(4)?;
+    let permit = crate::image_budget::try_reserve(bytes).ok()?;
     let rgba = image::RgbaImage::from_raw(w, h, pixels.as_ref().clone())?;
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+    Some((
+        Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])),
+        permit,
+    ))
 }
 
 fn placeholder_image() -> Arc<RenderImage> {
@@ -472,11 +487,20 @@ struct ImageEntry {
     rotation: i8,
     flipped_h: bool,
     image: Arc<RenderImage>,
+    /// Ledger reservation for the RenderImage copy; released when the entry
+    /// (and with it the image) is removed or the window closes.
+    /// Held only for its Drop: releases the global reservation when the image
+    /// is removed or the window closes.
+    #[allow(dead_code)]
+    permit: Option<crate::image_budget::MemoryPermit>,
 }
 
 impl ImageEntry {
     fn new(id: u64, label: String, pixels: Arc<Vec<u8>>, width: u32, height: u32) -> Self {
-        let image = render_image(&pixels, width, height).unwrap_or_else(placeholder_image);
+        let (image, permit) = match render_image(&pixels, width, height) {
+            Some((image, permit)) => (image, Some(permit)),
+            None => (placeholder_image(), None),
+        };
         Self {
             id,
             label,
@@ -486,6 +510,7 @@ impl ImageEntry {
             rotation: 0,
             flipped_h: false,
             image,
+            permit,
         }
     }
 
@@ -517,7 +542,9 @@ pub struct CollageWindowView {
     collage_preview: Option<Arc<RenderImage>>,
     pdf_page_count: usize,
     pdf_current_page: usize,
-    pdf_previews: Vec<Option<Arc<RenderImage>>>,
+    /// MRU-first page-preview cache: `(page_index, preview)`, at most
+    /// `PDF_PREVIEW_CACHE` entries. Generated on demand, not for all pages.
+    pdf_previews: Vec<(usize, Option<Arc<RenderImage>>)>,
 
     status: SharedString,
     export_result: Option<ExportResult>,
@@ -585,18 +612,18 @@ impl CollageWindowView {
             self.collage_preview = None;
         }
 
-        // PDF
+        // PDF: render only the visible page. Pre-generating every page made a
+        // long document hold hundreds of MB; page turns now render on demand
+        // with a two-entry LRU (see `ensure_pdf_preview`).
         if !self.images.is_empty() {
             let items: Vec<CollageItem> = self.images.iter().map(|e| e.to_collage_item()).collect();
             self.pdf_page_count = pdf_page_count(items.len(), &self.pdf_settings);
             self.pdf_current_page = self
                 .pdf_current_page
                 .min(self.pdf_page_count.saturating_sub(1));
-            self.pdf_previews = Vec::with_capacity(self.pdf_page_count);
-            for page_idx in 0..self.pdf_page_count {
-                let page = calculate_pdf_composed_page(&items, &self.pdf_settings, page_idx);
-                self.pdf_previews.push(self.render_pdf_page_preview(&page));
-            }
+            // Settings or the image list may have changed: previews are stale.
+            self.pdf_previews.clear();
+            self.ensure_pdf_preview(&items);
         } else {
             self.pdf_page_count = 0;
             self.pdf_current_page = 0;
@@ -726,6 +753,37 @@ impl CollageWindowView {
 
         let rgba = image::RgbaImage::from_raw(out_w, out_h, canvas)?;
         Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+    }
+
+    /// Makes sure the current page has a preview, rendering just that page on
+    /// demand. The cache is MRU-first; when full, the least recently used page
+    /// is evicted, so at most `PDF_PREVIEW_CACHE` page bitmaps stay in memory.
+    fn ensure_pdf_preview(&mut self, items: &[CollageItem]) {
+        let page_idx = self.pdf_current_page;
+        if let Some(pos) = self
+            .pdf_previews
+            .iter()
+            .position(|(idx, _)| *idx == page_idx)
+        {
+            let entry = self.pdf_previews.remove(pos);
+            self.pdf_previews.insert(0, entry); // refresh recency
+            return;
+        }
+        let page = calculate_pdf_composed_page(items, &self.pdf_settings, page_idx);
+        let preview = self.render_pdf_page_preview(&page);
+        if self.pdf_previews.len() >= PDF_PREVIEW_CACHE {
+            self.pdf_previews.pop(); // evict LRU
+        }
+        self.pdf_previews.insert(0, (page_idx, preview));
+    }
+
+    /// Borrows the current page's preview, already ensured by `recalc_all` and
+    /// the page-turn handlers, for the render path.
+    fn pdf_preview(&self) -> Option<&Arc<RenderImage>> {
+        self.pdf_previews
+            .iter()
+            .find(|(idx, _)| *idx == self.pdf_current_page)
+            .and_then(|(_, img)| img.as_ref())
     }
 
     fn on_open_image(&mut self, _: &OpenCollageImage, _: &mut Window, cx: &mut Context<Self>) {
@@ -984,6 +1042,8 @@ impl CollageWindowView {
     fn prev_pdf_page(&mut self, _: &PrevPdfPage, cx: &mut Context<Self>) {
         if self.pdf_page_count > 1 && self.pdf_current_page > 0 {
             self.pdf_current_page -= 1;
+            let items: Vec<CollageItem> = self.images.iter().map(|e| e.to_collage_item()).collect();
+            self.ensure_pdf_preview(&items);
             cx.notify();
         }
     }
@@ -991,6 +1051,8 @@ impl CollageWindowView {
     fn next_pdf_page(&mut self, _: &NextPdfPage, cx: &mut Context<Self>) {
         if self.pdf_page_count > 1 && self.pdf_current_page + 1 < self.pdf_page_count {
             self.pdf_current_page += 1;
+            let items: Vec<CollageItem> = self.images.iter().map(|e| e.to_collage_item()).collect();
+            self.ensure_pdf_preview(&items);
             cx.notify();
         }
     }
@@ -2264,32 +2326,27 @@ impl CollageWindowView {
                     .border_1()
                     .border_color(theme::border())
                     .rounded_md()
-                    .child(
-                        if self.pdf_page_count > 0
-                            && self.pdf_current_page < self.pdf_previews.len()
-                        {
-                            self.pdf_previews[self.pdf_current_page]
-                                .as_ref()
-                                .map(|render_img| {
-                                    img(ImageSource::Render(render_img.clone()))
-                                        .w_full()
-                                        .h_full()
-                                        .object_fit(gpui::ObjectFit::Contain)
-                                        .into_any_element()
-                                })
-                                .unwrap_or_else(|| {
-                                    div()
-                                        .text_color(theme::muted())
-                                        .child("渲染中...")
-                                        .into_any_element()
-                                })
-                        } else {
-                            div()
-                                .text_color(theme::muted())
-                                .child("添加图片生成 PDF")
-                                .into_any_element()
-                        },
-                    ),
+                    .child(if self.pdf_page_count > 0 {
+                        self.pdf_preview()
+                            .map(|render_img| {
+                                img(ImageSource::Render(render_img.clone()))
+                                    .w_full()
+                                    .h_full()
+                                    .object_fit(gpui::ObjectFit::Contain)
+                                    .into_any_element()
+                            })
+                            .unwrap_or_else(|| {
+                                div()
+                                    .text_color(theme::muted())
+                                    .child("渲染中...")
+                                    .into_any_element()
+                            })
+                    } else {
+                        div()
+                            .text_color(theme::muted())
+                            .child("添加图片生成 PDF")
+                            .into_any_element()
+                    }),
             )
             .child(
                 div()

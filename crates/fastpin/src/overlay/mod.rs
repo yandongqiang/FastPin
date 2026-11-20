@@ -56,7 +56,7 @@ use crate::overlay::annotate::{
     ToolbarModel,
 };
 use crate::overlay::composite::{CoverageRun, ElementRuns};
-use crate::overlay::editor::{Element, PressKind, Session, Shape, Tool};
+use crate::overlay::editor::{Element, PressKind, Session, Tool};
 use crate::overlay::toolbar::PHASE1_ITEMS;
 use crate::perf::PerfSession;
 use crate::platform::WM_APP_READY_SENTINEL;
@@ -2088,7 +2088,8 @@ impl OverlayView {
         if let Some(state) = self.long.as_mut() {
             state.hover.set_enabled(true);
         }
-        let (bar, bar_h) = self.long_bar_placement(window.scale_factor(), 0.0);
+        let (bar, bar_h) =
+            self.long_bar_placement(window.scale_factor(), 0.0, self.active_monitor_rect());
         let rect = hole_clear_of_bar(
             RECT {
                 left: abs_x,
@@ -3012,11 +3013,17 @@ impl OverlayView {
         cx.notify();
     }
 
-    fn toolbar_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let geom = self.toolbar_geom(scale)?;
+    fn toolbar_element(
+        &self,
+        scale: f32,
+        cx: &mut Context<Self>,
+        items: &[&'static str],
+        geom: Option<Rect>,
+    ) -> Option<impl IntoElement> {
+        let geom = geom?;
         let model = ToolbarModel {
             origin: (geom.x as f32 / scale, geom.y as f32 / scale),
-            items: self.visible_items(),
+            items: items.to_vec(),
             tool_id: self.editor.tool.id(),
             can_undo: self.editor.history.can_undo(),
             can_redo: self.editor.history.can_redo(),
@@ -3036,8 +3043,14 @@ impl OverlayView {
     /// selection -- the same rule `place_toolbar` used to pick the bar's side
     /// -- and is clamped to the monitor like every other popup. Empty for the
     /// select tool, which draws nothing.
-    fn props_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let (_cells, row, _below) = self.props_placement(scale)?;
+    fn props_element(
+        &self,
+        scale: f32,
+        cx: &mut Context<Self>,
+        geom: Option<Rect>,
+        mon: Rect,
+    ) -> Option<impl IntoElement> {
+        let (_cells, row, _below) = self.props_placement(scale, geom, mon)?;
         Some(annotate::props_element(
             annotate::PropsModel {
                 origin: (row.x as f32, row.y as f32),
@@ -3068,16 +3081,20 @@ impl OverlayView {
     }
 
     /// Logical second-row rect plus the side it hangs on.
-    fn props_placement(&self, scale: f32) -> Option<(Vec<toolbar::PropCell>, Rect, bool)> {
+    fn props_placement(
+        &self,
+        scale: f32,
+        geom: Option<Rect>,
+        mon: Rect,
+    ) -> Option<(Vec<toolbar::PropCell>, Rect, bool)> {
         let cells = annotate::prop_cells(self.editor.tool);
         if cells.is_empty() {
             return None;
         }
-        let geom = self.toolbar_geom(scale)?;
+        let geom = geom?;
         let s = scale.max(0.01) as f64;
         // toolbar_geom is physical; the element tree is logical.
         let bar = Rect::new(geom.x / s, geom.y / s, geom.width / s, geom.height / s);
-        let mon = self.active_monitor_rect();
         let mon = Rect::new(mon.x / s, mon.y / s, mon.width / s, mon.height / s);
         let (w, h) = toolbar::props_size(&cells);
         let below = bar.y + bar.height / 2.0 >= self.selection.y + self.selection.height / 2.0;
@@ -3088,19 +3105,22 @@ impl OverlayView {
     /// The colour popup. Only `visible_items` knows where the COLOR button ended
     /// up once the user hides tools, so the index comes from the same list the
     /// bar is drawn and hit-tested from.
-    fn swatches_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn swatches_element(
+        &self,
+        scale: f32,
+        cx: &mut Context<Self>,
+        items: &[&'static str],
+        geom: Option<Rect>,
+        mon: Rect,
+    ) -> Option<impl IntoElement> {
         if !self.color_open {
             return None;
         }
-        let index = self
-            .visible_items()
-            .iter()
-            .position(|id| *id == toolbar::COLOR)?;
+        let index = items.iter().position(|id| *id == toolbar::COLOR)?;
         // toolbar_geom is physical; the element tree is logical.
         let s = scale.max(0.01) as f64;
-        let bar = self.toolbar_geom(scale)?;
+        let bar = geom?;
         let bar = Rect::new(bar.x / s, bar.y / s, bar.width / s, bar.height / s);
-        let mon = self.active_monitor_rect();
         let mon = Rect::new(mon.x / s, mon.y / s, mon.width / s, mon.height / s);
         let (w, h) = toolbar::swatches_size(theme::SWATCHES.len());
         let pos = toolbar::place_swatches(
@@ -3133,19 +3153,22 @@ impl OverlayView {
     /// The rect / ellipse picker, centred on the shape button and placed like
     /// the colour popup. Its icon sub-buttons route through `handle_toolbar`
     /// exactly like bar items.
-    fn shape_popup_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn shape_popup_element(
+        &self,
+        scale: f32,
+        cx: &mut Context<Self>,
+        items: &[&'static str],
+        geom: Option<Rect>,
+        mon: Rect,
+    ) -> Option<impl IntoElement> {
         if !self.editor.shape_open {
             return None;
         }
-        let index = self
-            .visible_items()
-            .iter()
-            .position(|id| *id == toolbar::SHAPE)?;
+        let index = items.iter().position(|id| *id == toolbar::SHAPE)?;
         // toolbar_geom is physical; the element tree is logical.
         let s = scale.max(0.01) as f64;
-        let bar = self.toolbar_geom(scale)?;
+        let bar = geom?;
         let bar = Rect::new(bar.x / s, bar.y / s, bar.width / s, bar.height / s);
-        let mon = self.active_monitor_rect();
         let mon = Rect::new(mon.x / s, mon.y / s, mon.width / s, mon.height / s);
         let (w, h) = toolbar::bar_size(2);
         let pos = toolbar::place_swatches(
@@ -3176,20 +3199,19 @@ impl OverlayView {
     /// Where the long-capture bar lands, in capture coordinates: top-left plus
     /// height. `est_w` only shifts x, so the passthrough hole can ask for the
     /// band with a zero width and still get the y the bar will be drawn at.
-    fn long_bar_placement(&self, scale: f32, est_w: f64) -> (Point, f64) {
+    fn long_bar_placement(&self, scale: f32, est_w: f64, mon: Rect) -> (Point, f64) {
         let s = scale.max(0.01) as f64;
         let h = toolbar::H * s;
-        let pos = toolbar::place_toolbar(
-            self.selection,
-            est_w,
-            h,
-            self.active_monitor_rect(),
-            toolbar::ANCHOR_GAP * s,
-        );
+        let pos = toolbar::place_toolbar(self.selection, est_w, h, mon, toolbar::ANCHOR_GAP * s);
         (pos, h)
     }
 
-    fn long_bar_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn long_bar_element(
+        &self,
+        scale: f32,
+        cx: &mut Context<Self>,
+        mon: Rect,
+    ) -> Option<impl IntoElement> {
         if self.phase != Phase::LongCapturing {
             return None;
         }
@@ -3199,7 +3221,7 @@ impl OverlayView {
         // the width estimate only affects centering -- the bar sizes to
         // content once laid out.
         let est_w = (state.status.chars().count() as f64 * 13.0 + 4.0 * 88.0 + 72.0) * s;
-        let (pos, _) = self.long_bar_placement(scale, est_w);
+        let (pos, _) = self.long_bar_placement(scale, est_w, mon);
         let status: SharedString = state.status.clone().into();
         let axis_label: SharedString = match state.axis {
             Axis::Vertical => "↕ 垂直".into(),
@@ -3606,9 +3628,15 @@ impl OverlayView {
         )
     }
 
-    fn panel_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn panel_element(
+        &self,
+        scale: f32,
+        cx: &mut Context<Self>,
+        geom: Option<Rect>,
+        mon: Rect,
+    ) -> Option<impl IntoElement> {
         let panel = self.panel.as_ref()?;
-        let bar = self.toolbar_geom(scale)?;
+        let bar = geom?;
         let copyable = !panel.busy && !panel.body.is_empty();
         // toolbar_geom and active_monitor_rect are in physical pixels; the
         // element tree is logical, so convert before placing.
@@ -3616,7 +3644,6 @@ impl OverlayView {
         let bar = Rect::new(bar.x / s, bar.y / s, bar.width / s, bar.height / s);
         let sel = self.selection;
         let sel = Rect::new(sel.x / s, sel.y / s, sel.width / s, sel.height / s);
-        let mon = self.active_monitor_rect();
         let mon = Rect::new(mon.x / s, mon.y / s, mon.width / s, mon.height / s);
         let chrome = (PANEL_CHROME + if copyable { PANEL_COPY_H } else { 0. }) as f64;
         let place = toolbar::place_panel(
@@ -3710,20 +3737,16 @@ impl OverlayView {
     /// Text annotations live in the element tree, not the canvas, so the paint-time
     /// content mask does not reach them. Same clip, done with a container: positioned
     /// on the selection, children placed relative to it, overflow hidden.
-    fn text_layer(&self, scale: f32) -> Option<impl IntoElement> {
+    fn text_layer(&self, scale: f32, marks: &[Element]) -> Option<impl IntoElement> {
         if !self.has_sel {
             return None;
         }
         let sel = self.selection;
         let s = scale as f64;
-        // Badges are not in `editor.elements` while a draft is held; fold the
-        // draft in so the bubble previews under the cursor as it is placed.
-        let mut badge_elems: Vec<Element> = self.editor.elements.clone();
-        if let Some(draft) = &self.editor.draft {
-            if matches!(draft.shape, Shape::Badge { .. }) {
-                badge_elems.push(draft.clone());
-            }
-        }
+        // `marks` is `editor.visible()` (committed elements + the held draft),
+        // cloned once in `render` and shared with the canvas paint. Both layers
+        // filter by shape, so the draft is already folded into that one clone:
+        // no second clone and no temporary Vec, even while a badge is held.
         let frame = Rect::new(sel.x / s, sel.y / s, sel.width / s, sel.height / s);
         let offset = Point { x: sel.x, y: sel.y };
         // Badge and text layers position themselves with absolute window-local
@@ -3742,12 +3765,12 @@ impl OverlayView {
                 .top(px(0.))
                 .size_full()
                 .children([
-                    annotate::badge_layer(frame, offset, scale, &badge_elems).into_any_element(),
+                    annotate::badge_layer(frame, offset, scale, marks).into_any_element(),
                     annotate::text_layer(TextLayer {
                         frame,
                         offset,
                         scale,
-                        elements: &self.editor.elements,
+                        elements: marks,
                         draft: self.text_edit.as_ref(),
                         stroke: self.editor.stroke_argb(),
                     })
@@ -3863,13 +3886,19 @@ impl Render for OverlayView {
             self.refresh_magnifier_gpu(cx);
         }
         let scale = window.scale_factor().max(0.01);
+        // One pass per frame for the values every bar/popup placement reuses.
+        let visible_items = self.visible_items();
+        let toolbar_geom = self.toolbar_geom(scale);
+        let active_monitor = self.active_monitor_rect();
         let shown = self.current_rect();
         let mouse = self.mouse;
         let mag = self.mag.clone();
         let phase = self.phase;
         let start = self.start;
         let has_sel = self.has_sel;
-        let marks: Vec<Element> = self.editor.visible().cloned().collect();
+        // The one deep clone per frame: committed elements + held draft, shared
+        // by the canvas paint and the text/badge layers via `Rc`.
+        let marks: Rc<Vec<Element>> = Rc::new(self.editor.visible().cloned().collect());
         let masks = self.mark_masks(&marks);
         let dim = shown.and_then(|r| self.spotlight_dim_runs(r, &marks));
         let mosaic = self.mosaic_tiles(&marks, cx);
@@ -3891,6 +3920,9 @@ impl Render for OverlayView {
         let picked_color = self.picked_color;
         let color_format = self.color_format;
         let color_notice = self.last_color_notice.clone();
+        // The canvas paint closure is `move`: give it its own `Rc` handle so the
+        // original stays available for `text_layer` later in this same frame.
+        let paint_marks = marks.clone();
 
         div()
             .id("overlay-root")
@@ -3939,7 +3971,7 @@ impl Render for OverlayView {
                                     start,
                                     has_sel,
                                     scale,
-                                    marks,
+                                    marks: paint_marks.clone(),
                                     masks,
                                     dim,
                                     mosaic,
@@ -3959,13 +3991,25 @@ impl Render for OverlayView {
                     phase,
                     scale,
                 ))
-                .children(self.toolbar_element(scale, cx))
-                .children(self.props_element(scale, cx))
-                .children(self.long_bar_element(scale, cx))
-                .children(self.swatches_element(scale, cx))
-                .children(self.shape_popup_element(scale, cx))
-                .children(self.panel_element(scale, cx))
-                .children(self.text_layer(scale))
+                .children(self.toolbar_element(scale, cx, &visible_items, toolbar_geom))
+                .children(self.props_element(scale, cx, toolbar_geom, active_monitor))
+                .children(self.long_bar_element(scale, cx, active_monitor))
+                .children(self.swatches_element(
+                    scale,
+                    cx,
+                    &visible_items,
+                    toolbar_geom,
+                    active_monitor,
+                ))
+                .children(self.shape_popup_element(
+                    scale,
+                    cx,
+                    &visible_items,
+                    toolbar_geom,
+                    active_monitor,
+                ))
+                .children(self.panel_element(scale, cx, toolbar_geom, active_monitor))
+                .children(self.text_layer(scale, &marks))
             })
     }
 }
@@ -4060,7 +4104,7 @@ struct OverlayPaint {
     start: Instant,
     has_sel: bool,
     scale: f32,
-    marks: Vec<Element>,
+    marks: Rc<Vec<Element>>,
     masks: Vec<Option<Rc<ElementRuns>>>,
     dim: Option<Rc<Vec<CoverageRun>>>,
     mosaic: Rc<MosaicTiles>,

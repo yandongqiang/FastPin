@@ -411,8 +411,11 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
-/// Create `Split Images_<name>` under `parent`, adding ` (n)` on collisions.
-fn create_export_directory(parent: &Path, image_name: &str) -> std::io::Result<PathBuf> {
+/// Resolve an available `Split Images_<name>` path under `parent`, adding
+/// ` (n)` on collisions. The directory is *not* created here: callers write
+/// into a staging folder first and only rename it here once every tile
+/// succeeded, so a failed export never leaves half-written tiles behind.
+fn resolve_export_directory(parent: &Path, image_name: &str) -> std::io::Result<PathBuf> {
     if !parent.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -427,9 +430,9 @@ fn create_export_directory(parent: &Path, image_name: &str) -> std::io::Result<P
             format!("{base} ({suffix})")
         };
         let candidate = parent.join(&name);
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+        match candidate.try_exists() {
+            Ok(false) => return Ok(candidate),
+            Ok(true) => continue,
             Err(e) => return Err(e),
         }
     }
@@ -439,10 +442,54 @@ fn create_export_directory(parent: &Path, image_name: &str) -> std::io::Result<P
     ))
 }
 
+/// Claim a unique hidden staging directory next to the final one. `create_dir`
+/// is atomic, so concurrent exports never share a staging folder.
+fn create_staging_directory(parent: &Path) -> std::io::Result<PathBuf> {
+    for suffix in 0..i32::MAX {
+        let candidate = parent.join(format!(".Split Images_tmp-{}-{suffix}", std::process::id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "无法创建临时目录",
+    ))
+}
+
+/// Encode and write a single tile into `dir`; errors name the offending tile.
+fn export_one_tile(
+    dir: &Path,
+    pixels: &[u8],
+    layout: &SplitLayout,
+    format: crate::config::ImageFormat,
+    quality: u8,
+    index: u32,
+) -> Result<(), String> {
+    let region = layout
+        .region_at(index)
+        .ok_or_else(|| format!("第 {} 块区域无效", index + 1))?;
+    let crop = crop_bgra_region(pixels, layout.width, layout.height, region)
+        .ok_or_else(|| format!("第 {} 块裁剪失败", index + 1))?;
+    let stride = region.width * 4;
+    let encoded =
+        crate::codec::encode_bgra(format, quality, &crop, region.width, region.height, stride)
+            .map_err(|e| format!("第 {} 块编码失败：{e}", index + 1))?;
+    let path = dir.join(format!("{}.{}", index + 1, format.extension()));
+    std::fs::write(&path, encoded).map_err(|e| format!("第 {} 块写入失败：{e}", index + 1))?;
+    Ok(())
+}
+
 /// Export every tile of `layout` as a PNG into a new subfolder of `parent`.
 ///
 /// `pixels` is the full BGRA canvas (stride `width * 4`). Encoding goes through
 /// the shared WIC path so it behaves identically to the app's normal saves.
+/// Tiles are written to a staging folder and renamed into place only once all
+/// of them succeeded: a mid-export failure removes the staging folder and
+/// leaves `directory` empty, so `succeeded()` keeps reporting failure and the
+/// UI never offers to open a half-populated folder.
 pub fn export_split_images(
     pixels: &[u8],
     layout: &SplitLayout,
@@ -462,47 +509,39 @@ pub fn export_split_images(
         result.error = "图片或切图配置无效".into();
         return result;
     }
-    let dir = match create_export_directory(parent, image_name) {
+    let final_dir = match resolve_export_directory(parent, image_name) {
         Ok(d) => d,
         Err(e) => {
             result.error = format!("无法创建输出目录：{e}");
             return result;
         }
     };
-    result.directory = dir.clone();
+    let staging = match create_staging_directory(parent) {
+        Ok(d) => d,
+        Err(e) => {
+            result.error = format!("无法创建临时目录：{e}");
+            return result;
+        }
+    };
     // WIC encoders require a COM apartment on this thread.
     let _apartment = Apartment::join();
-    let extension = format.extension();
     for index in 0..result.total_count {
-        let Some(region) = layout.region_at(index) else {
-            result.error = format!("第 {} 块区域无效", index + 1);
-            return result;
-        };
-        let Some(crop) = crop_bgra_region(pixels, layout.width, layout.height, region) else {
-            result.error = format!("第 {} 块裁剪失败", index + 1);
-            return result;
-        };
-        let stride = region.width * 4;
-        let encoded = match crate::codec::encode_bgra(
-            format,
-            quality,
-            &crop,
-            region.width,
-            region.height,
-            stride,
-        ) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                result.error = format!("第 {} 块编码失败：{e}", index + 1);
-                return result;
-            }
-        };
-        let path = dir.join(format!("{}.{}", index + 1, extension));
-        if let Err(e) = std::fs::write(&path, encoded) {
-            result.error = format!("第 {} 块写入失败：{e}", index + 1);
+        if let Err(e) = export_one_tile(&staging, pixels, layout, format, quality, index) {
+            let _ = std::fs::remove_dir_all(&staging);
+            result.error = e;
             return result;
         }
         result.saved_count += 1;
+    }
+    // Every tile is on disk: publish the folder atomically. `directory` is
+    // assigned only here, so a rename failure also reports an empty directory.
+    match std::fs::rename(&staging, &final_dir) {
+        Ok(()) => result.directory = final_dir,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            result.saved_count = 0;
+            result.error = format!("导出目录落盘失败：{e}");
+        }
     }
     result
 }
@@ -710,5 +749,74 @@ mod tests {
             }
         )
         .is_none());
+    }
+
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    /// Throwaway parent directory used by the filesystem tests below.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "fastpin-imagesplit-{tag}-{}-{seq}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("temp parent");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn resolve_export_directory_respects_collisions() {
+        let tmp = TempDir::new("collision");
+        let first = resolve_export_directory(&tmp.0, "Shot").expect("first path");
+        assert!(first.ends_with("Split Images_Shot"));
+        std::fs::create_dir(&first).expect("create first");
+        let second = resolve_export_directory(&tmp.0, "Shot").expect("second path");
+        assert!(second.ends_with("Split Images_Shot (2)"));
+        std::fs::create_dir(&second).expect("create second");
+        let third = resolve_export_directory(&tmp.0, "Shot").expect("third path");
+        assert!(third.ends_with("Split Images_Shot (3)"));
+        // Resolving alone must not create any directory.
+        assert!(!third.exists());
+    }
+
+    #[test]
+    fn staging_directories_are_unique_and_hidden() {
+        let tmp = TempDir::new("staging");
+        let a = create_staging_directory(&tmp.0).expect("first staging dir");
+        let b = create_staging_directory(&tmp.0).expect("second staging dir");
+        assert_ne!(a, b);
+        assert!(a.is_dir() && b.is_dir());
+        assert!(a
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.')));
+    }
+
+    #[test]
+    fn invalid_input_reports_failure_without_a_directory() {
+        let tmp = TempDir::new("invalid");
+        let layout = calculate_layout(10, 10, &settings(SplitDirection::Vertical, 2));
+        // Buffer far too small for the declared canvas.
+        let result = export_split_images(
+            &[0u8; 4],
+            &layout,
+            crate::config::ImageFormat::Png,
+            100,
+            &tmp.0,
+            "Shot",
+        );
+        assert!(result.error.contains("无效"));
+        assert!(result.directory.as_os_str().is_empty());
+        assert!(!result.succeeded());
     }
 }

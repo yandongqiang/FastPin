@@ -15,7 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     deferred, div, img, prelude::*, px, size, App, AsyncApp, Bounds, Context, CursorStyle, Entity,
@@ -280,6 +280,38 @@ const SCROLL_INTERVALS: [(&str, u32); 4] = [
 /// (label, notches) presets; same reasoning as [`SCROLL_INTERVALS`].
 const SCROLL_NOTCHES: [(&str, u32); 4] = [("1 格", 1), ("2 格", 2), ("4 格", 4), ("8 格", 8)];
 
+/// Render-ready snapshot of the OCR engine status. `crate::ocr::engine_status()`
+/// clones the whole Settings and walks the filesystem (exe path + three
+/// `metadata()` calls), so the view samples it once and reuses the snapshot
+/// across frames instead of paying that cost on every render.
+struct EngineStatusSnapshot {
+    available: bool,
+    /// Resolved model directory, already formatted for display.
+    dir: SharedString,
+    label: &'static str,
+}
+
+impl EngineStatusSnapshot {
+    fn sample() -> Self {
+        Self::from(crate::ocr::engine_status())
+    }
+}
+
+impl From<crate::ocr::EngineStatus> for EngineStatusSnapshot {
+    fn from(engine: crate::ocr::EngineStatus) -> Self {
+        Self {
+            available: engine.available,
+            dir: engine
+                .dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "未找到".into())
+                .into(),
+            label: engine.label,
+        }
+    }
+}
+
 pub struct SettingsView {
     page: Page,
     settings: Settings,
@@ -314,6 +346,12 @@ pub struct SettingsView {
     /// cleanup — never on every frame.
     data_bytes: u64,
     log_bytes: u64,
+    /// Cached engine status for the Resources page, refreshed on window open,
+    /// on entering that page, or via the page's 刷新 button — never per frame.
+    engine_status: EngineStatusSnapshot,
+    /// Sampling timestamp; also throttles back-to-back refresh requests so a
+    /// double click cannot repeat the expensive filesystem walk.
+    engine_status_at: Instant,
     /// Embedded "历史图片" gallery state. The standalone Page::History renders
     /// the same grid as the dedicated gallery window, so the images are visible
     /// the moment the user opens the nav option instead of a near-empty page.
@@ -453,6 +491,7 @@ impl SettingsView {
         }));
 
         let (data_bytes, log_bytes) = Self::storage_sizes();
+        let engine_status = EngineStatusSnapshot::sample();
 
         Self {
             page: Page::General,
@@ -476,6 +515,8 @@ impl SettingsView {
             http_warn_confirm: false,
             data_bytes,
             log_bytes,
+            engine_status,
+            engine_status_at: Instant::now(),
             history_records: Vec::new(),
             history_thumbs: HashMap::new(),
             history_thumb_mtime: HashMap::new(),
@@ -579,6 +620,11 @@ impl SettingsView {
             // blank page. Refreshing again is harmless (sequence-guarded).
             self.reload_history(cx);
         }
+        if self.page == Page::Resources {
+            // Model files may have changed since the window opened; sample once
+            // on entry instead of gating every frame on a filesystem walk.
+            self.refresh_engine_status(true, cx);
+        }
         cx.notify();
     }
 
@@ -587,6 +633,18 @@ impl SettingsView {
     /// nav click), so waiting only for `go_page` would leave a blank grid.
     fn load_history_on_open(&mut self, cx: &mut Context<Self>) {
         self.reload_history(cx);
+    }
+
+    /// Re-samples the OCR engine status. Entering the page (`force`) always
+    /// refreshes; a 刷新 button click within a second of the last sample is
+    /// ignored so a double click cannot repeat the expensive filesystem walk.
+    fn refresh_engine_status(&mut self, force: bool, cx: &mut Context<Self>) {
+        if !force && self.engine_status_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.engine_status = EngineStatusSnapshot::sample();
+        self.engine_status_at = Instant::now();
+        cx.notify();
     }
 
     fn reset_page(&mut self, cx: &mut Context<Self>) {
@@ -2520,19 +2578,12 @@ impl SettingsView {
     }
 
     fn page_resources(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Recomputed on every render, never cached on the view: deleting or
-        // swapping model files outside the app has to move the dot and the
-        // label in the same frame.
-        let engine = crate::ocr::engine_status();
-        let default_dir: SharedString = engine
-            .dir
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "未找到".into())
-            .into();
+        // Sampled on window open, on entering this page, and via 刷新 — never
+        // on every frame (engine_status does a full Settings clone + file I/O).
+        let engine = &self.engine_status;
         let models: SharedString = match &self.settings.ocr.models_dir {
             Some(p) => p.display().to_string().into(),
-            None => format!("默认：{default_dir}").into(),
+            None => format!("默认：{}", engine.dir).into(),
         };
         div()
             .flex()
@@ -2559,7 +2610,11 @@ impl SettingsView {
                                     .text_size(px(12.))
                                     .text_color(theme::secondary_fg())
                                     .child(engine.label),
-                            ),
+                            )
+                            .child(widgets::button("engine-refresh", "刷新").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.refresh_engine_status(false, cx)),
+                            )),
                     ),
                 ),
                 widgets::stack("模型目录", "覆盖内置的 models\\v6 目录，留空使用默认位置。").child(
@@ -2993,8 +3048,13 @@ impl SettingsView {
         ])
     }
 
-    fn search_results(&self, query: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let hits = model::search(query);
+    /// Renders an already-computed hit list. The caller reuses the same search
+    /// for the header count, so a frame never scans the row registry twice.
+    fn search_results(
+        &self,
+        hits: &[&'static RowMeta],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         if hits.is_empty() {
             return widgets::rows(vec![widgets::unsupported_row(
                 "没有匹配的配置",
@@ -3058,9 +3118,15 @@ impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).text().trim().to_string();
         let searching = !query.is_empty();
+        // One search per frame feeds both the result count and the list.
+        let hits = if searching {
+            model::search(&query)
+        } else {
+            Vec::new()
+        };
 
         let header = if searching {
-            let n = model::search(&query).len();
+            let n = hits.len();
             self.heading(
                 "搜索结果",
                 format!("在所有页面中匹配「{query}」，共 {n} 项；点击可跳转到来源页面。"),
@@ -3073,7 +3139,7 @@ impl Render for SettingsView {
                 .into_any_element()
         };
         let body = if searching {
-            self.search_results(&query, cx)
+            self.search_results(&hits, cx)
         } else {
             self.page_body(cx)
         };
@@ -3118,6 +3184,28 @@ impl Render for SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_status_snapshot_keeps_only_renderable_fields() {
+        let installed = crate::ocr::EngineStatus {
+            available: true,
+            dir: Some(PathBuf::from("D:/models/v6")),
+            label: "PP-OCRv6 Small",
+        };
+        let snapshot = EngineStatusSnapshot::from(installed);
+        assert!(snapshot.available);
+        assert_eq!(&*snapshot.dir, "D:/models/v6");
+        assert_eq!(snapshot.label, "PP-OCRv6 Small");
+
+        let missing = crate::ocr::EngineStatus {
+            available: false,
+            dir: None,
+            label: "模型缺失，识别不可用",
+        };
+        let snapshot = EngineStatusSnapshot::from(missing);
+        assert!(!snapshot.available);
+        assert_eq!(&*snapshot.dir, "未找到");
+    }
 
     #[test]
     fn history_source_filter_matches_all_and_exact_sources() {

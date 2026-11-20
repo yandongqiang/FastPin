@@ -4,6 +4,7 @@
 
 use crate::config::{Watermark, WatermarkPosition};
 use crate::geom::{Point, Rect};
+use crate::image_budget::BUDGET;
 use crate::overlay::editor::{
     badge_font_size, cloud_polyline, dash_segments, ellipse_ring, spotlight_dim_argb, ArrowEnds,
     ArrowHead, BadgeStyle, DashPattern, Element, LineStyle, Shape, SpotlightKind,
@@ -15,6 +16,14 @@ struct Bgra<'a> {
     width: u32,
     height: u32,
     stride: u32,
+}
+
+/// Fallible, budgeted allocation for one-byte-per-pixel coverage masks.
+/// `None` means the request is over the shared image budget or the allocator
+/// refused; callers then skip that mask instead of aborting the process.
+fn coverage_buffer(width: usize, height: usize) -> Option<Vec<u8>> {
+    let len = BUDGET.checked_bytes(width as u64, height as u64, 1).ok()?;
+    BUDGET.alloc_zeroed(len).ok()
 }
 
 pub fn apply_annotations(
@@ -614,7 +623,7 @@ fn ellipse_fill_mask(r: Rect) -> Option<CoverageMask> {
         return None;
     }
     let scale = rx.min(ry);
-    let mut data = vec![0u8; width * height];
+    let mut data = coverage_buffer(width, height)?;
     for y in y0..y1 {
         for x in x0..x1 {
             let nx = (x as f64 + 0.5 - cx) / rx;
@@ -671,7 +680,7 @@ pub fn spotlight_dim_mask(bounds: Rect, elements: &[Element]) -> Option<Coverage
     }
     // Accumulate the maximum cutout coverage first: two overlapping antialiased
     // rims would over-carve the dim if each subtracted from the running value.
-    let mut holes = vec![0u8; width * height];
+    let mut holes = coverage_buffer(width, height)?;
     for (cutout, is_rect) in cutouts {
         let mask = if is_rect {
             rect_fill_mask(cutout)
@@ -718,7 +727,20 @@ fn merge_masks(a: &CoverageMask, b: &CoverageMask) -> CoverageMask {
     let y1 = (a.y0 + a.height as i32).max(b.y0 + b.height as i32);
     let width = (x1 - x0).max(0) as usize;
     let height = (y1 - y0).max(0) as usize;
-    let mut data = vec![0u8; width * height];
+    let mut data = match coverage_buffer(width, height) {
+        Some(data) => data,
+        // Signature stays stable: an empty mask blends and rasterizes to
+        // nothing, so an over-budget union layer is simply skipped.
+        None => {
+            return CoverageMask {
+                x0,
+                y0,
+                width: 0,
+                height: 0,
+                data: Vec::new(),
+            }
+        }
+    };
     for m in [a, b] {
         for row in 0..m.height {
             for col in 0..m.width {
@@ -826,7 +848,7 @@ pub fn stroke_segments_mask(segments: &[[Point; 2]], thick: f64) -> Option<Cover
     }
     let width = (x1 - x0) as usize;
     let height = (y1 - y0) as usize;
-    let mut data = vec![0u8; width * height];
+    let mut data = coverage_buffer(width, height)?;
     for [a, b] in segments {
         let sx0 = ((a.x.min(b.x) - pad).floor() as i32).clamp(x0, x1);
         let sy0 = ((a.y.min(b.y) - pad).floor() as i32).clamp(y0, y1);
@@ -891,7 +913,7 @@ pub fn triangles_mask(tris: &[(Point, Point, Point)]) -> Option<CoverageMask> {
     let y1 = max.y.ceil() as i32;
     let width = (x1 - x0 + 1) as usize;
     let height = (y1 - y0 + 1) as usize;
-    let mut data = vec![0u8; width * height];
+    let mut data = coverage_buffer(width, height)?;
     for y in y0..=y1 {
         for x in x0..=x1 {
             let mut hits = 0;
@@ -1218,17 +1240,30 @@ fn tile_premult_layer(
 /// configured path is used verbatim.
 fn load_watermark_image(wm: &Watermark) -> Option<(Vec<u8>, u32, u32)> {
     let path = wm.image_path.as_ref()?;
-    if !path.is_file() {
+    let Ok(meta) = path.metadata() else {
+        return None;
+    };
+    if !meta.is_file() {
         return None;
     }
+    // A file bigger than the budget can never decode to an in-budget bitmap:
+    // refuse it before the decoder inflates it.
+    BUDGET.checked_len(meta.len()).ok()?;
+    // Peek at the header too, so a tiny but huge (zip-bomb) image is rejected
+    // before `to_rgba8` allocates the decoded buffer.
+    let (header_w, header_h) = image::image_dimensions(path).ok()?;
+    BUDGET.checked_dims(header_w as u64, header_h as u64).ok()?;
+
     let img = image::open(path).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return None;
     }
+    // Final check on the decoded dimensions, then a budgeted fallible output.
+    BUDGET.checked_dims(w as u64, h as u64).ok()?;
     let src = img.into_raw();
-    let mut out = vec![0u8; (w * h * 4) as usize];
-    for i in 0..(w * h) as usize {
+    let mut out = BUDGET.alloc_rgba(w as u64, h as u64).ok()?;
+    for i in 0..(w as usize * h as usize) {
         let (r, g, b, a) = (src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]);
         let af = a as f64 / 255.0;
         out[i * 4] = (b as f64 * af).round() as u8;
@@ -2870,5 +2905,14 @@ mod tests {
         let alpha = (64.0_f64 * 255.0 / 100.0).round();
         let expected = (255.0_f64 * (255.0 - alpha) / 255.0).round() as u8;
         assert!(outside[2] <= expected + 1, "dim too weak: {}", outside[2]);
+    }
+
+    #[test]
+    fn coverage_buffer_refuses_oversized_masks() {
+        assert!(coverage_buffer(4, 4).is_some());
+        // One pixel past the side cap, and a u64 product that cannot fit a
+        // mask, must both be refused without allocating.
+        assert!(coverage_buffer(16_385, 1).is_none());
+        assert!(coverage_buffer(usize::MAX, 2).is_none());
     }
 }

@@ -77,7 +77,6 @@ pub const CUSTOMIZABLE: &[&str] = &[
     ARROW,
     POLYLINE_ARROW,
     CURVE_ARROW,
-    LINE,
     PEN,
     HIGHLIGHTER,
     TEXT,
@@ -1002,6 +1001,17 @@ mod tests {
     fn every_phase1_item_has_a_label() {
         for id in PHASE1_ITEMS {
             assert!(!label(id).is_empty(), "{id}");
+        }
+    }
+
+    /// The settings page renders one checkbox per CUSTOMIZABLE id; a duplicate
+    /// would draw the same box twice and confuse the hidden-item list.
+    #[test]
+    fn customizable_has_no_duplicates() {
+        let mut seen = Vec::new();
+        for id in CUSTOMIZABLE {
+            assert!(!seen.contains(id), "duplicate customizable id {id}");
+            seen.push(id);
         }
     }
 

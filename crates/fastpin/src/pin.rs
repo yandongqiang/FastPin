@@ -496,7 +496,10 @@ fn move_windows(hwnds: &[HWND], dx: i32, dy: i32) {
                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE,
             ) {
                 Ok(next) => hdwp = next,
-                Err(_) => return,
+                // The batch is invalidated on failure. Break instead of
+                // returning so EndDeferWindowPos still releases it; the
+                // remaining windows simply keep their old position.
+                Err(_) => break,
             }
         }
         let _ = EndDeferWindowPos(hdwp);
@@ -1336,7 +1339,16 @@ impl PinView {
         let Some(client) = client_rect(crate::platform::hwnd_of(window)) else {
             return;
         };
-        let new_zoom = self.zoom * factor;
+        // A group can hold members at different zooms; applying one shared
+        // factor without a per-member clamp lets a small member slip under the
+        // grabbable minimum. Clamp here so both the leader and every follower
+        // stay inside [MIN_ZOOM, MAX_ZOOM].
+        let min_dim = self.pixel_size.0.min(self.pixel_size.1) as f32;
+        let floor = MIN_ZOOM.max(24.0 / min_dim.max(1.0));
+        let new_zoom = (self.zoom * factor).clamp(floor, MAX_ZOOM);
+        if new_zoom == self.zoom {
+            return;
+        }
         let rect = zoom_rect(
             self.precise_rect(client),
             anchor,
@@ -2071,8 +2083,21 @@ pub(crate) fn run_menu_command(cx: &mut App, id: u64, cmd: u32) {
 /// forces every pixel opaque -- the crop is opaque, but the source alpha can
 /// be 0 from some desktop sources, which would render as blank in gpui.
 fn repack_opaque(pixels: &[u8], w: u32, h: u32, stride: u32) -> Vec<u8> {
-    let tight = (w * 4) as usize;
-    let mut out = Vec::with_capacity(tight * h as usize);
+    // A short crop (or a bogus stride) used to panic on the slice below; under
+    // `panic = "abort"` that killed the process. The caller already treats an
+    // empty buffer as a size mismatch and reports it.
+    let tight = match (w as u64).checked_mul(4) {
+        Some(n) => n as usize,
+        None => return Vec::new(),
+    };
+    let needed = match (stride as u64).checked_mul(h as u64) {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    if tight == 0 || h == 0 || (stride as usize) < tight || (pixels.len() as u64) < needed {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(tight.saturating_mul(h as usize));
     for row in 0..h as usize {
         let start = row * stride as usize;
         out.extend_from_slice(&pixels[start..start + tight]);

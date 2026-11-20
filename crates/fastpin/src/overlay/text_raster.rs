@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Imaging::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Font used by both the overlay preview and the export raster, so what the
 /// user sees is what the PNG gets.
@@ -147,8 +147,19 @@ pub fn rasterize(text: &str, font_size: f64, argb: u32) -> Result<(Vec<u8>, u32,
         );
         target.EndDraw(None, None)?;
 
-        let stride = width * 4;
-        let mut buf = vec![0u8; (stride * height) as usize];
+        // Width comes from DWrite (up to 32767 px) but the product is still
+        // unchecked in release builds: a wrapped stride/length would make
+        // CopyPixels write past the buffer. Route it through the shared cap.
+        let stride = width
+            .checked_mul(4)
+            .ok_or_else(|| Error::new("text raster too wide"))?;
+        let len = crate::image_budget::BUDGET
+            .checked_len(stride as u64 * height as u64)
+            .map_err(|e| Error::new(e.to_string()))?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len)
+            .map_err(|_| Error::new("text raster allocation failed"))?;
+        buf.resize(len, 0u8);
         bitmap.CopyPixels(ptr::null(), stride, &mut buf)?;
         Ok((buf, width, height))
     }

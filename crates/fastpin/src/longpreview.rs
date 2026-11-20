@@ -104,6 +104,10 @@ pub fn show_long_preview(cx: &mut App, pixels: Vec<u8>, w: u32, h: u32) {
     );
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    // Keep an Arc for the failure path. The view gets its own clone, so when
+    // `open_window` fails and drops it, `try_unwrap` below recovers the buffer
+    // without copying a possibly huge stitch.
+    let view_pixels = pixels.clone();
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -117,14 +121,21 @@ pub fn show_long_preview(cx: &mut App, pixels: Vec<u8>, w: u32, h: u32) {
         },
         |window, cx| {
             let fit = fit_zoom(window.viewport_size().width.into(), w as f32);
-            cx.new(|cx| LongPreviewView::new(cx, image, pixels, (w, h), fit))
+            cx.new(|cx| LongPreviewView::new(cx, image, view_pixels, (w, h), fit))
         },
     );
 
     let handle = match opened {
         Ok(handle) => handle,
         Err(e) => {
-            crate::perf::log_app(&format!("long preview window failed: {e}"));
+            // No window means no Save/Copy action; use the same historical
+            // export fallback as the buffer-mismatch branch so the shot is not
+            // silently lost.
+            crate::perf::log_app(&format!(
+                "long preview window failed: {e}; exporting directly"
+            ));
+            let bytes = Arc::try_unwrap(pixels).unwrap_or_else(|arc| (*arc).clone());
+            crate::app::export_pin_pixels(bytes, w, h, true, true);
             return;
         }
     };

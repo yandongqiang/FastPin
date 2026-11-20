@@ -269,6 +269,10 @@ struct LongCaptureState {
     /// Polls that found the previous frame still in the worker: the tick that
     /// would have exceeded `LONG_POLL`, reported in the next diag line.
     late_ticks: u64,
+    /// Consecutive capture failures (device reset, size change, protected
+    /// content). After a few, the session reports a real error instead of
+    /// polling forever with a "scroll the page" hint that can never progress.
+    capture_failures: u32,
     /// Latest `StallTracker::paused` from the worker (P1-05 decimation).
     stall_paused: bool,
     /// Latest stitched counters, mirrored from the last applied result so the
@@ -2050,6 +2054,7 @@ impl OverlayView {
             live,
             poll_ticks: 0,
             late_ticks: 0,
+            capture_failures: 0,
             stall_paused: false,
             segments,
             total_height,
@@ -2127,7 +2132,11 @@ impl OverlayView {
                 && abs_y + h as i32 <= m.y + m.h
         })?;
         let session = crate::capture::start_live(&cap.gpu, mon, mon.hdr).ok()?;
-        if !session.wait_first(Duration::from_millis(500)) {
+        // A cold WGC session used to busy-wait up to 500 ms here, on the UI
+        // thread, before the bar even appeared. The very first frame has a
+        // fresh-capture fallback anyway, so only give the live session a short
+        // head start and let later ticks pick it up once it warms up.
+        if !session.wait_first(Duration::from_millis(50)) {
             return None;
         }
         Some(LongLive {
@@ -2304,8 +2313,8 @@ impl OverlayView {
         }
         let (ax, ay, w, h) = (state.abs_x, state.abs_y, state.w, state.h);
         let (axis, epoch) = (state.axis, state.gate.epoch());
-        let px = match state.live.as_ref() {
-            Some(live) => match crate::app::capture_region_live(
+        let captured = match state.live.as_ref() {
+            Some(live) => crate::app::capture_region_live(
                 cx,
                 &live.session,
                 &live.gpu,
@@ -2316,18 +2325,30 @@ impl OverlayView {
                 ay,
                 w,
                 h,
-            ) {
-                // No new frame since the last poll: nothing scrolled, not an
-                // error -- skip aligning without touching prev_gray.
-                Ok(None) => return true,
-                Ok(Some((px, pw, ph, _))) if pw == w && ph == h => px,
-                Ok(Some(_)) | Err(_) => return true,
-            },
-            None => match crate::app::capture_region_bgra(cx, ax, ay, w, h) {
-                // A transient capture failure skips the frame, same as the C# loop.
-                Ok((px, pw, ph, _)) if pw == w && ph == h => px,
-                Ok(_) | Err(_) => return true,
-            },
+            )
+            .map(|frame| frame.map(|(px, pw, ph, _)| (px, pw, ph))),
+            None => crate::app::capture_region_bgra(cx, ax, ay, w, h)
+                .map(|(px, pw, ph, _)| Some((px, pw, ph))),
+        };
+        let px = match captured {
+            // No new frame since the last poll: nothing scrolled, not an error.
+            Ok(None) => return true,
+            Ok(Some((px, pw, ph))) if pw == w && ph == h => {
+                state.capture_failures = 0;
+                px
+            }
+            // A wrong size or a hard error is a failed sample. A few are
+            // transient; a long run used to poll forever with a misleading
+            // "scroll the page" status and no way to tell the user why.
+            Ok(_) | Err(_) => {
+                state.capture_failures = state.capture_failures.saturating_add(1);
+                if state.capture_failures >= 5 {
+                    state.status = "采集连续失败，请取消后重新开始长截图".to_string();
+                    crate::perf::log_app("long capture stopped after 5 capture failures");
+                    return false;
+                }
+                return true;
+            }
         };
         state.poll_ticks = state.poll_ticks.wrapping_add(1);
         let Some(seq) = state.gate.issue(epoch) else {
@@ -2335,6 +2356,9 @@ impl OverlayView {
         };
         let capture_ms = started.elapsed().as_secs_f64() * 1e3;
         let late = std::mem::take(&mut state.late_ticks);
+        // The frame got through, so the previous burst is over: let the next
+        // one cut the rate again instead of compounding on a stale counter.
+        state.cadence.clear_pressure();
         let job = Job {
             generation: gen,
             epoch,

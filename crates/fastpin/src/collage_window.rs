@@ -6,7 +6,7 @@
 //! - Export: PNG collage and/or PDF (PageBased/TemplateBased)
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -284,6 +284,26 @@ fn pdf_image_xobject(item: &ImageEntry) -> Option<ImageXObject> {
         image_filter: None,
         clipping_bbox: None,
     })
+}
+
+/// Sibling staging path used to write a PDF before publishing it atomically.
+/// Writing straight to the destination would leave a truncated file behind
+/// when `save` or `flush` fails.
+fn pdf_temp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.tmp"))
+}
+
+/// User-facing note for images that could not be embedded in the PDF.
+fn pdf_skipped_warning(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!("（已跳过 {count} 张无法嵌入的图片）")
+    }
 }
 
 struct ImageEntry {
@@ -721,6 +741,10 @@ impl CollageWindowView {
         let page_count = self.pdf_page_count.max(1);
         let mut written = Vec::new();
         let mut error = None;
+        // An image that fails to convert must not vanish silently: remember it
+        // so the status can warn the user instead of reporting a clean export.
+        let mut skipped: Vec<usize> = Vec::new();
+        let mut embedded_any = false;
 
         // `PerPage` writes one document per page; `Combined` keeps them all in
         // a single file. Both share the same page composer.
@@ -735,6 +759,7 @@ impl CollageWindowView {
             let (doc, first_page, first_layer) =
                 PdfDocument::new("FastPin Collage", Mm(page_w), Mm(page_h), "Layer 1");
             let mut page_indexes = vec![(first_page, first_layer)];
+            let mut group_embedded = false;
 
             for _ in 1..pages.len() {
                 page_indexes.push(doc.add_page(Mm(page_w), Mm(page_h), "Layer 1"));
@@ -744,12 +769,22 @@ impl CollageWindowView {
                 let (page_index, layer_index) = page_indexes[slot];
                 let page = calculate_pdf_composed_page(&items, &self.pdf_settings, *page_idx);
                 for cell in &page.cells {
-                    let Some(item) = self.images.get(cell.item_index) else {
+                    let item_index = cell.item_index;
+                    let Some(item) = self.images.get(item_index) else {
+                        if !skipped.contains(&item_index) {
+                            skipped.push(item_index);
+                        }
                         continue;
                     };
                     let Some(xobj) = pdf_image_xobject(item) else {
+                        // Zero-sized or over-budget: never embed a blank image.
+                        if !skipped.contains(&item_index) {
+                            skipped.push(item_index);
+                        }
                         continue;
                     };
+                    embedded_any = true;
+                    group_embedded = true;
                     let dpi = if cell.image_mm.width > 0.0 {
                         xobj.width.0 as f32 * 25.4 / cell.image_mm.width
                     } else {
@@ -767,40 +802,81 @@ impl CollageWindowView {
                 }
             }
 
+            // A page with no embeddable image would produce an empty PDF.
+            if !group_embedded {
+                continue;
+            }
+
             let name = if per_page {
                 format!("FastPin_Collage_{stamp}_p{}.pdf", group_idx + 1)
             } else {
                 format!("FastPin_Collage_{stamp}.pdf")
             };
             let path = dir.join(name);
-            let result = std::fs::File::create(&path).and_then(|file| {
+            let temp_path = pdf_temp_path(&path);
+            // Write to a sibling temp file, then publish with an atomic rename.
+            // A save/flush failure leaves no truncated PDF at `path`.
+            let result = (|| -> std::io::Result<()> {
+                let file = std::fs::File::create(&temp_path)?;
                 let mut writer = std::io::BufWriter::new(file);
                 doc.save(&mut writer).map_err(std::io::Error::other)?;
-                std::io::Write::flush(&mut writer)
-            });
+                std::io::Write::flush(&mut writer)?;
+                drop(writer);
+                // The timestamped name is normally free, but replace a stale
+                // file from an earlier same-second export before publishing.
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                }
+                std::fs::rename(&temp_path, &path)
+            })();
             match result {
                 Ok(()) => written.push(path),
                 Err(e) => {
+                    let _ = std::fs::remove_file(&temp_path);
                     error = Some(e);
                     break;
                 }
             }
         }
 
+        let warning = pdf_skipped_warning(skipped.len());
+        if !embedded_any {
+            // Every image was unusable: an empty PDF would be worse than no
+            // export, so refuse to write anything.
+            self.export_result = None;
+            self.status = SharedString::from(format!("所有图片均无法嵌入 PDF，未导出{warning}"));
+            cx.notify();
+            return;
+        }
         match error {
             Some(e) => {
-                self.status = SharedString::from(format!("导出 PDF 失败: {e}"));
+                // PerPage may have written earlier pages before failing. Keep
+                // them visible so the user can open the folder and inspect them.
+                if written.is_empty() {
+                    self.export_result = None;
+                    self.status = SharedString::from(format!("导出 PDF 失败: {e}{warning}"));
+                } else {
+                    self.export_result = Some(ExportResult {
+                        png_path: None,
+                        pdf_path: written.first().cloned(),
+                        message: format!("已导出 {} 个 PDF{warning}", written.len()),
+                    });
+                    self.status = SharedString::from(format!(
+                        "部分 PDF 导出失败: {e}；已导出 {} 个{warning}",
+                        written.len()
+                    ));
+                }
             }
             None => {
                 self.export_result = Some(ExportResult {
                     png_path: None,
                     pdf_path: written.first().cloned(),
-                    message: format!("已导出 {} 个 PDF", written.len()),
+                    message: format!("已导出 {} 个 PDF{warning}", written.len()),
                 });
                 self.status = SharedString::from(if let Some(path) = written.first() {
-                    format!("已导出 PDF: {}", path.display())
+                    format!("已导出 PDF: {}{warning}", path.display())
                 } else {
-                    "没有可导出的页面".to_string()
+                    format!("没有可导出的页面{warning}")
                 });
             }
         }
@@ -2379,5 +2455,24 @@ impl Render for CollageWindowView {
                     .child(self.preview(cx)),
             )
             .child(self.footer(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_temp_path_is_a_sibling_that_keeps_the_original() {
+        let target = Path::new("out").join("FastPin_Collage_1.pdf");
+        let temp = pdf_temp_path(&target);
+        assert_eq!(temp, Path::new("out").join("FastPin_Collage_1.pdf.tmp"));
+        assert_eq!(target, Path::new("out").join("FastPin_Collage_1.pdf"));
+    }
+
+    #[test]
+    fn skipped_warning_is_empty_only_when_nothing_was_skipped() {
+        assert_eq!(pdf_skipped_warning(0), "");
+        assert_eq!(pdf_skipped_warning(2), "（已跳过 2 张无法嵌入的图片）");
     }
 }

@@ -510,6 +510,12 @@ fn run(
         // The flag is set before the channel closes, so a job queued behind a
         // cancel is refused instead of stitched into a session nobody owns.
         if cancel.load(Ordering::SeqCst) && !matches!(cmd, Cmd::Finish(_)) {
+            // A queued hover preview must still get an answer. Without this the
+            // UI blocks for the full `render_region` timeout on a session that
+            // was just cancelled (the caller cannot see the cancel flag).
+            if let Cmd::Render(_, reply) = &cmd {
+                let _ = reply.send(None);
+            }
             break;
         }
         match cmd {
@@ -645,6 +651,9 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
     // The first frame only initializes the stitcher; it carries no motion.
     // It did establish the canvas, so seed the preview from it.
     let Some(orb) = orb else {
+        let preview = live_preview(&mut state.stitcher);
+        // Include the preview downsample: `capture_cadence` uses `process` as
+        // the worker cost and would otherwise think a growing canvas is free.
         spans.process = ms(started);
         return Outcome::Frame(FrameResult {
             verdict: Verdict::Idle,
@@ -653,7 +662,7 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
             total_height: total,
             stats: state.stitcher.stats(),
             spans,
-            preview: live_preview(&mut state.stitcher),
+            preview,
         });
     };
 
@@ -702,6 +711,9 @@ fn process(state: &mut SessionState, job: &Job) -> Outcome {
     } else {
         None
     };
+    // Report the whole worker pass (stitch + diag + preview) so the cadence
+    // controller does not over-drive a pipeline whose real cost was hidden.
+    spans.process = ms(started);
 
     Outcome::Frame(FrameResult {
         verdict,

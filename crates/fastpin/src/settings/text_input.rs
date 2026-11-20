@@ -17,7 +17,7 @@ use gpui::{
     CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
     Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextAlign, TextRun,
-    UTF16Selection, Window,
+    TextStyle, UTF16Selection, Window,
 };
 
 use super::widgets;
@@ -44,6 +44,29 @@ actions!(
 pub const CONTEXT: &str = "FastPinSettingsInput";
 
 const BULLET: &str = "•";
+
+/// Text actually handed to the shaper: the placeholder when empty, a run of
+/// bullets for a masked field, or the content itself. Kept as a helper so the
+/// masked case is unit-testable and the prepaint path can cache its result.
+fn display_text(content: &str, placeholder: &str, masked: bool) -> SharedString {
+    if content.is_empty() {
+        placeholder.into()
+    } else if masked {
+        BULLET.repeat(content.chars().count()).into()
+    } else {
+        content.into()
+    }
+}
+
+/// A shaped line plus the exact inputs that produced it. A frame with unchanged
+/// content and style reuses the cached line instead of re-shaping (and, for a
+/// masked field, re-allocating the bullet string) every frame.
+struct ShapeCache {
+    content: SharedString,
+    masked: bool,
+    style: TextStyle,
+    line: ShapedLine,
+}
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     let ctx = Some(CONTEXT);
@@ -73,6 +96,8 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// Reused across frames until content, mask state or text style changes.
+    shape_cache: Option<ShapeCache>,
     is_selecting: bool,
     /// Draws no frame of its own, for fields that sit inside a styled
     /// container (the settings search bar).
@@ -98,6 +123,7 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            shape_cache: None,
             is_selecting: false,
             flat: false,
         }
@@ -566,37 +592,50 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let input = self.input.read(cx);
         let style = window.text_style();
-        let empty = input.content.is_empty();
-        let display_text: SharedString = if empty {
-            input.placeholder.clone()
-        } else if input.masked {
-            BULLET.repeat(input.content.chars().count()).into()
-        } else {
-            input.content.clone()
-        };
-        let text_color = if empty {
-            theme::disabled_fg()
-        } else {
-            style.color
-        };
+        // Shape only when the visible text or text style changed. On a hit we
+        // reuse the cached line, so an unchanged frame neither re-shapes nor
+        // rebuilds the masked field's bullet string.
+        let line = self.input.update(cx, |input, _| {
+            if let Some(cache) = &input.shape_cache {
+                if cache.content == input.content
+                    && cache.masked == input.masked
+                    && cache.style == style
+                {
+                    return cache.line.clone();
+                }
+            }
+            let text = display_text(&input.content, &input.placeholder, input.masked);
+            let text_color = if input.content.is_empty() {
+                theme::disabled_fg()
+            } else {
+                style.color
+            };
+            let run = TextRun {
+                len: text.len(),
+                font: style.font(),
+                color: text_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let line = window
+                .text_system()
+                .shape_line(text, font_size, &[run], None);
+            input.shape_cache = Some(ShapeCache {
+                content: input.content.clone(),
+                masked: input.masked,
+                style: style.clone(),
+                line: line.clone(),
+            });
+            line
+        });
+
+        let input = self.input.read(cx);
         let cursor_at = input.display_offset(input.cursor_offset());
         let selected = input.display_offset(input.selected_range.start)
             ..input.display_offset(input.selected_range.end);
-
-        let run = TextRun {
-            len: display_text.len(),
-            font: style.font(),
-            color: text_color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window
-            .text_system()
-            .shape_line(display_text, font_size, &[run], None);
 
         let (selection, cursor) = if selected.is_empty() {
             (
@@ -676,5 +715,28 @@ impl Element for TextElement {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masked_text_uses_one_bullet_per_char() {
+        assert_eq!(&*display_text("abc", "ph", true), "•••");
+        assert_eq!(&*display_text("中文", "ph", true), "••");
+    }
+
+    #[test]
+    fn empty_content_falls_back_to_placeholder() {
+        assert_eq!(&*display_text("", "ph", false), "ph");
+        // A masked field still shows the placeholder while it is empty.
+        assert_eq!(&*display_text("", "ph", true), "ph");
+    }
+
+    #[test]
+    fn plain_text_is_not_transformed() {
+        assert_eq!(&*display_text("sk-123", "ph", false), "sk-123");
     }
 }

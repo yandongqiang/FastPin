@@ -968,15 +968,23 @@ pub fn get() -> Settings {
     guard.get_or_insert(loaded).clone()
 }
 
-/// Writes the file, then refreshes the cache. Cache-last: if the write fails
-/// the process keeps behaving like the settings the user can actually see.
+/// Writes a temporary file beside the real one and renames it into place.
+/// `std::fs::rename` on Windows uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`,
+/// so a crash or a failed serialize leaves the previous settings intact rather
+/// than a truncated file that silently resets everything on next start.
+/// Cache-last: on failure the process keeps the settings the user can see.
 pub fn save(settings: &Settings) -> Result<()> {
     let path = path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(settings).map_err(|e| Error::new(format!("{e}")))?;
-    std::fs::write(&path, text)?;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, &text)?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     *cache().write().unwrap_or_else(|e| e.into_inner()) = Some(settings.clone());
     Ok(())
 }
@@ -999,11 +1007,58 @@ fn parse(text: &str) -> Settings {
     if text.trim().is_empty() {
         return Settings::default();
     }
-    serde_json::from_str(text).unwrap_or_else(|e| {
-        // Falling back in silence reads as "translation is broken" with no clue why.
-        eprintln!("settings.json ignored: {e}");
-        Settings::default()
-    })
+    match serde_json::from_str::<Settings>(text) {
+        Ok(settings) => settings,
+        Err(e) => {
+            // One wrong field type (say `"timeoutSeconds": "30"`) used to throw
+            // away the whole file: baseUrl, saveDir and history were lost and
+            // the next save overwrote the original. Keep every field whose JSON
+            // type still matches the default shape and drop only the bad ones.
+            eprintln!("settings.json has invalid fields ({e}); keeping the well-typed ones");
+            let default = match serde_json::to_value(Settings::default()) {
+                Ok(value) => value,
+                Err(_) => return Settings::default(),
+            };
+            let input: serde_json::Value = match serde_json::from_str(text) {
+                Ok(value) => value,
+                Err(_) => return Settings::default(),
+            };
+            serde_json::from_value(merge_typed(&default, &input)).unwrap_or_default()
+        }
+    }
+}
+
+/// Merges `input` into the default-shaped tree, keeping only values whose JSON
+/// kind matches the default at that path. Unknown keys are dropped; a bad leaf
+/// falls back to its default instead of poisoning the whole document.
+fn merge_typed(default: &serde_json::Value, input: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match (default, input) {
+        (Value::Object(base), Value::Object(over)) => {
+            let mut out = base.clone();
+            for (key, value) in over {
+                if let Some(expected) = base.get(key) {
+                    out.insert(key.clone(), merge_typed(expected, value));
+                }
+            }
+            Value::Object(out)
+        }
+        (Value::Null, other) => other.clone(),
+        (expected, Value::Null) => expected.clone(),
+        (expected, other) if same_kind(expected, other) => other.clone(),
+        (expected, _) => expected.clone(),
+    }
+}
+
+fn same_kind(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    matches!(
+        (a, b),
+        (Value::Bool(_), Value::Bool(_))
+            | (Value::Number(_), Value::Number(_))
+            | (Value::String(_), Value::String(_))
+            | (Value::Array(_), Value::Array(_))
+    )
 }
 
 #[cfg(test)]
@@ -1029,6 +1084,23 @@ mod tests {
         assert_eq!(s.translation.base_url, "https://api.example.com/v1");
         assert_eq!(s.translation.model, "gpt-4o-mini");
         assert_eq!(s.translation.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn a_bad_field_does_not_discard_the_rest_of_the_file() {
+        let s = parse(
+            r#"{
+              "translation": {"baseUrl": "https://api.example.com/v1", "timeoutSeconds": "30"},
+              "ocr": {"modelsDir": "D:/models/v6"}
+            }"#,
+        );
+        assert_eq!(s.translation.base_url, "https://api.example.com/v1");
+        // The bad type falls back to its own default; valid fields survive.
+        assert_eq!(s.translation.timeout_seconds, 30);
+        assert_eq!(
+            s.ocr.models_dir.as_deref(),
+            Some(std::path::Path::new("D:/models/v6"))
+        );
     }
 
     #[test]

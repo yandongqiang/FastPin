@@ -4,6 +4,8 @@
 //! Nothing here touches gpui or the filesystem, so the page/search/reset rules
 //! stay unit-testable even though the window itself can only be checked by eye.
 
+use std::sync::OnceLock;
+
 use crate::config::Settings;
 
 /// One entry of the left navigation pane, in the order Citepix shows them.
@@ -423,19 +425,31 @@ pub fn rows_of(page: Page) -> impl Iterator<Item = &'static RowMeta> {
     ROWS.iter().filter(move |r| r.page == page)
 }
 
-fn matches(row: &RowMeta, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    let q = query.to_lowercase();
-    row.title.to_lowercase().contains(&q) || row.desc.to_lowercase().contains(&q)
+/// Lowercased copies of every row's title/desc, built once. The settings window
+/// searches on every frame; without this it would re-lower every row (allocating
+/// two `String`s each time) on every search and again for the result count.
+fn lowered_rows() -> &'static [(String, String)] {
+    static LOWERED: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    LOWERED.get_or_init(|| {
+        ROWS.iter()
+            .map(|r| (r.title.to_lowercase(), r.desc.to_lowercase()))
+            .collect()
+    })
 }
 
 /// Cross-page search. An empty query matches every row; the window only calls
 /// this with a non-empty query (an empty box shows the current page instead).
+/// The query is lower-cased once and reused; row text comes from the cache above.
 pub fn search(query: &str) -> Vec<&'static RowMeta> {
-    let q = query.trim();
-    ROWS.iter().filter(|r| matches(r, q)).collect()
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return ROWS.iter().collect();
+    }
+    ROWS.iter()
+        .zip(lowered_rows())
+        .filter(|(_, (title, desc))| title.contains(&q) || desc.contains(&q))
+        .map(|(row, _)| row)
+        .collect()
 }
 
 /// Resets the fields the page owns. Returns whether anything was reset, so the
@@ -627,6 +641,26 @@ mod tests {
             .any(|r| r.page == Page::Translate && r.title == "接口地址"));
         // Latin matching is case-insensitive.
         assert_eq!(search("OPENAI").len(), by_desc.len());
+    }
+
+    /// The pre-lowered cache must give exactly the same answers as lowering
+    /// each row on the fly, otherwise repeated searches could silently diverge.
+    #[test]
+    fn search_lowered_cache_agrees_with_naive_lowering() {
+        for query in ["水印", "OPENAI", "openai", "工具", "zzz-不存在"] {
+            let fast: Vec<_> = search(query).iter().map(|r| r.title).collect();
+            let q = query.trim().to_lowercase();
+            let naive: Vec<_> = ROWS
+                .iter()
+                .filter(|r| {
+                    r.title.to_lowercase().contains(&q) || r.desc.to_lowercase().contains(&q)
+                })
+                .map(|r| r.title)
+                .collect();
+            assert_eq!(fast, naive, "query {query}");
+        }
+        // The cache is built only once and never changes length.
+        assert_eq!(lowered_rows().len(), ROWS.len());
     }
 
     #[test]

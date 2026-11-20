@@ -270,6 +270,14 @@ pub enum ComposeError {
     Empty,
     /// The canvas or one resampled tile exceeds the image budget.
     Budget(crate::image_budget::BudgetError),
+    /// A tile's buffer is shorter than its dimensions describe. Exporting a
+    /// group with such a tile silently dropped it (and its marks) from the
+    /// composed image, so fail the whole export instead.
+    ShortTile {
+        index: usize,
+        available: u64,
+        needed: u64,
+    },
 }
 
 impl std::fmt::Display for ComposeError {
@@ -277,6 +285,11 @@ impl std::fmt::Display for ComposeError {
         match self {
             ComposeError::Empty => f.write_str("pin group has no tiles to compose"),
             ComposeError::Budget(e) => write!(f, "pin group too large: {e}"),
+            ComposeError::ShortTile {
+                index,
+                available,
+                needed,
+            } => write!(f, "tile {index} has {available} bytes but needs {needed}"),
         }
     }
 }
@@ -354,7 +367,7 @@ pub fn compose(tiles: &[TileImage]) -> Result<(Vec<u8>, u32, u32), ComposeError>
     // pixel count and the byte count, and reports which one failed.
     let mut out = budget.alloc_rgba(cw as u64, ch as u64)?;
 
-    for t in tiles {
+    for (index, t) in tiles.iter().enumerate() {
         let tile_bytes = (t.width as u64)
             .checked_mul(t.height as u64)
             .and_then(|px| px.checked_mul(4))
@@ -366,7 +379,11 @@ pub fn compose(tiles: &[TileImage]) -> Result<(Vec<u8>, u32, u32), ComposeError>
                 },
             ))?;
         if t.width == 0 || t.height == 0 || (t.pixels.len() as u64) < tile_bytes {
-            continue;
+            return Err(ComposeError::ShortTile {
+                index,
+                available: t.pixels.len() as u64,
+                needed: tile_bytes,
+            });
         }
         let dest = tile_dest(t.rect, &lay);
         let (dw, dh) = (dest.width().max(1) as u32, dest.height().max(1) as u32);
@@ -569,6 +586,22 @@ mod tests {
             .cycle()
             .take((w * h * 4) as usize)
             .collect()
+    }
+
+    #[test]
+    fn compose_refuses_a_short_tile_instead_of_dropping_it() {
+        let short = vec![0u8; 4]; // claims 2x2 but holds a single pixel
+        let tiles = [TileImage {
+            rect: IRect::new(0, 0, 4, 4).precise(),
+            pixels: &short,
+            width: 2,
+            height: 2,
+            zoom: 1.0,
+        }];
+        assert!(matches!(
+            compose(&tiles),
+            Err(ComposeError::ShortTile { index: 0, .. })
+        ));
     }
 
     #[test]

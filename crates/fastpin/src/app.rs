@@ -1097,7 +1097,17 @@ pub(crate) fn export_pixels_shared(
     if copy {
         // Not swallowed: copy-only exports have no PNG to prove they ran, so a
         // silent failure here reads as "the hotkey is dead".
-        match set_clipboard_dib(&px, cw, ch, stride) {
+        // A CF_DIB copy needs a second, uncompressed ~1 GiB buffer for a 16k
+        // image. Above the shared budget paste PNG via the registered format
+        // instead; an allocation failure there would abort the whole process.
+        let copied = match crate::codec::dib_bytes(cw, ch) {
+            Some(_) => set_clipboard_dib(&px, cw, ch, stride),
+            None => {
+                let png = crate::codec::encode_png_bgra(&px, cw, ch, stride)?;
+                crate::codec::set_clipboard_png(&png)
+            }
+        };
+        match copied {
             Ok(()) => {
                 crate::perf::log_app(&format!("clipboard: {cw}x{ch} copied"));
                 // Copy-only captures (no saved file) still get a history record

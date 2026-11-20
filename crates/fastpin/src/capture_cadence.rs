@@ -66,6 +66,10 @@ pub struct CaptureCadence {
     /// Consecutive samples that said "sustainable > target".
     recovery_samples: u32,
     limiting: LimitingStage,
+    /// One burst of backpressure is one cut. The caller reports queue depth
+    /// as a running counter, so without this latch every later tick would
+    /// multiply the target by 0.75 again and pin it at `MIN_FPS` forever.
+    pressure_active: bool,
 }
 
 impl Default for CaptureCadence {
@@ -81,6 +85,7 @@ impl CaptureCadence {
             ewma_cost_ms: 0.0,
             recovery_samples: 0,
             limiting: LimitingStage::Capture,
+            pressure_active: false,
         }
     }
 
@@ -157,12 +162,25 @@ impl CaptureCadence {
     /// counter is cleared so a single burst cannot ratchet the rate back up.
     pub fn record_pressure(&mut self, queue_depth: usize) {
         if queue_depth < PRESSURE_QUEUE_DEPTH {
+            // A frame got through: disarm so the next burst can cut again.
+            self.pressure_active = false;
             return;
         }
+        if self.pressure_active {
+            return;
+        }
+        self.pressure_active = true;
         let reduced = (self.target_fps as f64 * 0.75).floor() as u32;
         let sustainable = Self::sustainable_fps(self.ewma_cost_ms);
         self.target_fps = self.target_fps.min(reduced).min(sustainable).max(MIN_FPS);
         self.recovery_samples = 0;
+    }
+
+    /// Explicitly disarms the latch when a frame was accepted. `record_pressure`
+    /// also clears it on a sub-threshold report; this covers the path where the
+    /// caller skips the report entirely after a successful frame.
+    pub fn clear_pressure(&mut self) {
+        self.pressure_active = false;
     }
 }
 
@@ -221,6 +239,24 @@ mod tests {
         cadence.record_pressure(2);
         assert!(cadence.target_fps() < before);
         assert!(cadence.target_fps() >= MIN_FPS);
+    }
+
+    #[test]
+    fn a_running_pressure_counter_cuts_only_once() {
+        let mut cadence = CaptureCadence::new();
+        cadence.record_frame(20.0, 20.0);
+        cadence.record_pressure(2);
+        let after_first = cadence.target_fps();
+        // The UI reports a growing late-tick count every in-flight poll. Without
+        // the latch these repeated reports would ratchet the target to MIN_FPS.
+        for depth in 3..20 {
+            cadence.record_pressure(depth);
+        }
+        assert_eq!(cadence.target_fps(), after_first);
+        // A successful frame disarms it, so a new burst can cut again.
+        cadence.clear_pressure();
+        cadence.record_pressure(2);
+        assert!(cadence.target_fps() < after_first || after_first == MIN_FPS);
     }
 
     #[test]

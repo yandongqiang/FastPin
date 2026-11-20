@@ -19,6 +19,22 @@ use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDev
 
 use crate::error::{Error, Result};
 
+/// `RowPitch * height` in u64, with the shared image ceiling. A wrapped u32
+/// product would hand `from_raw_parts` a tiny slice of a much larger mapping
+/// (silent corruption) or run past the mapping (an access violation that is
+/// fatal with `panic = "abort"`).
+fn mapped_bytes(stride: u32, height: u32) -> Result<usize> {
+    let bytes = (stride as u64)
+        .checked_mul(height as u64)
+        .ok_or_else(|| Error::new("readback size overflow"))?;
+    if bytes == 0 {
+        return Ok(0);
+    }
+    crate::image_budget::BUDGET
+        .checked_len(bytes)
+        .map_err(|e| Error::new(e.to_string()))
+}
+
 const TONEMAP_HLSL: &str = r#"
 Texture2D<float4> g_tex : register(t0);
 SamplerState g_samp : register(s0);
@@ -411,8 +427,18 @@ impl Gpu {
                 return Err(e.into());
             }
             let stride = mapped.RowPitch;
-            let size = stride * h;
-            let slice = std::slice::from_raw_parts(mapped.pData as *const u8, size as usize);
+            let size = match mapped_bytes(stride, h) {
+                Ok(size) => size,
+                Err(e) => {
+                    ctx.Unmap(&staging, 0);
+                    return Err(e);
+                }
+            };
+            if size == 0 || mapped.pData.is_null() {
+                ctx.Unmap(&staging, 0);
+                return Err(Error::new("readback mapping is empty"));
+            }
+            let slice = std::slice::from_raw_parts(mapped.pData as *const u8, size);
             let pixels = slice.to_vec();
             ctx.Unmap(&staging, 0);
             Ok((pixels, w, h, stride))
@@ -454,8 +480,18 @@ impl Gpu {
                 return Err(e.into());
             }
             let stride = mapped.RowPitch;
-            let size = stride * desc.Height;
-            let slice = std::slice::from_raw_parts(mapped.pData as *const u8, size as usize);
+            let size = match mapped_bytes(stride, desc.Height) {
+                Ok(size) => size,
+                Err(e) => {
+                    ctx.Unmap(&staging, 0);
+                    return Err(e);
+                }
+            };
+            if size == 0 || mapped.pData.is_null() {
+                ctx.Unmap(&staging, 0);
+                return Err(Error::new("readback mapping is empty"));
+            }
+            let slice = std::slice::from_raw_parts(mapped.pData as *const u8, size);
             let pixels = slice.to_vec();
             ctx.Unmap(&staging, 0);
             Ok((pixels, desc.Width, desc.Height, stride))

@@ -7,6 +7,7 @@ use std::path::Path;
 use std::ptr;
 use std::slice;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
 use windows::Win32::Graphics::Gdi::{BITMAPINFOHEADER, BI_RGB};
 use windows::Win32::Graphics::Imaging::{
@@ -19,7 +20,7 @@ use windows::Win32::System::Com::StructuredStorage::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, IStream, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
@@ -349,6 +350,17 @@ pub fn write_image_file(
     Ok(())
 }
 
+/// Size of the CF_DIB block `set_clipboard_dib` would allocate for a
+/// `width x height` 32bpp image, header included. Pure, so callers can decide
+/// to fall back to the PNG clipboard before copying ~1 GiB into a global block.
+/// `None` when the dimensions or the total exceed the shared image budget.
+pub fn dib_bytes(width: u32, height: u32) -> Option<usize> {
+    let budget = BUDGET;
+    let image = budget.checked_bytes(width as u64, height as u64, 4).ok()?;
+    let header = std::mem::size_of::<BITMAPINFOHEADER>();
+    budget.checked_len(image as u64 + header as u64).ok()
+}
+
 pub fn set_clipboard_dib(pixels: &[u8], width: u32, height: u32, stride: u32) -> Result<()> {
     let budget = BUDGET;
     // Checked before the `u32` math below: `width * 4 * height` used to wrap,
@@ -401,6 +413,43 @@ pub fn set_clipboard_dib(pixels: &[u8], width: u32, height: u32, stride: u32) ->
         match handed_over {
             // On success the clipboard owns the block; freeing it would be a
             // double free.
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = GlobalFree(Some(hg));
+                Err(e.into())
+            }
+        }
+    }
+}
+
+/// Places PNG bytes on the clipboard under the registered `PNG` format. Used
+/// when a CF_DIB copy would exceed the shared image budget (a 16k-tall capture
+/// needs ~1 GiB for the DIB alone): browsers, Office and most chat apps paste
+/// PNG directly, and targets that only understand CF_DIB get a normal paste
+/// error instead of the app dying on a failed allocation.
+pub fn set_clipboard_png(png: &[u8]) -> Result<()> {
+    let wide: Vec<u16> = "PNG".encode_utf16().chain([0]).collect();
+    let format = unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) };
+    if format == 0 {
+        return Err(Error::new("RegisterClipboardFormatW(PNG) failed"));
+    }
+    unsafe {
+        let hg = GlobalAlloc(GMEM_MOVEABLE, png.len())?;
+        let ptr = GlobalLock(hg) as *mut u8;
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hg));
+            return Err(Error::new("GlobalLock failed for PNG"));
+        }
+        std::ptr::copy_nonoverlapping(png.as_ptr(), ptr, png.len());
+        let _ = GlobalUnlock(hg);
+        if let Err(e) = OpenClipboard(Some(HWND::default())) {
+            let _ = GlobalFree(Some(hg));
+            return Err(e.into());
+        }
+        let _ = EmptyClipboard();
+        let handed_over = SetClipboardData(format, Some(HANDLE(hg.0)));
+        let _ = CloseClipboard();
+        match handed_over {
             Ok(_) => Ok(()),
             Err(e) => {
                 let _ = GlobalFree(Some(hg));
@@ -560,5 +609,18 @@ mod tests {
             let _ = GlobalUnlock(h);
             let _ = CloseClipboard();
         }
+    }
+
+    #[test]
+    fn dib_bytes_is_bounded_and_matches_the_header_math() {
+        let header = std::mem::size_of::<BITMAPINFOHEADER>();
+        assert_eq!(dib_bytes(0, 0), Some(header));
+        assert_eq!(dib_bytes(2, 3), Some(2 * 3 * 4 + header));
+        // The largest square the side caps allow is exactly 1 GiB + header,
+        // still inside the 1 GiB + 128 MiB budget.
+        assert_eq!(dib_bytes(16_384, 16_384), Some(1024 * 1024 * 1024 + header));
+        // One pixel over a side, and a wrapped u32 product, are refused.
+        assert_eq!(dib_bytes(16_385, 1), None);
+        assert_eq!(dib_bytes(u32::MAX, u32::MAX), None);
     }
 }

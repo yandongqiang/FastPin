@@ -230,6 +230,10 @@ pub struct Export {
     /// `{datetime}` (YYYYMMDD_HHMMSS) placeholders. Empty falls back to
     /// [`DEFAULT_FILENAME_TEMPLATE`].
     pub filename_template: String,
+    /// 完成截图时是否自动写文件。默认关闭，保持旧行为（完成只复制到剪贴板）。
+    pub auto_save: bool,
+    /// 完成截图时是否自动复制到剪贴板。默认开启，保持旧行为。
+    pub auto_copy: bool,
 }
 
 /// The name every build produced before this setting existed, so an untouched
@@ -242,6 +246,8 @@ impl Default for Export {
             format: ImageFormat::Png,
             quality: 90,
             filename_template: DEFAULT_FILENAME_TEMPLATE.to_string(),
+            auto_save: false,
+            auto_copy: true,
         }
     }
 }
@@ -1161,6 +1167,9 @@ mod tests {
             s.screenshot.watermark.position,
             Watermark::default().position
         );
+        // 旧文件没有这两个开关时回落到默认行为：只复制、不写文件。
+        assert!(!s.screenshot.export.auto_save);
+        assert!(s.screenshot.export.auto_copy);
         assert_eq!(s.hotkeys.region, Hotkeys::default().region);
         // A file written before the appearance field existed starts light.
         assert_eq!(s.appearance, APPEARANCE_LIGHT);
@@ -1207,6 +1216,33 @@ mod tests {
         );
         assert_eq!(after.ocr.models_dir, before.ocr.models_dir);
         assert_eq!(after.screenshot.annotation.stroke_color, "#FA3C3C");
+    }
+
+    /// 缺省值与旧行为一致：「完成」只复制，不写文件。
+    #[test]
+    fn export_auto_flags_default_to_clipboard_only() {
+        let export = Export::default();
+        assert!(!export.auto_save);
+        assert!(export.auto_copy);
+
+        // 从未写过这两个键的配置文件也必须保留这一行为。
+        let s = parse(r#"{"screenshot": {"export": {}}}"#);
+        assert!(!s.screenshot.export.auto_save);
+        assert!(s.screenshot.export.auto_copy);
+    }
+
+    #[test]
+    fn export_auto_flags_use_camel_case_keys_and_roundtrip() {
+        let s = parse(r#"{"screenshot": {"export": {"autoSave": true, "autoCopy": false}}}"#);
+        assert!(s.screenshot.export.auto_save);
+        assert!(!s.screenshot.export.auto_copy);
+
+        let json = serde_json::to_string(&s.screenshot.export).expect("serializes");
+        assert!(json.contains("\"autoSave\":true"), "{json}");
+        assert!(json.contains("\"autoCopy\":false"), "{json}");
+        let back: Export = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.auto_save, s.screenshot.export.auto_save);
+        assert_eq!(back.auto_copy, s.screenshot.export.auto_copy);
     }
 
     #[test]

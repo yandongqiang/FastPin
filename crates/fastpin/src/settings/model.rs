@@ -224,6 +224,16 @@ pub const ROWS: &[RowMeta] = &[
     },
     RowMeta {
         page: Page::Output,
+        title: "自动保存",
+        desc: "完成截图时自动把图片写入保存位置；关闭后「完成」不写文件。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "自动复制",
+        desc: "完成截图时自动把图片复制到剪贴板；与自动保存相互独立。",
+    },
+    RowMeta {
+        page: Page::Output,
         title: "水印文字",
         desc: "导出 PNG 时烧录的文字，留空则仅当勾选时间或设置了图片时显示。",
     },
@@ -331,6 +341,11 @@ pub const ROWS: &[RowMeta] = &[
         title: "提示词",
         desc: "留空则使用内置的翻译提示词。",
     },
+    RowMeta {
+        page: Page::Translate,
+        title: "明文 HTTP 警告",
+        desc: "http:// 接口携带 API Key 时需两次点击确认明文传输风险。",
+    },
     // 资源管理
     RowMeta {
         page: Page::Resources,
@@ -411,13 +426,18 @@ pub const ROWS: &[RowMeta] = &[
     // 关于
     RowMeta {
         page: Page::About,
-        title: "版本",
-        desc: "当前构建版本与构建类型。",
+        title: "FastPin",
+        desc: "轻量截图与文字识别工具。",
     },
     RowMeta {
         page: Page::About,
         title: "检查更新",
         desc: "从发布页获取最新版本。",
+    },
+    RowMeta {
+        page: Page::About,
+        title: "应用内下载",
+        desc: "流式下载官方安装包到下载目录，显示进度，不经浏览器。",
     },
 ];
 
@@ -532,6 +552,8 @@ mod tests {
         s.translation.timeout_seconds = 111;
         s.screenshot.hidden_toolbar_items = vec!["text".into(), "redo".into()];
         s.screenshot.save_dir = Some("D:/shots".into());
+        s.screenshot.export.auto_save = true;
+        s.screenshot.export.auto_copy = false;
         s.screenshot.annotation.stroke_width = 9.0;
         s.screenshot.annotation.stroke_color = "#123456".into();
         s.screenshot.annotation.mosaic_block = 32;
@@ -624,6 +646,19 @@ mod tests {
         }
     }
 
+    /// 自动保存 / 自动复制是两个独立开关，两行都要能被搜索到。
+    #[test]
+    fn auto_export_rows_are_searchable_on_output_page() {
+        for title in ["自动保存", "自动复制"] {
+            assert!(
+                search(title)
+                    .iter()
+                    .any(|r| r.title == title && r.page == Page::Output),
+                "search lost '{title}' on Page::Output"
+            );
+        }
+    }
+
     #[test]
     fn empty_query_matches_every_row() {
         assert_eq!(search("").len(), ROWS.len());
@@ -688,7 +723,10 @@ mod tests {
                     && s.screenshot.auto_scroll.notches == 1
             }
             Page::Output => {
-                s.screenshot.save_dir.is_none() && s.screenshot.watermark.text.is_empty()
+                s.screenshot.save_dir.is_none()
+                    && s.screenshot.watermark.text.is_empty()
+                    && !s.screenshot.export.auto_save
+                    && s.screenshot.export.auto_copy
             }
             Page::Hotkey => s.hotkeys.region == "Ctrl+Alt+A",
             Page::Appearance => s.appearance == "light",

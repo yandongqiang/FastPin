@@ -1086,22 +1086,25 @@ fn update_draft(draft: &mut Element, start: Point, current: Point) {
             draft.bounds = rect_from_points(start, current);
         }
         Shape::Spotlight { center, size, kind } => {
-            // Drag from press point sizes the cutout; the press point stays the
-            // centre. A circle forces width == height; an ellipse stretches with
-            // the drag; a rect sizes independently.
+            // Same corner-to-corner gesture as the Rect/Ellipse shapes: the
+            // press point is one corner and the cursor is the opposite one, so
+            // the cutout actually follows the mouse. The old code pinned the
+            // centre at the press point and only grew the size, which left the
+            // cursor outside the hole and felt unintuitive.
             let dx = (current.x - start.x).abs().max(1.0);
             let dy = (current.y - start.y).abs().max(1.0);
-            *size = match *kind {
+            let (w, h) = match *kind {
                 SpotlightKind::Circle => {
                     let d = dx.max(dy);
-                    gpui::Size::new(d as f32, d as f32)
+                    (d, d)
                 }
-                SpotlightKind::Ellipse | SpotlightKind::Rect => {
-                    gpui::Size::new(dx as f32, dy as f32)
-                }
+                SpotlightKind::Ellipse | SpotlightKind::Rect => (dx, dy),
             };
-            let w = size.width as f64;
-            let h = size.height as f64;
+            *center = Point {
+                x: (start.x + current.x) * 0.5,
+                y: (start.y + current.y) * 0.5,
+            };
+            *size = gpui::Size::new(w as f32, h as f32);
             draft.bounds = Rect::new(center.x - w * 0.5, center.y - h * 0.5, w, h);
         }
         Shape::Pen { points }
@@ -2087,11 +2090,12 @@ mod tests {
     }
 
     #[test]
-    fn spotlight_drag_sizes_the_cutout_from_press_point() {
+    fn spotlight_drag_covers_press_point_to_cursor() {
         let mut s = Session::new();
         s.tool = Tool::Spotlight;
         s.spotlight_kind = SpotlightKind::Rect;
-        // Press at (100, 100), drag to (140, 130) -> 40x30 rect centred at (100,100)
+        // Like the Rect shape: press at (100,100) is one corner, the cursor at
+        // (140,130) is the opposite one. The cursor stays on the cutout edge.
         s.pointer_pressed(pt(100.0, 100.0));
         s.pointer_moved(pt(140.0, 130.0));
         s.pointer_released();
@@ -2099,15 +2103,14 @@ mod tests {
         let el = &s.elements[0];
         match &el.shape {
             Shape::Spotlight { center, size, kind } => {
-                assert_eq!(*center, pt(100.0, 100.0));
+                assert_eq!(*center, pt(120.0, 115.0));
                 assert_eq!(size.width as f64, 40.0);
                 assert_eq!(size.height as f64, 30.0);
                 assert_eq!(*kind, SpotlightKind::Rect);
             }
             other => panic!("expected spotlight rect, got {other:?}"),
         }
-        // Bounds centred on press point: 80..120 x, 85..115 y
-        assert_eq!(el.bounds, Rect::new(80.0, 85.0, 40.0, 30.0));
+        assert_eq!(el.bounds, Rect::new(100.0, 100.0, 40.0, 30.0));
     }
 
     #[test]
@@ -2115,7 +2118,8 @@ mod tests {
         let mut s = Session::new();
         s.tool = Tool::Spotlight;
         s.spotlight_kind = SpotlightKind::Circle;
-        // Drag farther horizontally than vertically -> circle uses max dim
+        // Drag farther horizontally than vertically -> circle uses max dim,
+        // centred between the press point and the cursor.
         s.pointer_pressed(pt(100.0, 100.0));
         s.pointer_moved(pt(150.0, 110.0));
         s.pointer_released();
@@ -2123,13 +2127,14 @@ mod tests {
         let el = &s.elements[0];
         match &el.shape {
             Shape::Spotlight { center, size, kind } => {
-                assert_eq!(*center, pt(100.0, 100.0));
+                assert_eq!(*center, pt(125.0, 105.0));
                 assert_eq!(size.width as f64, 50.0);
                 assert_eq!(size.height as f64, 50.0);
                 assert_eq!(*kind, SpotlightKind::Circle);
             }
             other => panic!("expected spotlight circle, got {other:?}"),
         }
+        assert_eq!(el.bounds, Rect::new(100.0, 80.0, 50.0, 50.0));
     }
 
     #[test]

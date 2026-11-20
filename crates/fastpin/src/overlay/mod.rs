@@ -65,9 +65,11 @@ const MAG_COUNT: u32 = 15;
 const MAG_PIXEL: f32 = 10.0;
 const MIN_RECT: f64 = 5.0;
 
-/// Complete / Enter: clipboard only. Save writes a file.
+/// 完成 / Enter 按「输出」页的两个独立开关决定是否写文件与复制；
+/// 工具栏的保存按钮另有语义，只写文件、不复制（见 `save`）。
 fn complete_export_flags() -> (bool, bool) {
-    (false, true)
+    let export = crate::config::get().screenshot.export;
+    (export.auto_save, export.auto_copy)
 }
 
 /// C# RegionCaptureWindow: dash {5,5}, offset = elapsed * -15.
@@ -4735,9 +4737,16 @@ mod tests {
 
     #[test]
     fn complete_defaults_to_clipboard_not_file() {
+        // 标志现在来自配置；同一次读取做参照，避免本机 settings.json 的非缺省值
+        // 让测试变得不确定。缺省语义由 config 的 export 单测固定。
+        let export = crate::config::get().screenshot.export;
         let (write_file, copy) = complete_export_flags();
-        assert!(!write_file);
-        assert!(copy);
+        assert_eq!(write_file, export.auto_save);
+        assert_eq!(copy, export.auto_copy);
+
+        let default = crate::config::Export::default();
+        assert!(!default.auto_save);
+        assert!(default.auto_copy);
     }
 
     #[test]

@@ -14,7 +14,8 @@ pub mod widgets;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -376,6 +377,10 @@ pub struct SettingsView {
     update_checking: bool,
     /// (version, url) of a newer release, when the last check found one.
     update_available: Option<(String, String)>,
+    /// In-app installer download state, polled from a worker's progress channel.
+    update_downloading: bool,
+    update_progress: Option<crate::update::DownloadProgress>,
+    downloaded_installer: Option<PathBuf>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -529,6 +534,9 @@ impl SettingsView {
             history_filter: "all".to_string(),
             update_checking: false,
             update_available: None,
+            update_downloading: false,
+            update_progress: None,
+            downloaded_installer: None,
             _subscriptions: subscriptions,
         }
     }
@@ -750,6 +758,18 @@ impl SettingsView {
         } else {
             cx.notify();
         }
+    }
+
+    fn toggle_export_auto_save(&mut self, cx: &mut Context<Self>) {
+        let export = &mut self.settings.screenshot.export;
+        export.auto_save = !export.auto_save;
+        self.persist(cx);
+    }
+
+    fn toggle_export_auto_copy(&mut self, cx: &mut Context<Self>) {
+        let export = &mut self.settings.screenshot.export;
+        export.auto_copy = !export.auto_copy;
+        self.persist(cx);
     }
 
     fn set_scroll_interval(&mut self, ms: u32, cx: &mut Context<Self>) {
@@ -1501,6 +1521,93 @@ impl SettingsView {
         }
     }
 
+    /// Streams the installer in-app instead of handing the URL to a browser.
+    /// The downloader is blocking WinHTTP, so it runs on a dedicated thread and
+    /// reports progress over a channel that the UI task drains every 150 ms.
+    fn download_update(&mut self, cx: &mut Context<Self>) {
+        if self.update_downloading {
+            return;
+        }
+        let Some((version, _)) = self.update_available.clone() else {
+            return;
+        };
+        self.update_downloading = true;
+        self.update_progress = None;
+        self.downloaded_installer = None;
+        cx.notify();
+
+        enum Msg {
+            Progress(crate::update::DownloadProgress),
+            Done(std::result::Result<PathBuf, String>),
+        }
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        std::thread::spawn(move || {
+            let outcome = crate::update::download_release_asset(&version, |progress| {
+                let _ = tx.send(Msg::Progress(progress));
+            });
+            let _ = tx.send(Msg::Done(outcome.map_err(|e| e.to_string())));
+            flag.store(true, Ordering::Release);
+        });
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            while !finished.load(Ordering::Acquire) {
+                while let Ok(msg) = rx.try_recv() {
+                    let _ = this.update(cx, |this, cx| {
+                        match msg {
+                            Msg::Progress(p) => this.update_progress = Some(p),
+                            Msg::Done(Ok(path)) => {
+                                this.update_downloading = false;
+                                this.update_progress = None;
+                                this.downloaded_installer = Some(path);
+                                this.ok("安装包已下载");
+                            }
+                            Msg::Done(Err(e)) => {
+                                this.update_downloading = false;
+                                this.update_progress = None;
+                                this.fail(format!("下载失败：{e}"));
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+            }
+            // Drain the final Done message after the worker set its flag.
+            while let Ok(msg) = rx.try_recv() {
+                let _ = this.update(cx, |this, cx| {
+                    if let Msg::Done(Ok(path)) = msg {
+                        this.update_downloading = false;
+                        this.update_progress = None;
+                        this.downloaded_installer = Some(path);
+                        this.ok("安装包已下载");
+                    } else if let Msg::Done(Err(e)) = msg {
+                        this.update_downloading = false;
+                        this.update_progress = None;
+                        this.fail(format!("下载失败：{e}"));
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn open_downloaded_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.downloaded_installer.clone() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = crate::settings::system::open_folder(parent) {
+                self.fail(format!("打开下载目录失败：{e}"));
+                cx.notify();
+            }
+        }
+    }
+
     // ---- chrome ------------------------------------------------------------
 
     /// Caption drawn by the gpui-component `TitleBar`: the component owns the
@@ -2179,6 +2286,34 @@ impl SettingsView {
                     "可用 {date}（年月日）、{time}（时分秒）、{datetime}（两者）。留空使用默认名。",
                 )
                 .child(self.export_name.clone()),
+                widgets::row(
+                    "自动保存",
+                    "完成截图时自动把图片写入保存位置；关闭后「完成」不写文件。",
+                )
+                .child(widgets::control(
+                    widgets::toggle(
+                        "export-auto-save",
+                        self.settings.screenshot.export.auto_save,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.toggle_export_auto_save(cx)),
+                    ),
+                )),
+                widgets::row(
+                    "自动复制",
+                    "完成截图时自动把图片复制到剪贴板；与自动保存相互独立。",
+                )
+                .child(widgets::control(
+                    widgets::toggle(
+                        "export-auto-copy",
+                        self.settings.screenshot.export.auto_copy,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.toggle_export_auto_copy(cx)),
+                    ),
+                )),
                 widgets::stack(
                     "水印文字",
                     "导出时烧录的文字，留空则仅当勾选时间或设置了图片时显示。",
@@ -3030,6 +3165,37 @@ impl SettingsView {
                 cx.listener(|this, _, _, cx| this.check_update(cx)),
             )
         };
+        let download_label: SharedString = if let Some(path) = &self.downloaded_installer {
+            format!(
+                "打开目录（{}）",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )
+            .into()
+        } else if self.update_downloading {
+            match &self.update_progress {
+                Some(p) => format!("下载中… {}%", p.percent().unwrap_or(0)).into(),
+                None => "下载中…".into(),
+            }
+        } else if self.update_available.is_some() {
+            "应用内下载".into()
+        } else {
+            "检查更新后可用".into()
+        };
+        let download_button = widgets::button("update-download", download_label).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                if this.downloaded_installer.is_some() {
+                    this.open_downloaded_folder(cx);
+                } else if this.update_available.is_some() {
+                    this.download_update(cx);
+                } else {
+                    // Never leave a visible button silently dead: explain what
+                    // has to happen before it can do anything.
+                    this.ok("请先检查更新");
+                    cx.notify();
+                }
+            }),
+        );
         let version: SharedString = format!(
             "v{}{}",
             crate::update::current_version(),
@@ -3045,6 +3211,11 @@ impl SettingsView {
                 .child(widgets::control(widgets::muted_text(version))),
             widgets::row("检查更新", "从发布页获取最新版本。")
                 .child(widgets::control(update_button)),
+            widgets::row(
+                "应用内下载",
+                "下载官方安装包到 %LOCALAPPDATA%\\FastPin\\downloads，不经过浏览器。",
+            )
+            .child(widgets::control(download_button)),
         ])
     }
 

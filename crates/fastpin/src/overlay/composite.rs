@@ -1097,6 +1097,22 @@ fn apply_watermark(buf: &mut Bgra<'_>, width: u32, height: u32, wm: &Watermark) 
     let alpha = (wm.opacity.clamp(10, 100) as f64 / 100.0).max(0.0);
     let position = WatermarkPosition::from_key(&wm.position);
     if let Some((px, w, h)) = load_watermark_image(wm) {
+        // The size control promises to scale "text or image"; honour it for
+        // images too instead of silently ignoring the setting.
+        let Some((nw, nh)) = scaled_watermark_dims(w, h, wm.scale as f64) else {
+            return;
+        };
+        let (px, w, h) = if (nw, nh) == (w, h) {
+            (px, w, h)
+        } else {
+            let Some(src) = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(w, h, &px)
+            else {
+                return;
+            };
+            let resized =
+                image::imageops::resize(&src, nw, nh, image::imageops::FilterType::Triangle);
+            (resized.into_raw(), nw, nh)
+        };
         let (ox, oy) = watermark_origin((width, height), (w, h), position, margin);
         blend_premult_layer(buf, ox, oy, width, height, &px, w, h, alpha);
         return;
@@ -1115,6 +1131,20 @@ fn apply_watermark(buf: &mut Bgra<'_>, width: u32, height: u32, wm: &Watermark) 
         let (ox, oy) = watermark_origin((width, height), (w, h), position, margin);
         blend_premult_layer(buf, ox, oy, width, height, &px, w, h, alpha);
     }
+}
+
+/// Dimensions of a watermark after applying the shared size control. Pure so
+/// the text and image branches cannot drift, and so the budget decision can be
+/// unit-tested without loading a real image.
+fn scaled_watermark_dims(w: u32, h: u32, scale: f64) -> Option<(u32, u32)> {
+    let scale = scale.clamp(0.5, 3.0);
+    if (scale - 1.0).abs() < f64::EPSILON {
+        return Some((w, h));
+    }
+    let nw = ((w as f64 * scale).round() as u32).max(1);
+    let nh = ((h as f64 * scale).round() as u32).max(1);
+    BUDGET.checked_bytes(nw as u64, nh as u64, 4).ok()?;
+    Some((nw, nh))
 }
 
 /// Top-left corner of a `text`-sized layer inside a `canvas`, kept `margin`
@@ -2346,6 +2376,16 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn watermark_scale_applies_to_images_and_stays_budgeted() {
+        assert_eq!(scaled_watermark_dims(40, 20, 1.0), Some((40, 20)));
+        assert_eq!(scaled_watermark_dims(40, 20, 2.0), Some((80, 40)));
+        assert_eq!(scaled_watermark_dims(40, 20, 0.5), Some((20, 10)));
+        // Clamped to the same [0.5, 3.0] range the text branch uses.
+        assert_eq!(scaled_watermark_dims(10, 10, 9.0), Some((30, 30)));
+        assert_eq!(scaled_watermark_dims(10, 10, 0.01), Some((5, 5)));
     }
 
     #[test]

@@ -1741,8 +1741,10 @@ impl Render for PinView {
         let mut cursor = CursorStyle::Arrow;
         let mut edit_paint = None;
         let mut text_layer = None;
+        let mut preparing = false;
         if let (Some(edit), Some(offset)) = (editing.as_ref(), self.edit_offset(window)) {
             let e = edit.borrow();
+            preparing = e.preparing;
             let marks: Vec<Element> = e.session.visible().cloned().collect();
             let masks = annotate::mark_masks(&e.mask_cache, &marks);
             let mosaic = annotate::mosaic_tiles(&e.mosaic_cache, &marks, e.extent, |x, y, w, h| {
@@ -1865,6 +1867,22 @@ impl Render for PinView {
                     .child(mouse_layer)
                     .children(text_layer),
             )
+            // The backdrop is composed on a worker. Show a visible state while
+            // it is not ready instead of silently accepting strokes that cannot
+            // yet sample the image for mosaic effects.
+            .when(preparing, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(6.))
+                        .left(px(6.))
+                        .rounded_md()
+                        .bg(hsla(0., 0., 0., 0.7))
+                        .text_color(white())
+                        .text_size(px(12.))
+                        .child("合成中…"),
+                )
+            })
             // A close affordance that does not cover small pins: under 48
             // logical px on either side, Esc / double-click remain the way out.
             .children(close_here.then(|| {

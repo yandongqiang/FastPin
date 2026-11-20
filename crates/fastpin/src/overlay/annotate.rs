@@ -230,7 +230,7 @@ pub fn handle_common_toolbar(
         session.spotlight_kind = match id {
             toolbar::SPOTLIGHT_RECT => SpotlightKind::Rect,
             toolbar::SPOTLIGHT_ELLIPSE => SpotlightKind::Ellipse,
-            toolbar::SPOTLIGHT_CIRCLE => SpotlightKind::Ellipse, // circle = ellipse with equal width/height at draw time
+            toolbar::SPOTLIGHT_CIRCLE => SpotlightKind::Circle,
             _ => session.spotlight_kind,
         };
         crate::perf::log_diag(&format!("spotlight kind -> {:?}", session.spotlight_kind));
@@ -1612,6 +1612,27 @@ mod tests {
                 PropCell::Btn(toolbar::SPOTLIGHT_CIRCLE),
             ]
         );
+    }
+
+    #[test]
+    fn spotlight_kind_buttons_set_the_matching_kind() {
+        for (id, want) in [
+            (toolbar::SPOTLIGHT_RECT, SpotlightKind::Rect),
+            (toolbar::SPOTLIGHT_ELLIPSE, SpotlightKind::Ellipse),
+            (toolbar::SPOTLIGHT_CIRCLE, SpotlightKind::Circle),
+        ] {
+            let mut s = Session::new();
+            let mut text = None;
+            let mut color_open = false;
+            assert!(handle_common_toolbar(
+                &mut s,
+                &mut text,
+                &mut color_open,
+                id
+            ));
+            assert_eq!(s.tool, Tool::Spotlight, "{id}");
+            assert_eq!(s.spotlight_kind, want, "{id} must set its own kind");
+        }
     }
 
     /// A variant button on the row switches the tool and leaves the row (and

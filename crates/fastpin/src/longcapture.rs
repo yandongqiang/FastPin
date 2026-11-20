@@ -1545,6 +1545,9 @@ pub struct Stitcher {
     /// previous one instead of restarting at a frame's height -- that is what
     /// turns "a copy every N ticks" into "a copy at every doubling".
     head_grant: usize,
+    /// Process-wide ledger reservations for the physical buffer. Grows with
+    /// the canvas and is released when the stitcher (session) is dropped.
+    permits: Vec<crate::image_budget::MemoryPermit>,
     stats: StitchStats,
 }
 
@@ -1573,6 +1576,7 @@ impl Stitcher {
             });
         }
         let pixels = BUDGET.alloc_rgba(width as u64, first_frame_height as u64)?;
+        let permit = crate::image_budget::try_reserve(pixels.len() as u64)?;
         let mut heights = Vec::new();
         heights.try_reserve_exact(1).map_err(|_| {
             StitchError::Budget(BudgetError::AllocFailed {
@@ -1587,6 +1591,7 @@ impl Stitcher {
             pixels,
             head_rows: 0,
             head_grant: 0,
+            permits: vec![permit],
             stats: StitchStats {
                 copied_bytes: 0,
                 compactions: 0,
@@ -1661,7 +1666,12 @@ impl Stitcher {
         if BUDGET.checked_len(physical as u64).is_err() {
             self.drop_headroom();
         }
-        BUDGET.try_grow(&mut self.pixels, extra)?;
+        let permit = crate::image_budget::try_reserve(extra as u64)?;
+        if let Err(e) = BUDGET.try_grow(&mut self.pixels, extra) {
+            drop(permit);
+            return Err(e.into());
+        }
+        self.permits.push(permit);
         self.heights.try_reserve(1).map_err(|_| {
             StitchError::Budget(BudgetError::AllocFailed {
                 bytes: std::mem::size_of::<usize>() as u64,
@@ -1740,12 +1750,16 @@ impl Stitcher {
                     .ok_or(StitchError::Budget(BudgetError::AllocFailed {
                         bytes: u64::MAX,
                     }))?;
+            // Reserve the replacement before allocating it: many live pins
+            // plus a growing canvas must stay under the process-wide ceiling.
+            let permit = crate::image_budget::try_reserve(physical as u64)?;
             let mut pixels = Vec::new();
-            pixels.try_reserve_exact(physical).map_err(|_| {
-                StitchError::Budget(BudgetError::AllocFailed {
+            if pixels.try_reserve_exact(physical).is_err() {
+                drop(permit);
+                return Err(StitchError::Budget(BudgetError::AllocFailed {
                     bytes: physical as u64,
-                })
-            })?;
+                }));
+            }
             let pad = (head - new_rows) * row_bytes;
             // The front of the headroom stays zeroed; only the padding is
             // written here, never the image.
@@ -1756,6 +1770,8 @@ impl Stitcher {
             self.stats.compactions += 1;
             self.stats.allocations += 1;
             self.pixels = pixels;
+            self.permits.clear(); // old buffer was dropped above
+            self.permits.push(permit);
             self.head_rows = head - new_rows;
             self.head_grant = head;
         }

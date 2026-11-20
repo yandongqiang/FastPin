@@ -302,6 +302,17 @@ pub fn show_pin(
         crate::perf::log_app("pin: pixel buffer size mismatch");
         return;
     };
+    // A pin keeps one BGRA copy plus the render-image copy for its whole life.
+    // Reserve both against the process-wide ceiling so many pins cannot add up
+    // to an OOM even though each one passes the single-buffer check.
+    let held = (pixels.len() as u64).saturating_mul(2);
+    let permit = match crate::image_budget::try_reserve(held) {
+        Ok(permit) => permit,
+        Err(e) => {
+            crate::perf::log_app(&format!("pin refused: {e}"));
+            return;
+        }
+    };
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
     bind_pin_keys(cx);
@@ -327,7 +338,7 @@ pub fn show_pin(
             window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| PinView::new(cx, id, image, pixels, w, h, window)),
+        |_window, cx| cx.new(|cx| PinView::new(cx, id, image, pixels, permit, w, h)),
     ) {
         Ok(handle) => handle,
         Err(e) => {
@@ -609,6 +620,8 @@ pub struct PinView {
     image: Arc<RenderImage>,
     /// Tight BGRA at native size, kept for compositing a group.
     pixels: Arc<Vec<u8>>,
+    /// Process-wide ledger reservation for the two buffers held by this pin.
+    permit: crate::image_budget::MemoryPermit,
     /// Physical pixel size of the flattened crop.
     pixel_size: (u32, u32),
     zoom: f32,
@@ -635,14 +648,15 @@ impl PinView {
         id: u64,
         image: Arc<RenderImage>,
         pixels: Arc<Vec<u8>>,
+        permit: crate::image_budget::MemoryPermit,
         w: u32,
         h: u32,
-        _window: &mut Window,
     ) -> Self {
         Self {
             id,
             image,
             pixels,
+            permit,
             pixel_size: (w.max(1), h.max(1)),
             zoom: 1.0,
             layout_rect: None,
@@ -695,6 +709,15 @@ impl PinView {
         let Some(image) = render_image(&pixels, w, h) else {
             return;
         };
+        let held = (pixels.len() as u64).saturating_mul(2);
+        let permit = match crate::image_budget::try_reserve(held) {
+            Ok(permit) => permit,
+            Err(e) => {
+                crate::perf::log_app(&format!("pin edit refused: {e}"));
+                return;
+            }
+        };
+        self.permit = permit; // releases the old reservation
         self.pixels = pixels;
         self.image = image;
         self.pixel_size = (w.max(1), h.max(1));

@@ -12,6 +12,7 @@
 //! budgets and exercise each limit without allocating gigabytes.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Longest side of any image the app will allocate. Matches
 /// `pin_snap::MAX_CANVAS_SIDE`, the long-capture `LONG_MAX_H` (applied to the
@@ -82,6 +83,13 @@ pub enum BudgetError {
     AllocFailed {
         bytes: u64,
     },
+    /// This single buffer is legal, but together with the live buffers the
+    /// process is already holding it would exceed the adaptive global ceiling.
+    GlobalLimit {
+        needed: u64,
+        live: u64,
+        limit: u64,
+    },
 }
 
 impl fmt::Display for BudgetError {
@@ -146,6 +154,14 @@ impl fmt::Display for BudgetError {
             BudgetError::AllocFailed { bytes } => {
                 write!(f, "could not allocate {bytes} bytes for an image")
             }
+            BudgetError::GlobalLimit {
+                needed,
+                live,
+                limit,
+            } => write!(
+                f,
+                "{needed} more bytes would exceed the global image limit ({live} held, {limit} allowed)"
+            ),
         }
     }
 }
@@ -343,6 +359,90 @@ impl ImageBudget {
 /// The budget every production path uses.
 pub const BUDGET: ImageBudget = ImageBudget::STANDARD;
 
+// ---- process-wide ledger -------------------------------------------------
+//
+// `ImageBudget` checks one buffer at a time. Ten individually legal 4K pins
+// can still add up to well over a gigabyte, so the long-lived buffers hold a
+// `MemoryPermit` whose Drop releases the reservation when the buffer dies.
+
+static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// A reservation of `bytes` bytes against the adaptive global ceiling. Dropped
+/// automatically with the buffer that owns it.
+#[derive(Debug)]
+pub struct MemoryPermit {
+    bytes: u64,
+}
+
+impl Drop for MemoryPermit {
+    fn drop(&mut self) {
+        // Releases underflow only if a permit were duplicated by hand; the
+        // type is not Clone, so `fetch_sub` is always balanced by `try_reserve`.
+        LIVE_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// Bytes currently reserved by long-lived image buffers. For diagnostics.
+pub fn live_bytes() -> u64 {
+    LIVE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Available physical memory, when the platform can report it.
+fn available_phys() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GlobalMemoryStatusEx(&mut status) }.is_ok() {
+            return Some(status.ullAvailPhys);
+        }
+    }
+    #[cfg(not(windows))]
+    {}
+    None
+}
+
+/// Process-wide ceiling for tracked buffers. One quarter of available RAM, at
+/// least the single-buffer ceiling (so a legal capture is never refused) and
+/// never more than four of them. Falls back to two single-buffer ceilings when
+/// the platform cannot report memory.
+pub fn global_limit() -> u64 {
+    const MIN: u64 = 256 * 1024 * 1024;
+    let fallback = MAX_BYTES.saturating_mul(2);
+    let adaptive = available_phys()
+        .map(|avail| (avail / 4).clamp(MIN, MAX_BYTES.saturating_mul(4)))
+        .unwrap_or(fallback);
+    adaptive.max(MAX_BYTES)
+}
+
+/// Reserves `bytes` bytes against [`global_limit`]. On success the caller owns
+/// a `MemoryPermit`; dropping it (with the buffer) returns the reservation.
+pub fn try_reserve(bytes: u64) -> Result<MemoryPermit, BudgetError> {
+    let limit = global_limit();
+    let mut live = LIVE_BYTES.load(Ordering::Relaxed);
+    loop {
+        let next = live.checked_add(bytes).ok_or(BudgetError::Overflow {
+            width: bytes,
+            height: 1,
+            bytes_per_pixel: 1,
+        })?;
+        if next > limit {
+            return Err(BudgetError::GlobalLimit {
+                needed: bytes,
+                live,
+                limit,
+            });
+        }
+        match LIVE_BYTES.compare_exchange_weak(live, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return Ok(MemoryPermit { bytes }),
+            Err(actual) => live = actual,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +597,18 @@ mod tests {
         // One pixel over either side is still refused.
         assert!(b.checked_bytes(16_385, 16_384, 4).is_err());
         assert!(b.checked_bytes(16_384, 16_385, 4).is_err());
+    }
+
+    #[test]
+    fn global_ledger_reports_overflow_and_tracks_a_permit() {
+        assert!(global_limit() >= MAX_BYTES);
+        // With nothing live, `0 + u64::MAX` does not overflow — the global
+        // limit (not the arithmetic) is what refuses it.
+        assert!(try_reserve(u64::MAX).is_err());
+        let before = live_bytes();
+        let permit = try_reserve(4096).expect("a small reservation fits");
+        assert!(live_bytes() >= before + 4096);
+        drop(permit); // balanced; other tests may reserve concurrently
     }
 
     #[test]

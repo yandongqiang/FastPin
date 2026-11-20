@@ -234,26 +234,37 @@ impl SplitWindowView {
                 return;
             }
         };
-        let result = export_split_images(
-            &self.pixels,
-            &self.layout,
-            self.format,
-            self.quality,
-            &parent,
-            &self.image_name,
-        );
-        if result.succeeded() {
-            self.status = format!(
-                "已导出 {} 张到 {}",
-                result.saved_count,
-                result.directory.display()
-            )
-            .into();
-        } else {
-            self.status = format!("导出失败：{}", result.error).into();
-        }
-        self.export_result = Some(result);
+        // 克隆所需输入后把 WIC 编码与写盘移到后台线程，避免块数多时冻结 UI。
+        let pixels = self.pixels.clone();
+        let layout = self.layout.clone();
+        let format = self.format;
+        let quality = self.quality;
+        let image_name = self.image_name.clone();
+        self.status = "导出中…".into();
+        self.export_result = None;
         cx.notify();
+
+        let task = cx.background_spawn(async move {
+            export_split_images(&pixels, &layout, format, quality, &parent, &image_name)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if result.succeeded() {
+                    this.status = format!(
+                        "已导出 {} 张到 {}",
+                        result.saved_count,
+                        result.directory.display()
+                    )
+                    .into();
+                } else {
+                    this.status = format!("导出失败：{}", result.error).into();
+                }
+                this.export_result = Some(result);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn on_open_folder(&mut self, _cx: &mut Context<Self>) {

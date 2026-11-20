@@ -9,11 +9,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
-    div, prelude::*, px, size, App, Bounds, Context, FocusHandle, Focusable, Point as GpuiPoint,
-    Render, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions,
+    div, prelude::*, px, size, App, AsyncApp, Bounds, Context, FocusHandle, Focusable,
+    Point as GpuiPoint, Render, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions,
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -62,8 +63,13 @@ pub struct GroupEdit {
     /// or zoom while editing, so it stays valid.
     pub origin: (i32, i32),
     pub extent: (u32, u32),
-    /// The group composited in screen pixels, for mosaic averaging.
+    /// The group composited in screen pixels, for mosaic averaging. Filled by
+    /// a worker after `start`; until then effects that read it are skipped.
     backdrop: Vec<u8>,
+    /// True while the worker is composing the backdrop.
+    pub preparing: bool,
+    /// Identifies this session so a compose finishing after a cancel is ignored.
+    epoch: u64,
     pub mask_cache: MaskCache,
     pub mosaic_cache: MosaicCache,
     toolbar: Option<WindowHandle<PinToolbar>>,
@@ -81,6 +87,9 @@ impl GroupEdit {
 
     /// BGRA pixels of an edit-space rect, tight stride.
     pub fn readback(&self, x: u32, y: u32, w: u32, h: u32) -> Option<(Vec<u8>, u32, u32, u32)> {
+        if self.preparing {
+            return None; // backdrop not ready yet; effects skip until it is
+        }
         let rect = IRect::from_origin_size(x as i32, y as i32, w as i32, h as i32);
         let px = crop(&self.backdrop, self.extent.0, self.extent.1, rect)?;
         Some((px, w, h, w * 4))
@@ -91,6 +100,8 @@ thread_local! {
     static EDITS: RefCell<HashMap<u64, Rc<RefCell<GroupEdit>>>> = RefCell::new(HashMap::new());
 }
 
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
 pub fn edit_for_group(group: u64) -> Option<Rc<RefCell<GroupEdit>>> {
     EDITS.with(|slot| slot.borrow().get(&group).cloned())
 }
@@ -100,6 +111,12 @@ pub fn is_editing(group: u64) -> bool {
 }
 
 /// Opens an edit over `group`, whose current tiles are `tiles`.
+///
+/// The backdrop is composited on a worker: a large group used to freeze the UI
+/// between the key press and the toolbar appearing. The session is inserted
+/// immediately with an empty backdrop and `preparing = true`; the worker's
+/// result is installed back on the UI thread, guarded by an epoch so a compose
+/// finishing after a cancel cannot resurrect the edit.
 pub(crate) fn start(cx: &mut App, group: u64, tiles: &[TileSnapshot]) {
     if is_editing(group) || tiles.is_empty() {
         return;
@@ -108,32 +125,29 @@ pub(crate) fn start(cx: &mut App, group: u64, tiles: &[TileSnapshot]) {
         .iter()
         .skip(1)
         .fold(tiles[0].rect, |acc, t| acc.union(&t.rect));
-    // Zoom 1 for every tile forces a screen-pixel canvas: the backdrop is
-    // what the user sees, resampled tiles included.
-    let images: Vec<TileImage> = tiles
+    let owned: Vec<TileSnapshot> = tiles
         .iter()
-        .map(|t| TileImage {
-            rect: t.rect.precise(),
-            pixels: t.pixels.as_slice(),
-            width: t.size.0,
-            height: t.size.1,
-            zoom: 1.0,
+        .map(|t| TileSnapshot {
+            id: t.id,
+            rect: t.rect,
+            precise_rect: t.precise_rect,
+            pixels: t.pixels.clone(),
+            size: t.size,
+            zoom: t.zoom,
         })
         .collect();
-    let (backdrop, bw, bh) = match compose(&images) {
-        Ok(v) => v,
-        Err(e) => {
-            crate::perf::log_app(&format!("pin edit: {e}"));
-            return;
-        }
-    };
+    let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
     let edit = Rc::new(RefCell::new(GroupEdit {
         session: Session::new(),
         text: None,
         color_open: false,
         origin: (bbox.left, bbox.top),
-        extent: (bw, bh),
-        backdrop,
+        // Filled in by the worker; effects that read the backdrop skip while
+        // preparing, and the toolbar is already usable.
+        extent: (bbox.width().max(1) as u32, bbox.height().max(1) as u32),
+        backdrop: Vec::new(),
+        preparing: true,
+        epoch,
         mask_cache: RefCell::new(None),
         mosaic_cache: RefCell::new(None),
         toolbar: None,
@@ -142,6 +156,45 @@ pub(crate) fn start(cx: &mut App, group: u64, tiles: &[TileSnapshot]) {
     let toolbar = open_toolbar(cx, group, bbox);
     edit.borrow_mut().toolbar = toolbar;
     pin::refresh_group(cx, group);
+
+    let task = cx.background_executor().spawn(async move {
+        // Zoom 1 for every tile forces a screen-pixel canvas: the backdrop is
+        // what the user sees, resampled tiles included.
+        let images: Vec<TileImage> = owned
+            .iter()
+            .map(|t| TileImage {
+                rect: t.rect.precise(),
+                pixels: t.pixels.as_slice(),
+                width: t.size.0,
+                height: t.size.1,
+                zoom: 1.0,
+            })
+            .collect();
+        compose(&images).ok()
+    });
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let composed = task.await;
+        cx.update(|cx: &mut App| {
+            let Some(edit) = EDITS.with(|slot| slot.borrow().get(&group).cloned()) else {
+                return;
+            };
+            let mut edit = edit.borrow_mut();
+            if edit.epoch != epoch {
+                return; // cancelled and reopened while the worker ran
+            }
+            match composed {
+                Some((backdrop, bw, bh)) => {
+                    edit.extent = (bw, bh);
+                    edit.backdrop = backdrop;
+                }
+                None => crate::perf::log_app("pin edit: backdrop compose failed"),
+            }
+            edit.preparing = false;
+            drop(edit);
+            pin::refresh_group(cx, group);
+        });
+    })
+    .detach();
 }
 
 /// Ends the edit. With `commit`, the marks are rasterized onto the tiles:
@@ -191,6 +244,56 @@ pub(crate) fn finish(
     }
     pin::refresh_group(cx, group);
     leftover
+}
+
+/// Ends an edit with `commit` on a worker thread. The cancel path has no pixel
+/// work and stays synchronous; only 完成 composes + rasterizes off-thread.
+/// Results are applied to every member handle on the UI thread, so the caller
+/// no longer has to carry a "leftover" tile back into its own view.
+pub(crate) fn finish_async(cx: &mut App, group: u64, commit: bool, tiles: Vec<TileSnapshot>) {
+    if !commit {
+        let _ = finish(cx, group, false, Vec::new());
+        return;
+    }
+    let Some(edit) = EDITS.with(|slot| slot.borrow_mut().remove(&group)) else {
+        return;
+    };
+    let elements = {
+        let mut e = edit.borrow_mut();
+        if let Some(toolbar) = e.toolbar.take() {
+            let _ = toolbar.update(cx, |_, window, _| window.remove_window());
+        }
+        e.commit_drafts();
+        e.session.elements.clone()
+    };
+    if elements.is_empty() {
+        pin::refresh_group(cx, group);
+        return;
+    }
+
+    let task = cx
+        .background_executor()
+        .spawn(async move { flatten(&elements, &tiles) });
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let applied = task.await;
+        cx.update(|cx: &mut App| {
+            // A new session opened while we were compositing owns the group
+            // now; do not push stale pixels into it.
+            if EDITS.with(|slot| slot.borrow().contains_key(&group)) {
+                return;
+            }
+            for (id, px, w, h, zoom) in applied {
+                if let Some(handle) = pin::entry_handle(id) {
+                    let _ = handle.update(cx, |view, _, cx| {
+                        view.replace_pixels(px, w, h, zoom);
+                        cx.notify();
+                    });
+                }
+            }
+            pin::refresh_group(cx, group);
+        });
+    })
+    .detach();
 }
 
 /// Rasterizes `elements` (edit space) over the tiles and returns each tile's
@@ -668,6 +771,8 @@ mod tests {
             origin: (0, 0),
             extent: (100, 100),
             backdrop: Vec::new(),
+            preparing: false,
+            epoch: 0,
             mask_cache: RefCell::new(None),
             mosaic_cache: RefCell::new(None),
             toolbar: None,

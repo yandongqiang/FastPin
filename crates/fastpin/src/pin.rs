@@ -893,11 +893,9 @@ impl PinView {
         } else {
             Vec::new()
         };
-        for (id, px, w, h, zoom) in pin_edit::finish(cx, group, commit, tiles) {
-            if id == self.id {
-                self.replace_pixels(px, w, h, zoom);
-            }
-        }
+        // 完成 composites + rasterizes on a worker; the result is applied to
+        // every group member (including this view) back on the UI thread.
+        pin_edit::finish_async(cx, group, commit, tiles);
         self.edit_down = None;
         cx.notify();
     }

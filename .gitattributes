@@ -1,0 +1,6 @@
+# Normalize text files in the index. On Windows this matches the usual
+# core.autocrlf=true setup (CRLF in the working tree, LF in the repository).
+# Scripts and patches must stay LF so they remain runnable / applicable.
+* text=auto
+*.sh text eol=lf
+*.patch text eol=lf

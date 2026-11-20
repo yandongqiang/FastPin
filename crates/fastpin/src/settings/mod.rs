@@ -6,22 +6,25 @@
 //! Only pages whose settings this build can actually honour carry controls;
 //! the rest say so in a disabled row instead of offering dead switches.
 
-mod model;
+pub(crate) mod model;
 pub(crate) mod system;
 pub mod text_input;
 pub mod widgets;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gpui::{
-    deferred, div, img, prelude::*, px, size, App, Bounds, Context, CursorStyle, Entity, Focusable,
-    FontWeight, ImageSource, MouseButton, RenderImage, SharedString, Subscription, Window,
-    WindowBounds, WindowHandle, WindowOptions,
+    deferred, div, img, prelude::*, px, size, App, AsyncApp, Bounds, Context, CursorStyle, Entity,
+    Focusable, FontWeight, ImageSource, MouseButton, RenderImage, SharedString, Subscription,
+    Window, WindowBounds, WindowHandle, WindowOptions,
 };
 
 use crate::config::Settings;
+use crate::history::{HistoryRecord, HistoryStore};
 use crate::hotkey::{self, Hotkey, HotkeyAction, HotkeyBindings};
 use crate::overlay::{theme, toolbar};
 use model::{Page, RowMeta};
@@ -102,7 +105,14 @@ pub fn open(cx: &mut App) {
     );
 
     match opened {
-        Ok(handle) => SETTINGS_WINDOW.with(|slot| *slot.borrow_mut() = Some(handle)),
+        Ok(handle) => {
+            // Populate the embedded history grid up front so the History page
+            // shows real thumbnails even when reached without a nav click.
+            handle
+                .update(cx, |view, _, cx| view.load_history_on_open(cx))
+                .ok();
+            SETTINGS_WINDOW.with(|slot| *slot.borrow_mut() = Some(handle))
+        }
         Err(e) => eprintln!("settings window: {e}"),
     }
 }
@@ -197,7 +207,16 @@ enum SelectId {
     WaterPosition,
     WaterOpacity,
     WaterScale,
+    ExportFormat,
+    ExportQuality,
+    SmartSelection,
+    AutoScrollInterval,
+    AutoScrollNotches,
+    HistoryRetention,
+    HistoryLimit,
+    HistoryDisk,
     Appearance,
+    HistoryFilter,
 }
 
 /// (label, position key) presets for the watermark 9-grid.
@@ -226,6 +245,15 @@ const WM_SCALES: [(&str, f32); 4] = [
     ("特大 3x", 3.0),
 ];
 
+/// (label, value) presets for the JPG/WebP quality dropdown. PNG ignores it.
+const EXPORT_QUALITIES: [(&str, u8); 5] = [
+    ("60%（最小）", 60),
+    ("75%", 75),
+    ("85%", 85),
+    ("90%（推荐）", 90),
+    ("100%（最大）", 100),
+];
+
 /// (label, value) presets for the annotation dropdowns.
 const STROKE_WIDTHS: [(&str, f64); 4] = [
     ("细 2 px", 2.0),
@@ -239,6 +267,18 @@ const MOSAIC_BLOCKS: [(&str, i32); 4] = [
     ("大 24 px", 24),
     ("特大 32 px", 32),
 ];
+
+/// (label, milliseconds) presets for the long-capture auto-scroll beat. Values
+/// stay inside scroll_step's `[128, 1000] ms` range so a persisted pick is never
+/// silently clamped to something other than what the dropdown showed.
+const SCROLL_INTERVALS: [(&str, u32); 4] = [
+    ("快 200 ms", 200),
+    ("标准 600 ms", 600),
+    ("慢 800 ms", 800),
+    ("最慢 1000 ms", 1000),
+];
+/// (label, notches) presets; same reasoning as [`SCROLL_INTERVALS`].
+const SCROLL_NOTCHES: [(&str, u32); 4] = [("1 格", 1), ("2 格", 2), ("4 格", 4), ("8 格", 8)];
 
 pub struct SettingsView {
     page: Page,
@@ -260,14 +300,40 @@ pub struct SettingsView {
     timeout: Entity<TextInput>,
     prompt: Entity<TextInput>,
     wm_text: Entity<TextInput>,
+    /// Export file-name template. Persists as typed; a blank field falls back
+    /// to `config::DEFAULT_FILENAME_TEMPLATE` when a file is actually named.
+    export_name: Entity<TextInput>,
     search: Entity<TextInput>,
     /// The global reset asks for a second click; a single stray press must not
     /// wipe every setting.
     confirm_reset_all: bool,
+    /// Two-click arming for the plaintext-HTTP API Key warning. The second click
+    /// persists `allowInsecureHttp`, so the runtime guard and this banner agree.
+    http_warn_confirm: bool,
     /// Sizes for the Data page, sampled when the window opens and after a
     /// cleanup — never on every frame.
     data_bytes: u64,
     log_bytes: u64,
+    /// Embedded "历史图片" gallery state. The standalone Page::History renders
+    /// the same grid as the dedicated gallery window, so the images are visible
+    /// the moment the user opens the nav option instead of a near-empty page.
+    history_records: Vec<HistoryRecord>,
+    history_thumbs: HashMap<String, Option<Arc<RenderImage>>>,
+    /// Modification time (unix millis) of the image each cached thumb was built
+    /// from. A cached thumb is reused only while this still matches the file.
+    history_thumb_mtime: HashMap<String, u64>,
+    history_thumb_seq: u64,
+    history_status: SharedString,
+    /// Incremented on every history status change so an older auto-fade timer
+    /// cannot clear a newer message.
+    history_status_seq: u64,
+    history_selected: Option<String>,
+    /// Destructive history actions ask for a second click, matching the global
+    /// reset pattern: the first click arms, the second performs the action.
+    history_confirm_delete: bool,
+    history_confirm_clear: bool,
+    /// Source filter for the embedded gallery ("all" / a record source string).
+    history_filter: String,
     /// In-flight update check guards against double clicks.
     update_checking: bool,
     /// (version, url) of a newer release, when the last check found one.
@@ -297,6 +363,15 @@ impl SettingsView {
         });
         let search = cx.new(|cx| TextInput::new(cx, "", "搜索所有配置...", false).flat());
 
+        let export_name = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                settings.screenshot.export.filename_template.clone(),
+                crate::config::DEFAULT_FILENAME_TEMPLATE,
+                false,
+            )
+        });
+
         let mut subscriptions = Vec::new();
 
         // Every field compares before storing: the inputs notify on cursor moves
@@ -304,6 +379,12 @@ impl SettingsView {
         subscriptions.push(cx.observe(&base_url, |this, input, cx| {
             let value = input.read(cx).text().to_string();
             if this.settings.translation.base_url != value {
+                // A confirmation only applies to the http:// endpoint it was
+                // given for; switching to https:// must revoke it.
+                if !crate::translate::is_insecure_http(&value) {
+                    this.settings.translation.allow_insecure_http = false;
+                }
+                this.http_warn_confirm = false;
                 this.settings.translation.base_url = value;
                 this.persist(cx);
             }
@@ -328,6 +409,17 @@ impl SettingsView {
             let value = input.read(cx).text().to_string();
             if this.settings.screenshot.watermark.text != value {
                 this.settings.screenshot.watermark.text = value;
+                this.persist(cx);
+            }
+        }));
+
+        // The name template persists verbatim, blank included: `expand_name`
+        // substitutes the default at naming time, so clearing the field
+        // restores the shipped name instead of writing a nameless file.
+        subscriptions.push(cx.observe(&export_name, |this, input, cx| {
+            let value = input.read(cx).text().to_string();
+            if this.settings.screenshot.export.filename_template != value {
+                this.settings.screenshot.export.filename_template = value;
                 this.persist(cx);
             }
         }));
@@ -378,10 +470,22 @@ impl SettingsView {
             timeout,
             prompt,
             wm_text,
+            export_name,
             search,
             confirm_reset_all: false,
+            http_warn_confirm: false,
             data_bytes,
             log_bytes,
+            history_records: Vec::new(),
+            history_thumbs: HashMap::new(),
+            history_thumb_mtime: HashMap::new(),
+            history_thumb_seq: 0,
+            history_status: SharedString::default(),
+            history_status_seq: 0,
+            history_selected: None,
+            history_confirm_delete: false,
+            history_confirm_clear: false,
+            history_filter: "all".to_string(),
             update_checking: false,
             update_available: None,
             _subscriptions: subscriptions,
@@ -426,6 +530,11 @@ impl SettingsView {
         }
         match crate::translate::set_api_key(&key) {
             Ok(()) => {
+                if key.trim().is_empty() && self.settings.translation.allow_insecure_http {
+                    self.settings.translation.allow_insecure_http = false;
+                    self.persist(cx);
+                }
+                self.http_warn_confirm = false;
                 self.saved_api_key = key;
                 self.ok("API Key 已保存");
             }
@@ -438,8 +547,13 @@ impl SettingsView {
     fn sync_inputs(&mut self, cx: &mut Context<Self>) {
         let t = self.settings.translation.clone();
         let wm = self.settings.screenshot.watermark.text.clone();
+        let template = self.settings.screenshot.export.filename_template.clone();
+        let key = self.saved_api_key.clone();
         self.base_url
             .update(cx, |input, cx| input.set_text(t.base_url, cx));
+        self.api_key.update(cx, |input, cx| input.set_text(key, cx));
+        self.export_name
+            .update(cx, |input, cx| input.set_text(template, cx));
         self.model
             .update(cx, |input, cx| input.set_text(t.model, cx));
         self.timeout.update(cx, |input, cx| {
@@ -448,14 +562,31 @@ impl SettingsView {
         self.prompt
             .update(cx, |input, cx| input.set_text(t.prompt, cx));
         self.wm_text.update(cx, |input, cx| input.set_text(wm, cx));
+        self.http_warn_confirm = false;
     }
 
     fn go_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
         self.open_select = None;
         self.confirm_reset_all = false;
+        self.http_warn_confirm = false;
+        // Leaving/entering a page disarms any pending destructive confirmation.
+        self.history_confirm_delete = false;
+        self.history_confirm_clear = false;
         self.search.update(cx, |input, cx| input.set_text("", cx));
+        if self.page == Page::History {
+            // Load records + decode thumbnails on entry so the grid is never a
+            // blank page. Refreshing again is harmless (sequence-guarded).
+            self.reload_history(cx);
+        }
         cx.notify();
+    }
+
+    /// Load history as soon as the window opens. The settings window can be
+    /// launched directly into the History page (or opened there before any
+    /// nav click), so waiting only for `go_page` would leave a blank grid.
+    fn load_history_on_open(&mut self, cx: &mut Context<Self>) {
+        self.reload_history(cx);
     }
 
     fn reset_page(&mut self, cx: &mut Context<Self>) {
@@ -474,6 +605,12 @@ impl SettingsView {
             return;
         }
         if model::reset_page(&mut self.settings, self.page) {
+            if self.page == Page::Translate {
+                // The key lives in the credential vault, not settings.json:
+                // a page reset must remove it too, not just blank the field.
+                let _ = crate::translate::set_api_key("");
+                self.saved_api_key.clear();
+            }
             // The appearance page resets to light; re-projecting the (possibly
             // unchanged) theme here keeps the chrome and every other window in
             // step without a second click.
@@ -489,6 +626,9 @@ impl SettingsView {
 
     fn reset_all(&mut self, cx: &mut Context<Self>) {
         model::reset_all(&mut self.settings);
+        // Resetting everything includes the API Key stored in the vault.
+        let _ = crate::translate::set_api_key("");
+        self.saved_api_key.clear();
         let _ = system::set_autostart(false);
         theme::set_dark(cx, self.settings.dark());
         self.autostart = system::autostart_enabled();
@@ -529,6 +669,411 @@ impl SettingsView {
             self.persist(cx);
         } else {
             cx.notify();
+        }
+    }
+
+    fn set_export_format(&mut self, format: crate::config::ImageFormat, cx: &mut Context<Self>) {
+        let export = &mut self.settings.screenshot.export;
+        self.open_select = None;
+        if export.format != format {
+            export.format = format;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_export_quality(&mut self, quality: u8, cx: &mut Context<Self>) {
+        let export = &mut self.settings.screenshot.export;
+        self.open_select = None;
+        if export.quality != quality {
+            export.quality = quality;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_scroll_interval(&mut self, ms: u32, cx: &mut Context<Self>) {
+        self.open_select = None;
+        if self.settings.screenshot.auto_scroll.interval_ms != ms {
+            self.settings.screenshot.auto_scroll.interval_ms = ms;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_scroll_notches(&mut self, notches: u32, cx: &mut Context<Self>) {
+        self.open_select = None;
+        if self.settings.screenshot.auto_scroll.notches != notches {
+            self.settings.screenshot.auto_scroll.notches = notches;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn toggle_history_enabled(&mut self, cx: &mut Context<Self>) {
+        let h = &mut self.settings.history;
+        h.enabled = !h.enabled;
+        self.persist(cx);
+    }
+
+    fn toggle_history_keep(&mut self, cx: &mut Context<Self>) {
+        let h = &mut self.settings.history;
+        h.keep_permanently = !h.keep_permanently;
+        self.persist(cx);
+        // Retention changes apply to records already on disk, not just future
+        // ones, so the new limit takes effect the moment it is chosen.
+        self.prune_history_now();
+    }
+
+    /// Sentinel value used by the retention dropdown for the "永久" option.
+    /// `0` never matches a numbered day option, and maps to `keep_permanently`.
+    const RETENTION_FOREVER: u64 = 0;
+
+    fn set_history_retention(&mut self, days: u64, cx: &mut Context<Self>) {
+        self.open_select = None;
+        let changed = {
+            let h = &mut self.settings.history;
+            if days == Self::RETENTION_FOREVER {
+                // "永久" is a view of the same flag as the "始终保留" toggle —
+                // never delete by age, no matter what retention_days says.
+                let c = !h.keep_permanently;
+                h.keep_permanently = true;
+                c
+            } else {
+                let c = h.retention_days != days || h.keep_permanently;
+                h.retention_days = days;
+                h.keep_permanently = false;
+                c
+            }
+        };
+        if changed {
+            self.persist(cx);
+            self.prune_history_now();
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_history_limit(&mut self, limit: usize, cx: &mut Context<Self>) {
+        self.open_select = None;
+        if self.settings.history.limit != limit {
+            self.settings.history.limit = limit;
+            self.persist(cx);
+            self.prune_history_now();
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_history_disk(&mut self, mib: u64, cx: &mut Context<Self>) {
+        self.open_select = None;
+        if self.settings.history.max_disk_mib != mib {
+            self.settings.history.max_disk_mib = mib;
+            self.persist(cx);
+            self.prune_history_now();
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Apply the current retention policy to records already on disk. Each
+    /// history setter calls this after persisting so lowering a limit removes
+    /// the excess immediately instead of waiting for the next save or launch.
+    fn prune_history_now(&self) {
+        let h = &self.settings.history;
+        if let Ok(dir) = h.store_dir() {
+            let store = crate::history::HistoryStore::new(dir);
+            let retention = h.retention();
+            // Prune is best-effort: a failed cleanup must never make the
+            // settings change look like it failed to save.
+            let _ = store.prune(&retention);
+        }
+    }
+
+    fn open_history(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        crate::history_window::show_history_window(cx);
+    }
+
+    /// Build the store for the effective history directory (config override or
+    /// the default `capture_history` folder).
+    fn history_store(&self) -> Option<HistoryStore> {
+        self.settings
+            .history
+            .store_dir()
+            .ok()
+            .map(HistoryStore::new)
+    }
+
+    /// Refresh the embedded history grid from disk. Called whenever the user
+    /// opens the History page or changes its contents.
+    fn reload_history(&mut self, cx: &mut Context<Self>) {
+        self.history_records = self
+            .history_store()
+            .and_then(|s| s.list().ok())
+            .unwrap_or_default();
+        if self
+            .history_selected
+            .as_ref()
+            .is_some_and(|id| !self.history_records.iter().any(|r| &r.id == id))
+        {
+            self.history_selected = None;
+        }
+        self.load_history_thumbs_async(cx);
+        cx.notify();
+    }
+
+    /// Decode thumbnails off the UI thread, reusing the gallery window's
+    /// decoder. A sequence number prevents a stale batch from overwriting a
+    /// newer refresh's thumbnails. Thumbs already decoded from an unchanged
+    /// file are reused, so re-entering the page does not re-decode everything.
+    fn load_history_thumbs_async(&mut self, cx: &mut Context<Self>) {
+        let seq = {
+            self.history_thumb_seq = self.history_thumb_seq.wrapping_add(1);
+            self.history_thumb_seq
+        };
+        let Some(store) = self.history_store() else {
+            return;
+        };
+        // Keep only cache entries for records that still exist, then work out
+        // which images actually need (re)decoding. A file is unchanged when its
+        // modification time still matches the one the cached thumb was built
+        // from; a missing/unreadable mtime forces a fresh decode.
+        let live_ids: std::collections::HashSet<String> =
+            self.history_records.iter().map(|r| r.id.clone()).collect();
+        self.history_thumbs.retain(|id, _| live_ids.contains(id));
+        self.history_thumb_mtime
+            .retain(|id, _| live_ids.contains(id));
+
+        let mut jobs: Vec<(String, PathBuf)> = Vec::new();
+        for r in &self.history_records {
+            let path = store.image_path(r);
+            let mtime = history_file_mtime(&path);
+            let cached = self.history_thumbs.contains_key(&r.id)
+                && self.history_thumb_mtime.get(&r.id).copied() == mtime
+                && mtime.is_some();
+            if !cached {
+                jobs.push((r.id.clone(), path));
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let decoded = cx
+                .background_executor()
+                .spawn(async move {
+                    jobs.into_iter()
+                        .map(|(id, path)| {
+                            let mtime = history_file_mtime(&path);
+                            let thumb = crate::history_window::load_thumb(&path);
+                            (id, mtime, thumb)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.history_thumb_seq == seq {
+                    for (id, mtime, thumb) in decoded {
+                        if let Some(m) = mtime {
+                            this.history_thumb_mtime.insert(id.clone(), m);
+                        }
+                        this.history_thumbs.insert(id, thumb);
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn history_selected_record(&self) -> Option<&HistoryRecord> {
+        let id = self.history_selected.as_ref()?;
+        self.history_records.iter().find(|r| &r.id == id)
+    }
+
+    /// Set a history status line. Transient messages fade after a few seconds;
+    /// confirmation prompts (`persist`) stay until the next action. A sequence
+    /// number stops an older timer from clearing a newer message.
+    fn set_history_status(
+        &mut self,
+        text: impl Into<SharedString>,
+        persist: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.history_status = text.into();
+        self.history_status_seq = self.history_status_seq.wrapping_add(1);
+        let seq = self.history_status_seq;
+        if !persist {
+            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                cx.background_executor().timer(Duration::from_secs(4)).await;
+                this.update(cx, |this, cx| {
+                    if this.history_status_seq == seq {
+                        this.history_status = SharedString::default();
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn history_copy_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(record) = self.history_selected_record().cloned() else {
+            self.set_history_status("请先选择一张图片", false, cx);
+            return;
+        };
+        let Some(store) = self.history_store() else {
+            return;
+        };
+        let path = store.image_path(&record);
+        match crate::codec::decode_bgra(&path) {
+            Some((bgra, w, h)) => match crate::codec::set_clipboard_dib(&bgra, w, h, w * 4) {
+                Ok(()) => self.set_history_status("已复制到剪贴板", false, cx),
+                Err(e) => self.set_history_status(format!("复制失败：{e}"), false, cx),
+            },
+            None => self.set_history_status("图片解码失败", false, cx),
+        }
+    }
+
+    fn history_delete_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.history_selected.clone() else {
+            self.set_history_status("请先选择一张图片", false, cx);
+            return;
+        };
+        // Two-click confirmation: deletion is a two-phase, irreversible commit.
+        if !self.history_confirm_delete {
+            self.history_confirm_delete = true;
+            self.history_confirm_clear = false;
+            self.set_history_status("再次点击「删除」以确认删除这张图片", true, cx);
+            return;
+        }
+        self.history_confirm_delete = false;
+        match self.history_store().and_then(|s| s.remove(&id).ok()) {
+            Some(()) => {
+                self.set_history_status("已删除", false, cx);
+                self.history_selected = None;
+                self.reload_history(cx);
+            }
+            None => self.set_history_status("删除失败", false, cx),
+        }
+    }
+
+    fn history_clear(&mut self, cx: &mut Context<Self>) {
+        // Two-click confirmation: clearing wipes every record irreversibly.
+        if !self.history_confirm_clear {
+            self.history_confirm_clear = true;
+            self.history_confirm_delete = false;
+            self.set_history_status("再次点击「清空」以确认清空全部历史", true, cx);
+            return;
+        }
+        self.history_confirm_clear = false;
+        match self.history_store_clear() {
+            Ok(()) => {
+                self.set_history_status("已清空历史", false, cx);
+                self.history_selected = None;
+                self.reload_history(cx);
+            }
+            Err(msg) => self.set_history_status(msg, false, cx),
+        }
+    }
+
+    /// Source filter for the embedded gallery. Changing it also disarms any
+    /// pending destructive confirmation so a hidden item cannot be deleted.
+    fn set_history_filter(&mut self, filter: &str, cx: &mut Context<Self>) {
+        self.history_filter = filter.to_string();
+        self.open_select = None;
+        self.history_confirm_delete = false;
+        self.history_confirm_clear = false;
+        // A filtered-out selection must not stay selected.
+        if let Some(id) = self.history_selected.clone() {
+            let visible = self
+                .history_records
+                .iter()
+                .any(|r| r.id == id && history_matches_filter(&r.source, &self.history_filter));
+            if !visible {
+                self.history_selected = None;
+            }
+        }
+        cx.notify();
+    }
+
+    fn history_open_folder(&mut self, cx: &mut Context<Self>) {
+        // Always open the history root — consistent with the gallery window and
+        // with CitePix. Per-record discovery stays in the dedicated gallery.
+        let result = self
+            .history_dir()
+            .and_then(|dir| system::open_folder(&dir).map_err(|e| format!("打开失败：{e}")));
+        match result {
+            Ok(()) => self.set_history_status("已打开历史目录", false, cx),
+            Err(e) => self.set_history_status(e, false, cx),
+        }
+    }
+
+    fn open_image_split(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        crate::imagesplit_window::show_split_window(cx);
+    }
+
+    fn open_collage(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        crate::collage_window::show_collage_window(cx);
+    }
+
+    /// Shared low-level history operations. Both the Data page and the embedded
+    /// History page call these so the actual logic lives in one place; each
+    /// caller keeps its own status channel and confirmation behaviour.
+    fn history_dir(&self) -> std::result::Result<PathBuf, String> {
+        self.settings
+            .history
+            .store_dir()
+            .map_err(|e| format!("历史目录不可用：{e}"))
+    }
+
+    fn history_store_clear(&self) -> std::result::Result<(), String> {
+        crate::history::HistoryStore::new(self.history_dir()?)
+            .clear()
+            .map_err(|e| format!("清空历史失败：{e}"))
+    }
+
+    /// Data-page "清空截图历史" button. Uses the Data page's status line.
+    fn clear_history(&mut self, cx: &mut Context<Self>) {
+        match self.history_store_clear() {
+            Ok(()) => self.ok("截图历史已清空"),
+            Err(e) => self.fail(e),
+        }
+        cx.notify();
+    }
+
+    /// Data-page "打开历史目录" button. Uses the Data page's status line.
+    fn open_history_dir(&mut self, cx: &mut Context<Self>) {
+        match self
+            .history_dir()
+            .and_then(|dir| system::open_folder(&dir).map_err(|e| format!("打开历史目录失败：{e}")))
+        {
+            Ok(()) => {}
+            Err(e) => self.fail(e),
+        }
+        cx.notify();
+    }
+
+    fn choose_history_dir(&mut self, cx: &mut Context<Self>) {
+        // Start the picker at the effective directory (configured or default).
+        let current = self.settings.history.store_dir().unwrap_or_default();
+        match system::pick_folder(&current) {
+            Ok(None) => {}
+            Ok(Some(dir)) => {
+                self.settings.history.dir = Some(dir);
+                self.persist(cx);
+            }
+            Err(e) => {
+                self.fail(format!("{e}"));
+                cx.notify();
+            }
         }
     }
 
@@ -1203,6 +1748,35 @@ impl SettingsView {
             mosaic_rows,
         );
 
+        let smart_mode = self.settings.screenshot.smart_selection;
+        let smart_label: SharedString = smart_mode.label().into();
+        let smart_rows = crate::config::SmartSelectionMode::ALL
+            .into_iter()
+            .map(|mode| {
+                widgets::select_option(
+                    SharedString::from(format!("smart-{}", mode.id())),
+                    mode.label(),
+                    mode == smart_mode,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.settings.screenshot.smart_selection = mode;
+                        this.open_select = None;
+                        this.persist(cx);
+                    }),
+                )
+            })
+            .collect();
+        let smart = self.select_row(
+            cx,
+            SelectId::SmartSelection,
+            "智能选区",
+            "框选时吸附到窗口或其内部元素；「禁用」为自由拖拽。",
+            smart_label,
+            smart_rows,
+        );
+
         div()
             .flex()
             .flex_col()
@@ -1217,9 +1791,69 @@ impl SettingsView {
                 )),
                 width,
                 mosaic,
+                smart,
+                self.scroll_interval_row(cx),
+                self.scroll_notches_row(cx),
                 widgets::unsupported_row("截屏模式", "当前版本固定为冻结屏幕后框选区域。"),
             ]))
-            .child(widgets::hint("工具栏与注释默认值在下一次截图时生效。"))
+            .child(widgets::hint(
+                "工具栏与注释默认值在下一次截图时生效；自动滚动的间隔与步长在下一次长截图时生效。",
+            ))
+    }
+
+    /// Auto-scroll cadence for long captures. Persisted through the shared
+    /// `Screenshot` config so the next capture picks the values up; the clamp
+    /// lives in `AutoScroll::step`, not here, to keep one source of truth.
+    fn scroll_interval_row(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let ms = self.settings.screenshot.auto_scroll.interval_ms;
+        let current: SharedString = SCROLL_INTERVALS
+            .iter()
+            .find(|(_, v)| *v == ms)
+            .map(|(label, _)| (*label).into())
+            .unwrap_or_else(|| format!("{ms} ms").into());
+        let rows = SCROLL_INTERVALS
+            .iter()
+            .map(|(label, v)| {
+                widgets::select_option(("scroll-int", *v), *label, *v == ms).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_scroll_interval(*v, cx)),
+                )
+            })
+            .collect();
+        self.select_row(
+            cx,
+            SelectId::AutoScrollInterval,
+            "自动滚动间隔",
+            "长截图自动滚动时，两次滚动之间的等待时间；间隔越短滚动越快。",
+            current,
+            rows,
+        )
+    }
+
+    fn scroll_notches_row(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let notches = self.settings.screenshot.auto_scroll.notches;
+        let current: SharedString = SCROLL_NOTCHES
+            .iter()
+            .find(|(_, v)| *v == notches)
+            .map(|(label, _)| (*label).into())
+            .unwrap_or_else(|| format!("{notches} 格").into());
+        let rows = SCROLL_NOTCHES
+            .iter()
+            .map(|(label, v)| {
+                widgets::select_option(("scroll-notch", *v), *label, *v == notches).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_scroll_notches(*v, cx)),
+                )
+            })
+            .collect();
+        self.select_row(
+            cx,
+            SelectId::AutoScrollNotches,
+            "自动滚动步长",
+            "每次滚动发送的原生滚轮格数；格数越大，一步跨过的页面越多。",
+            current,
+            rows,
+        )
     }
 
     fn page_unsupported(&self, page: Page) -> impl IntoElement {
@@ -1238,12 +1872,198 @@ impl SettingsView {
             ))
     }
 
+    fn history_retention_row(&self, cx: &mut Context<Self>) -> gpui::Div {
+        // `let`, not `const`: the rows below reference Self::RETENTION_FOREVER,
+        // and a nested const item cannot use Self from its enclosing type.
+        let days: [(&str, u64); 5] = [
+            ("1 天", 1),
+            ("7 天", 7),
+            ("30 天", 30),
+            ("90 天", 90),
+            ("永久", Self::RETENTION_FOREVER),
+        ];
+        let h = &self.settings.history;
+        // "永久" is backed by keep_permanently, not a day count (the config
+        // layer clamps retention_days to 365, so a large value could never
+        // actually mean "forever"). Reflect that in both the label and check.
+        let current: SharedString = if h.keep_permanently {
+            "永久".into()
+        } else {
+            days.iter()
+                .find(|(_, d)| *d == h.retention_days)
+                .map(|(label, _)| (*label).into())
+                .unwrap_or_else(|| format!("{} 天", h.retention_days).into())
+        };
+        let rows = days
+            .iter()
+            .map(|(label, d)| {
+                // Copy the day out of the local array: the listener is 'static
+                // and cannot borrow from `days`, which is dropped at return.
+                let day = *d;
+                let selected = if day == Self::RETENTION_FOREVER {
+                    h.keep_permanently
+                } else {
+                    !h.keep_permanently && day == h.retention_days
+                };
+                widgets::select_option(("hist-ret", day as u32), *label, selected).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_history_retention(day, cx)),
+                )
+            })
+            .collect();
+        self.select_row(
+            cx,
+            SelectId::HistoryRetention,
+            "保留期限",
+            "超过该天数的历史记录会在启动时和保存后自动清理；选择“永久”等同于开启“始终保留”。",
+            current,
+            rows,
+        )
+    }
+
+    fn history_limit_row(&self, cx: &mut Context<Self>) -> gpui::Div {
+        const LIMITS: [(&str, usize); 5] = [
+            ("20 张", 20),
+            ("50 张", 50),
+            ("100 张", 100),
+            ("300 张", 300),
+            ("1000 张", 1000),
+        ];
+        let h = &self.settings.history;
+        let current: SharedString = format!("{} 张", h.limit).into();
+        let rows = LIMITS
+            .iter()
+            .map(|(label, n)| {
+                widgets::select_option(("hist-limit", *n as u32), *label, *n == h.limit)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_history_limit(*n, cx)),
+                    )
+            })
+            .collect();
+        self.select_row(
+            cx,
+            SelectId::HistoryLimit,
+            "数量上限",
+            "最多保留的记录条数，超出后删除最旧的。",
+            current,
+            rows,
+        )
+    }
+
+    fn history_disk_row(&self, cx: &mut Context<Self>) -> gpui::Div {
+        const SIZES: [(&str, u64); 5] = [
+            ("128 MB", 128),
+            ("512 MB", 512),
+            ("1 GB", 1024),
+            ("4 GB", 4096),
+            ("10 GB", 10240),
+        ];
+        let h = &self.settings.history;
+        let current: SharedString = if h.max_disk_mib >= 1024 {
+            format!("{} GB", h.max_disk_mib / 1024).into()
+        } else {
+            format!("{} MB", h.max_disk_mib).into()
+        };
+        let rows = SIZES
+            .iter()
+            .map(|(label, m)| {
+                widgets::select_option(("hist-disk", *m as u32), *label, *m == h.max_disk_mib)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_history_disk(*m, cx)),
+                    )
+            })
+            .collect();
+        self.select_row(
+            cx,
+            SelectId::HistoryDisk,
+            "占用上限",
+            "历史目录的最大体积，超出后删除最旧的记录。",
+            current,
+            rows,
+        )
+    }
+
+    /// History controls, owned by the Data page. Kept as a row builder so the
+    /// search index and the rendered page stay in the same place.
+    fn history_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::Div> {
+        let h = &self.settings.history;
+        let store_dir: SharedString = match h.store_dir() {
+            Ok(p) => p.display().to_string().into(),
+            Err(e) => format!("{e}").into(),
+        };
+        let location = widgets::stack(
+            "历史目录",
+            "历史图片是保存截图的独立副本；删除这里的记录不影响原截图文件。",
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .child(widgets::path_line(store_dir).flex_1().min_w(px(0.)))
+                .child(widgets::button("hist-dir-change", "更改").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.choose_history_dir(cx)),
+                ))
+                .child(
+                    widgets::button("hist-dir-open", "打开文件夹").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.open_history_dir(cx)),
+                    ),
+                ),
+        );
+        let actions = widgets::row("浏览历史", "打开历史窗口，查看、复制或删除以往截图。").child(
+            widgets::control(
+                widgets::button("hist-open-window", "查看历史").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.open_history(window, cx)),
+                ),
+            ),
+        );
+        let clear = widgets::row("清空历史", "删除所有历史记录；此操作不可撤销。").child(
+            widgets::control(widgets::danger_button("hist-clear", "清空").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.clear_history(cx)),
+            )),
+        );
+
+        vec![
+            widgets::row("记录截图历史", "保存截图时自动留存一份副本到历史目录。").child(
+                widgets::control(widgets::toggle("hist-enabled", h.enabled).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.toggle_history_enabled(cx)),
+                )),
+            ),
+            self.history_retention_row(cx),
+            self.history_limit_row(cx),
+            self.history_disk_row(cx),
+            widgets::row("始终保留", "开启后忽略保留期限，只按数量与体积上限清理。").child(
+                widgets::control(
+                    widgets::toggle("hist-keep", h.keep_permanently).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.toggle_history_keep(cx)),
+                    ),
+                ),
+            ),
+            location,
+            actions,
+            clear,
+        ]
+    }
+
     fn page_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let save_dir: SharedString = match crate::config::screenshot_dir() {
             Ok(p) => p.display().to_string().into(),
             Err(e) => format!("{e}").into(),
         };
-        let location = widgets::stack("保存位置", "工具栏的保存按钮把 PNG 写到这里。").child(
+        let location = widgets::stack(
+            "保存位置",
+            "工具栏的保存按钮把截图写到这里，扩展名跟随下方格式。",
+        )
+        .child(
             div()
                 .flex()
                 .flex_row()
@@ -1294,15 +2114,42 @@ impl SettingsView {
             .flex_col()
             .child(widgets::rows(vec![
                 location,
+                self.export_format_row(cx),
+                self.export_quality_row(cx),
+                widgets::stack(
+                    "文件名称",
+                    "可用 {date}（年月日）、{time}（时分秒）、{datetime}（两者）。留空使用默认名。",
+                )
+                .child(self.export_name.clone()),
                 widgets::stack(
                     "水印文字",
-                    "导出 PNG 时烧录的文字，留空则仅当勾选时间或设置了图片时显示。",
+                    "导出时烧录的文字，留空则仅当勾选时间或设置了图片时显示。",
                 )
                 .child(self.wm_text.clone()),
                 self.watermark_position_row(cx),
                 self.watermark_opacity_row(cx),
                 self.watermark_scale_row(cx),
                 image,
+                widgets::stack(
+                    "图片切图",
+                    "把一张图片切成等分/精确的网格，逐块导出，适合分页打印长截图。",
+                )
+                .child(
+                    widgets::button("split-open-window", "打开切图工具").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.open_image_split(window, cx)),
+                    ),
+                ),
+                widgets::stack(
+                    "拼图工具",
+                    "把多张图片拼成一张，支持垂直/水平/网格布局，可导出 PNG 或多页 PDF。",
+                )
+                .child(
+                    widgets::button("collage-open-window", "打开拼图工具").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.open_collage(window, cx)),
+                    ),
+                ),
                 widgets::row(
                     "添加拍摄时间",
                     "在文字前附加 UTC 时间，格式 YYYY-MM-DD HH:MM:SS。",
@@ -1409,6 +2256,69 @@ impl SettingsView {
             SelectId::WaterScale,
             "水印大小",
             "水印文字或图片的缩放，0.5x 到 3x。",
+            current,
+            rows,
+        )
+    }
+
+    fn export_format_row(&self, cx: &mut Context<Self>) -> gpui::Div {
+        use crate::config::ImageFormat;
+        let current_format = self.settings.screenshot.export.format;
+        let current: SharedString = current_format.label().into();
+        let rows = ImageFormat::ALL
+            .into_iter()
+            // WebP comes from an optional Windows package; offering it where
+            // the codec is missing would silently export PNG under a .webp
+            // setting the user just picked on purpose.
+            .filter(|f| crate::codec::format_available(*f))
+            .map(|f| {
+                widgets::select_option(("export-fmt", f as u32), f.label(), f == current_format)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_export_format(f, cx)),
+                    )
+            })
+            .collect();
+        self.select_row(
+            cx,
+            SelectId::ExportFormat,
+            "图片格式",
+            "PNG 无损体积大；JPG/WebP 有损但适合长页面与照片。",
+            current,
+            rows,
+        )
+    }
+
+    fn export_quality_row(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let export = &self.settings.screenshot.export;
+        // PNG ignores quality, so the row explains that instead of offering a
+        // control that changes nothing.
+        if !export.format.honours_quality() {
+            return widgets::row(
+                "图片质量",
+                "PNG 为无损格式，质量设置对它不生效；选择 JPG 或 WebP 后可调。",
+            );
+        }
+        let current: SharedString = EXPORT_QUALITIES
+            .iter()
+            .find(|(_, v)| *v == export.quality)
+            .map(|(label, _)| (*label).into())
+            .unwrap_or_else(|| format!("{}%", export.quality).into());
+        let quality = export.quality;
+        let rows = EXPORT_QUALITIES
+            .map(|(label, v)| {
+                widgets::select_option(("export-q", v as u32), label, v == quality).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_export_quality(v, cx)),
+                )
+            })
+            .into_iter()
+            .collect();
+        self.select_row(
+            cx,
+            SelectId::ExportQuality,
+            "图片质量",
+            "有损格式的编码质量，越高越清晰、文件越大。",
             current,
             rows,
         )
@@ -1548,7 +2458,7 @@ impl SettingsView {
                 )
             });
 
-        widgets::rows(vec![
+        let mut rows: Vec<_> = vec![
             widgets::stack(
                 "接口地址",
                 "OpenAI 兼容接口，例如 https://api.openai.com/v1；留空则翻译不可用。",
@@ -1564,7 +2474,49 @@ impl SettingsView {
                 div().w(px(120.)).child(self.timeout.clone()),
             )),
             prompt,
-        ])
+        ];
+        // A key on a plaintext endpoint is the one case where the vault is not
+        // enough: show a two-click acknowledgement and gate the runtime on it.
+        if !self.saved_api_key.trim().is_empty()
+            && crate::translate::is_insecure_http(&self.settings.translation.base_url)
+        {
+            let acknowledged = self.settings.translation.allow_insecure_http;
+            let label = if acknowledged {
+                "已确认：点击撤销明文 HTTP 授权"
+            } else if self.http_warn_confirm {
+                "再次点击以确认明文传输风险"
+            } else {
+                "我了解风险，仍要使用 HTTP"
+            };
+            rows.insert(
+                0,
+                widgets::row(
+                    "明文 HTTP 警告",
+                    "当前接口使用 http://，API Key 会以明文发送。仅对本地或可信服务使用。",
+                )
+                .child(widgets::danger_button("http-risk", label).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        if this.settings.translation.allow_insecure_http {
+                            this.settings.translation.allow_insecure_http = false;
+                            this.http_warn_confirm = false;
+                            this.persist(cx);
+                            this.ok("已撤销明文 HTTP 授权");
+                        } else if this.http_warn_confirm {
+                            this.settings.translation.allow_insecure_http = true;
+                            this.http_warn_confirm = false;
+                            this.persist(cx);
+                            this.ok("已确认：允许明文 HTTP 发送 API Key");
+                        } else {
+                            this.http_warn_confirm = true;
+                            this.ok("再次点击以确认明文传输风险");
+                        }
+                        cx.notify();
+                    }),
+                )),
+            );
+        }
+        widgets::rows(rows)
     }
 
     fn page_resources(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1649,7 +2601,7 @@ impl SettingsView {
         )
         .into();
 
-        widgets::rows(vec![
+        let mut rows = vec![
             widgets::row("数据目录", "settings.json 所在位置。").child(widgets::control(
                 div()
                     .flex()
@@ -1700,8 +2652,305 @@ impl SettingsView {
                     cx.listener(|this, _, _, cx| this.clear_logs(cx)),
                 ),
             )),
-            widgets::unsupported_row("历史图片", "当前版本不保存截图历史，没有可清理的图片。"),
-        ])
+        ];
+        // The standalone History page was folded in here: keeping its controls
+        // next to the other storage data means one place to manage what the app
+        // keeps on disk.
+        rows.extend(self.history_rows(cx));
+        widgets::rows(rows)
+    }
+
+    /// Embedded history gallery. This renders the *same* grid as the standalone
+    /// history window so clicking "历史图片" in the nav shows the actual captured
+    /// images — not a near-empty action page that looks like "nothing loaded".
+    fn page_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        const CARD_W: f32 = 240.0;
+        const THUMB: f32 = 200.0;
+        const PAD: f32 = 12.0;
+
+        // Only records matching the source filter are shown and counted.
+        let visible: Vec<&HistoryRecord> = self
+            .history_records
+            .iter()
+            .filter(|r| history_matches_filter(&r.source, &self.history_filter))
+            .collect();
+        let total_bytes: u64 = visible.iter().map(|r| r.bytes).sum();
+        let total_label = model::human_size(total_bytes);
+
+        // Source filter dropdown (全部 / 保存到文件 / 复制到剪贴板).
+        const FILTERS: [(&str, &str); 3] = [
+            ("all", "全部来源"),
+            ("saved_to_file", "保存到文件"),
+            ("copied_to_clipboard", "复制到剪贴板"),
+        ];
+        let filter_open = self.open_select == Some(SelectId::HistoryFilter);
+        let current_label: SharedString = FILTERS
+            .iter()
+            .find(|(value, _)| *value == self.history_filter)
+            .map(|(_, label)| *label)
+            .unwrap_or("全部来源")
+            .into();
+        let filter_field = widgets::select(
+            SharedString::from(format!("select-{}", SelectId::HistoryFilter as u8)),
+            current_label,
+            filter_open,
+            Some(140.),
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.open_select = if filter_open {
+                    None
+                } else {
+                    Some(SelectId::HistoryFilter)
+                };
+                cx.notify();
+            }),
+        );
+        let filter_value = self.history_filter.clone();
+        let filter_rows = FILTERS
+            .iter()
+            .enumerate()
+            .map(|(i, (value, label))| {
+                let value = value.to_string();
+                let selected = value == filter_value;
+                widgets::select_option(("hist-filter", i), *label, selected).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_history_filter(&value, cx)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let filter_control = div()
+            .relative()
+            .child(filter_field)
+            .when(filter_open, |el| {
+                el.child(deferred(
+                    div()
+                        .absolute()
+                        .top(px(DROPDOWN_TOP))
+                        .right(px(0.))
+                        .w(px(140.))
+                        .child(widgets::select_list().children(filter_rows)),
+                ))
+            });
+
+        let mut grid = div()
+            .id("settings-history-grid")
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .gap(px(16.));
+
+        if visible.is_empty() {
+            let (title, hint) = if self.history_records.is_empty() {
+                (
+                    "还没有截图历史。",
+                    "保存截图或将截图复制到剪贴板后会自动记录到这里。",
+                )
+            } else {
+                ("当前筛选下没有图片。", "试试将来源筛选切换为“全部来源”。")
+            };
+            grid = grid.child(
+                div()
+                    .w_full()
+                    .py(px(60.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme::secondary_fg())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::secondary_fg())
+                            .child(hint),
+                    ),
+            );
+        } else {
+            for (i, record) in visible.iter().enumerate() {
+                let selected = self.history_selected.as_ref() == Some(&record.id);
+                let id = record.id.clone();
+                let thumb = self.history_thumbs.get(&record.id).and_then(|t| t.clone());
+                grid = grid.child(
+                    div()
+                        .id(("settings-history-card", i))
+                        .flex_none()
+                        .w(px(CARD_W))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .p(px(PAD))
+                        .rounded(px(8.))
+                        .cursor(CursorStyle::PointingHand)
+                        .bg(if selected {
+                            theme::selection_wash()
+                        } else {
+                            theme::elevated_surface()
+                        })
+                        .border_1()
+                        .border_color(if selected {
+                            theme::accent()
+                        } else {
+                            theme::border()
+                        })
+                        .hover(|s| s.border_color(theme::accent_hover()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.history_selected = Some(id.clone());
+                                this.history_status = SharedString::default();
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(px(THUMB - 2.0 * PAD))
+                                .h(px(THUMB - 2.0 * PAD))
+                                .rounded(px(6.))
+                                .bg(theme::muted())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(match thumb {
+                                    Some(image) => img(ImageSource::Render(image))
+                                        .w(px(THUMB - 2.0 * PAD))
+                                        .h(px(THUMB - 2.0 * PAD))
+                                        .rounded(px(6.))
+                                        .into_any_element(),
+                                    None => div()
+                                        .text_size(px(11.))
+                                        .text_color(theme::secondary_fg())
+                                        .child("无预览")
+                                        .into_any_element(),
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::primary_fg())
+                                        .child(crate::history::format_utc(record.created_ms)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(theme::secondary_fg())
+                                        .child(format!(
+                                            "{} × {} · {}",
+                                            record.width,
+                                            record.height,
+                                            crate::history::source_label(&record.source),
+                                        )),
+                                ),
+                        ),
+                );
+            }
+        }
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::primary_fg())
+                            .child(format!("{} 张图片", visible.len())),
+                    )
+                    .child(div().w(px(1.)).h(px(10.)).bg(theme::border()))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::secondary_fg())
+                            .child(total_label),
+                    )
+                    .child(div().flex_1())
+                    .child(filter_control),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(widgets::button("hist-refresh", "刷新").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.reload_history(cx)),
+                    ))
+                    .child(
+                        widgets::button("hist-open-window", "独立窗口打开").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| this.open_history(window, cx)),
+                        ),
+                    )
+                    .child(widgets::button("hist-folder", "打开文件夹").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.history_open_folder(cx)),
+                    ))
+                    .child(widgets::button("hist-copy", "复制").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.history_copy_selected(cx)),
+                    ))
+                    .child(
+                        widgets::button(
+                            "hist-delete",
+                            if self.history_confirm_delete {
+                                "再次点击删除"
+                            } else {
+                                "删除"
+                            },
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.history_delete_selected(cx)),
+                        ),
+                    )
+                    .child(
+                        widgets::button(
+                            "hist-clear",
+                            if self.history_confirm_clear {
+                                "再次点击清空"
+                            } else {
+                                "清空"
+                            },
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.history_clear(cx)),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(if self.history_status.is_empty() {
+                        theme::secondary_fg()
+                    } else {
+                        theme::accent()
+                    })
+                    .child(self.history_status.clone()),
+            )
+            .child(grid)
+            .into_any_element()
     }
 
     fn page_about(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1773,10 +3022,11 @@ impl SettingsView {
         match self.page {
             Page::General => self.page_general(cx).into_any_element(),
             Page::Screenshot => self.page_screenshot(cx).into_any_element(),
-            Page::Record | Page::History => {
+            Page::Record => {
                 debug_assert!(self.page.unsupported());
                 self.page_unsupported(self.page).into_any_element()
             }
+            Page::History => self.page_history(cx).into_any_element(),
             Page::Appearance => self.page_appearance(cx).into_any_element(),
             Page::Output => self.page_output(cx).into_any_element(),
             Page::Pin => self.page_pin(cx).into_any_element(),
@@ -1787,6 +3037,21 @@ impl SettingsView {
             Page::About => self.page_about(cx).into_any_element(),
         }
     }
+}
+
+/// Gallery source-filter predicate. `"all"` accepts everything; other values
+/// match a record's source string exactly.
+fn history_matches_filter(source: &str, filter: &str) -> bool {
+    filter == "all" || source == filter
+}
+
+/// Modification time of a history image in unix millis, used to decide whether
+/// a cached thumbnail is still valid. `None` means the file could not be
+/// inspected and forces a fresh decode.
+fn history_file_mtime(path: &PathBuf) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(duration.as_millis() as u64)
 }
 
 impl Render for SettingsView {
@@ -1853,6 +3118,22 @@ impl Render for SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_source_filter_matches_all_and_exact_sources() {
+        assert!(history_matches_filter("saved_to_file", "all"));
+        assert!(history_matches_filter("copied_to_clipboard", "all"));
+        assert!(history_matches_filter("saved_to_file", "saved_to_file"));
+        assert!(!history_matches_filter(
+            "saved_to_file",
+            "copied_to_clipboard"
+        ));
+        assert!(!history_matches_filter(
+            "copied_to_clipboard",
+            "saved_to_file"
+        ));
+        assert!(!history_matches_filter("clipboard", "copied_to_clipboard"));
+    }
 
     #[test]
     fn about_page_names_the_product_fastpin() {

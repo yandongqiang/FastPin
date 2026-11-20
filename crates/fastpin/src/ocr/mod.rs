@@ -251,8 +251,12 @@ mod tests {
     use std::fs;
 
     /// Unique scratch directory; the real model folders are never touched.
+    /// Lives under target/ because %TEMP% is blocked by the harness sandbox.
     fn scratch(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("fastpin-ocr-{}-{name}", std::process::id()));
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("ocr-tests")
+            .join(format!("fastpin-ocr-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
@@ -283,8 +287,10 @@ mod tests {
 
     #[test]
     fn models_in_a_missing_directory_are_unavailable() {
-        let dir =
-            std::env::temp_dir().join(format!("fastpin-ocr-{}-does-not-exist", std::process::id()));
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("ocr-tests")
+            .join("does-not-exist");
         assert!(!models_present_in(&dir));
     }
 

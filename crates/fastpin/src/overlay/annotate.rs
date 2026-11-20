@@ -20,10 +20,10 @@ use gpui::{
 };
 
 use crate::geom::{Point, Rect};
-use crate::overlay::composite::{element_coverage, CoverageRun, ElementRuns};
+use crate::overlay::composite::{element_coverage, spotlight_dim_mask, CoverageRun, ElementRuns};
 use crate::overlay::editor::{
-    badge_font_size, ArrowEnds, ArrowHead, BadgeStyle, Element, LineStyle, Session, Shape, Tool,
-    TEXT_FONT_SIZE,
+    badge_font_size, spotlight_dim_argb, ArrowEnds, ArrowHead, BadgeStyle, Element, LineStyle,
+    Session, Shape, SpotlightKind, Tool, TEXT_FONT_SIZE,
 };
 use crate::overlay::{text_raster, theme, toolbar};
 
@@ -206,6 +206,37 @@ pub fn handle_common_toolbar(
     }
     // Any other button dismisses the shape picker.
     session.shape_open = false;
+    // Clicking the spotlight button while the spotlight tool is active toggles
+    // the cutout kind between rect and ellipse; the button still switches the
+    // tool to Spotlight so a non-spotlight user can reach it in one click.
+    if id == toolbar::SPOTLIGHT {
+        session.tool = Tool::Spotlight;
+        session.spotlight_kind = match session.spotlight_kind {
+            SpotlightKind::Ellipse => SpotlightKind::Rect,
+            SpotlightKind::Rect => SpotlightKind::Circle,
+            SpotlightKind::Circle => SpotlightKind::Ellipse,
+        };
+        crate::perf::log_diag(&format!("spotlight kind -> {:?}", session.spotlight_kind));
+        session.cancel_draft();
+        return true;
+    }
+    // Spotlight cutout kind: rect / ellipse / circle. Picks the kind for the
+    // next spotlight drawn and keeps the spotlight tool active.
+    if id == toolbar::SPOTLIGHT_RECT
+        || id == toolbar::SPOTLIGHT_ELLIPSE
+        || id == toolbar::SPOTLIGHT_CIRCLE
+    {
+        session.tool = Tool::Spotlight;
+        session.spotlight_kind = match id {
+            toolbar::SPOTLIGHT_RECT => SpotlightKind::Rect,
+            toolbar::SPOTLIGHT_ELLIPSE => SpotlightKind::Ellipse,
+            toolbar::SPOTLIGHT_CIRCLE => SpotlightKind::Ellipse, // circle = ellipse with equal width/height at draw time
+            _ => session.spotlight_kind,
+        };
+        crate::perf::log_diag(&format!("spotlight kind -> {:?}", session.spotlight_kind));
+        session.cancel_draft();
+        return true;
+    }
     if let Some(style) = LineStyle::from_id(id) {
         session.line_style = style;
         return true;
@@ -329,6 +360,21 @@ pub fn prop_cells(tool: Tool) -> Vec<toolbar::PropCell> {
             .map(Btn),
         );
         cells.push(toolbar::PropCell::BadgeSizeSlider);
+    } else if matches!(tool, Tool::Line | Tool::Highlighter) {
+        // The new straight-line and highlighter tools expose a width slider.
+        // The highlighter still floors the chosen value at HIGHLIGHTER_MIN_WIDTH
+        // at draw time. Pen keeps its historically empty row.
+        cells.push(toolbar::PropCell::WidthSlider);
+    } else if tool == Tool::Spotlight {
+        // Spotlight offers rect / ellipse / circle cutout kind on the second row.
+        cells.extend(
+            [
+                toolbar::SPOTLIGHT_RECT,
+                toolbar::SPOTLIGHT_ELLIPSE,
+                toolbar::SPOTLIGHT_CIRCLE,
+            ]
+            .map(Btn),
+        );
     }
     cells
 }
@@ -349,6 +395,8 @@ pub struct PropsModel {
     pub badge_style: BadgeStyle,
     /// Bubble radius in image px.
     pub badge_size: f64,
+    /// Active spotlight cutout kind for highlighting the shape button.
+    pub spotlight_kind: SpotlightKind,
 }
 
 fn prop_active(model: &PropsModel, id: &str) -> bool {
@@ -374,6 +422,16 @@ fn prop_active(model: &PropsModel, id: &str) -> bool {
     }
     if let Some(style) = BadgeStyle::from_id(id) {
         return style == model.badge_style;
+    }
+    // Spotlight shape buttons: highlight the active cutout kind.
+    if id == toolbar::SPOTLIGHT_RECT {
+        return model.spotlight_kind == SpotlightKind::Rect;
+    }
+    if id == toolbar::SPOTLIGHT_ELLIPSE {
+        return model.spotlight_kind == SpotlightKind::Ellipse;
+    }
+    if id == toolbar::SPOTLIGHT_CIRCLE {
+        return model.spotlight_kind == SpotlightKind::Circle;
     }
     false
 }
@@ -754,6 +812,26 @@ pub fn mark_masks(cache: &MaskCache, marks: &[Element]) -> Vec<Option<Rc<Element
     masks
 }
 
+/// Cached runs of the whole-image dim layer. The mask spans the crop, so unlike
+/// the per-element masks it is keyed by both the exact marks and the image rect
+/// and is only rebuilt when either changes.
+pub type SpotlightDimCache = RefCell<Option<(Vec<Element>, Rect, Option<Rc<Vec<CoverageRun>>>)>>;
+
+pub fn spotlight_dim_runs(
+    cache: &SpotlightDimCache,
+    bounds: Rect,
+    marks: &[Element],
+) -> Option<Rc<Vec<CoverageRun>>> {
+    if let Some((key, key_bounds, runs)) = cache.borrow().as_ref() {
+        if key.as_slice() == marks && *key_bounds == bounds {
+            return runs.clone();
+        }
+    }
+    let runs = spotlight_dim_mask(bounds, marks).map(|mask| Rc::new(mask.runs()));
+    *cache.borrow_mut() = Some((marks.to_vec(), bounds, runs.clone()));
+    runs
+}
+
 // ---- painting ---------------------------------------------------------------
 
 /// Paints the mosaic tiles and every non-text element. Text is a GPUI div in
@@ -832,6 +910,18 @@ fn paint_mask(
             c,
         ));
     }
+}
+
+/// Paint the global dim layer. Called before `paint_marks` so a spotlight's
+/// clear cutout shows the screenshot and annotations inside it stay bright.
+pub fn paint_spotlight(window: &mut Window, runs: &[CoverageRun], offset: Point, scale: f32) {
+    paint_mask(
+        window,
+        runs,
+        offset,
+        scale,
+        argb_color(spotlight_dim_argb()),
+    );
 }
 
 pub fn rect_to_bounds(r: Rect, scale: f32) -> Bounds<Pixels> {
@@ -1463,7 +1553,23 @@ mod tests {
             );
             assert!(!cells.contains(&PropCell::BadgeSizeSlider), "{tool:?}");
         }
-        for tool in [Tool::Select, Tool::Pen, Tool::Mosaic, Tool::Text] {
+        for tool in [Tool::Line, Tool::Highlighter] {
+            assert_eq!(
+                prop_cells(tool)
+                    .iter()
+                    .filter(|c| **c == PropCell::WidthSlider)
+                    .count(),
+                1,
+                "{tool:?}"
+            );
+        }
+        for tool in [
+            Tool::Select,
+            Tool::Pen,
+            Tool::Mosaic,
+            Tool::Text,
+            Tool::Eraser,
+        ] {
             assert!(prop_cells(tool).is_empty(), "{tool:?}");
         }
     }
@@ -1492,6 +1598,20 @@ mod tests {
         for tool in [Tool::PolylineArrow, Tool::CurveArrow] {
             assert_eq!(prop_cells(tool), prop_cells(Tool::Arrow), "{tool:?}");
         }
+    }
+
+    /// The spotlight second row offers rect / ellipse / circle kind buttons.
+    #[test]
+    fn spotlight_row_has_shape_kind_buttons() {
+        let cells = prop_cells(Tool::Spotlight);
+        assert_eq!(
+            cells,
+            vec![
+                PropCell::Btn(toolbar::SPOTLIGHT_RECT),
+                PropCell::Btn(toolbar::SPOTLIGHT_ELLIPSE),
+                PropCell::Btn(toolbar::SPOTLIGHT_CIRCLE),
+            ]
+        );
     }
 
     /// A variant button on the row switches the tool and leaves the row (and
@@ -1531,6 +1651,7 @@ mod tests {
             arrow_head: s.arrow_head,
             badge_style: BadgeStyle::Filled,
             badge_size: 12.0,
+            spotlight_kind: SpotlightKind::Ellipse,
         };
         assert!(prop_active(&model, toolbar::ARROW));
         assert!(!prop_active(&model, toolbar::POLYLINE_ARROW));

@@ -13,15 +13,16 @@ pub use assets::{AppAssets, ToolbarAssets};
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    actions, black, canvas, div, fill, hsla, outline, point, prelude::*, px, rgb, size, white, App,
-    BorderStyle, Bounds, BoxShadow, ContentMask, Context, CursorStyle, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, InteractiveElement, KeyBinding, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point as GpuiPoint, SharedString, UTF16Selection, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    actions, black, canvas, div, fill, hsla, img, outline, point, prelude::*, px, rgb, size, white,
+    App, BorderStyle, Bounds, BoxShadow, ContentMask, Context, CursorStyle, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, ImageSource, InteractiveElement,
+    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, Pixels, Point as GpuiPoint, RenderImage, SharedString, UTF16Selection, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -32,11 +33,11 @@ use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow,
-    IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos,
-    ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    WDA_EXCLUDEFROMCAPTURE, WHEEL_DELTA, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW,
+    EnumChildWindows, EnumWindows, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
+    IsIconic, IsWindow, IsWindowVisible, PostMessageW, SetForegroundWindow,
+    SetWindowDisplayAffinity, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_SHOWWINDOW,
+    SW_HIDE, SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WHEEL_DELTA, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::capture::{crop_sdr_bgra, CapturedDesktop, Gpu, WgcLive};
@@ -45,14 +46,16 @@ use crate::geom::{
     hit_test, move_rect, physical_source_rect, resize_rect, Point, Rect, SelectionHitKind,
 };
 use crate::gpui_bridge::present_freeze_from_texture;
-use crate::longcapture::{bgra_to_gray, normalize_bgra, Axis, Stitcher};
+use crate::longcapture::Axis;
 use crate::longworker::{
     Done, Job, LongWorker, Outcome, Poll, Rebase, ResultGate, StopReason, Verdict, FINISH_WAIT,
 };
+use crate::orb_stitcher::OrbStitcher;
 use crate::overlay::annotate::{
-    MaskCache, MosaicCache, MosaicTiles, SwatchesModel, TextDraft, TextLayer, ToolbarModel,
+    MaskCache, MosaicCache, MosaicTiles, SpotlightDimCache, SwatchesModel, TextDraft, TextLayer,
+    ToolbarModel,
 };
-use crate::overlay::composite::ElementRuns;
+use crate::overlay::composite::{CoverageRun, ElementRuns};
 use crate::overlay::editor::{Element, PressKind, Session, Shape, Tool};
 use crate::overlay::toolbar::PHASE1_ITEMS;
 use crate::perf::PerfSession;
@@ -81,7 +84,14 @@ pub fn bench_auto_hide_enabled() -> bool {
 
 actions!(
     overlay,
-    [ConfirmSelection, CancelOverlay, UndoEdit, RedoEdit]
+    [
+        ConfirmSelection,
+        CancelOverlay,
+        UndoEdit,
+        RedoEdit,
+        CopyPickedColor,
+        CycleColorFormat
+    ]
 );
 
 thread_local! {
@@ -136,6 +146,17 @@ pub struct OverlayView {
     from_drag: bool,
     has_sel: bool,
     windows: Vec<Rect>,
+    /// Smart-selection candidates for the point under the cursor: the finest
+    /// boundary first, coarser ancestors behind it. Empty when the mode is
+    /// disabled or the cursor is over dead space, which is exactly when a free
+    /// drag must be allowed to start.
+    candidates: Vec<crate::smart_selection::Candidate>,
+    /// The mode this capture was opened with. Read once so flipping the setting
+    /// cannot change the picker's behaviour underneath an open overlay.
+    smart_selection: crate::config::SmartSelectionMode,
+    /// Where the last candidate lookup happened, so a mouse move that stays on
+    /// the same pixel does not re-enumerate every child window.
+    candidates_at: Option<Point>,
     /// Monitor bounds in capture-relative coordinates, captured once per
     /// capture instead of enumerated every frame -- the overlay repaints at
     /// 60fps for the marching ants, and `active_monitor_rect` is called
@@ -160,6 +181,9 @@ pub struct OverlayView {
     /// The overlay repaints every frame for the marching ants; rasterizing the
     /// strokes again only happens when the annotations actually change.
     mask_cache: MaskCache,
+    /// Runs of the whole-image spotlight dim layer, keyed by the marks and the
+    /// selection rect so the full-canvas mask is not rebuilt every frame.
+    spotlight_cache: SpotlightDimCache,
     panel: Option<Panel>,
     /// Read when the overlay is shown, not per frame: the settings window can
     /// rewrite it while this view is alive, and the bar must not change shape
@@ -168,6 +192,12 @@ pub struct OverlayView {
     /// Copy-only capture: mouse-up on a fresh selection confirms immediately,
     /// skipping the toolbar — "框选后直接复制".
     copy_only: bool,
+    /// Screen colour picker state: the colour under the magnifier crosshair and
+    /// the format it is shown in. `C` copies it, `F` cycles the format. Ported
+    /// from snow-shot's `ScreenshotColorPicker` controller/window pair.
+    picked_color: Option<crate::colorpicker::Color>,
+    color_format: crate::colorpicker::ColorFormat,
+    last_color_notice: Option<SharedString>,
     /// The colour popup is open. Session state, not settings: the picker changes
     /// the colour of the next annotation, it does not rewrite the saved default.
     color_open: bool,
@@ -245,6 +275,29 @@ struct LongCaptureState {
     /// bar can draw without touching the worker's buffer.
     segments: usize,
     total_height: usize,
+    /// Latest live-preview thumbnail, rendered once when a progress frame
+    /// arrives and cached here so the bar draws without touching the worker.
+    /// `None` until the first frame established a canvas.
+    preview: Option<(Arc<RenderImage>, u32, u32)>,
+    /// Trim selection over the stitched canvas, in canvas rows: the thumbnail's
+    /// two handles pick what 完成 exports. Ported from snow-shot's
+    /// `ScreenshotScrollingTrimRange`; starts as the whole canvas so an
+    /// untouched session exports everything.
+    trim: crate::longtrim::TrimRange,
+    /// Active thumbnail-handle drag, if any. Held across mouse moves so the
+    /// handle keeps following the pointer even once it leaves the handle's hit
+    /// radius.
+    trim_drag: Option<TrimDrag>,
+    /// Tight BGRA accumulator for the incremental preview bands the worker
+    /// sends. Each band is blitted into this buffer (bottom for a downward
+    /// scroll, top for an upward one) and `preview` is then rebuilt from it, so
+    /// the UI shows the whole growing thumbnail while only the new rows ever
+    /// cross the thread boundary.
+    preview_buf: Vec<u8>,
+    /// Width of the accumulated bands; 0 before the first band.
+    preview_buf_w: u32,
+    /// Height of the accumulated content; 0 before the first band.
+    preview_buf_h: u32,
     /// Generation/epoch/sequence gate: the only thing that decides whether a
     /// finished job may touch this session (P1-01).
     gate: ResultGate,
@@ -257,6 +310,78 @@ struct LongCaptureState {
     /// Opt-in automatic scrolling (default off). Session-only: never written
     /// to `config`, so a later capture cannot start scrolling by itself.
     auto_scroll: AutoScroll,
+    /// Adaptive frame-rate controller. Watches capture/stitch cost per frame
+    /// and lowers the poll rate while either stage is overloaded; the poll
+    /// loop asks it for the next timer interval on every tick.
+    cadence: crate::capture_cadence::CaptureCadence,
+    /// Hover preview over the thumbnail: while the pointer rests on it the
+    /// capture pauses and that band of the canvas is rendered at full
+    /// resolution, so the stitched page can be checked mid-scroll.
+    hover: crate::hoverpreview::HoverPreview,
+    /// The rendered hover band plus its canvas range, cached so drawing costs
+    /// nothing between requests.
+    hover_image: Option<(Arc<RenderImage>, u32, u32)>,
+    /// Canvas rows the hover band covers, for highlighting them on the
+    /// thumbnail. Kept next to the image so the two can never disagree.
+    hover_rows: Option<(u32, u32)>,
+}
+
+/// The canvas rows the hover preview should render for a pointer at `y` (in
+/// thumbnail logical pixels, measured from the thumbnail's top edge).
+///
+/// The band is one viewport tall and centred on the pointer's row, clamped to
+/// the canvas -- the same shape snow-shot's thumbnail asks for, so the preview
+/// shows what one more scroll step would have captured rather than a sliver.
+/// `None` when the pointer is off the thumbnail or the canvas is empty.
+fn hover_rows_at(y: f32, thumb_h: f32, canvas: u32, viewport_h: u32) -> Option<(u32, u32)> {
+    if !(y.is_finite()) || thumb_h <= 0.0 || canvas == 0 {
+        return None;
+    }
+    if y < 0.0 || y > thumb_h {
+        return None;
+    }
+    let row = crate::longtrim::row_at(y, thumb_h, canvas);
+    let span = viewport_h.clamp(1, canvas);
+    let top = row
+        .saturating_sub(span / 2)
+        .min(canvas.saturating_sub(span));
+    Some((top, top + span))
+}
+
+#[cfg(test)]
+mod hover_rows_tests {
+    use super::hover_rows_at;
+
+    #[test]
+    fn a_pointer_band_is_one_viewport_tall_and_centred() {
+        // 1000 canvas rows shown in a 200 px thumbnail; a 200-row viewport.
+        let (top, bottom) = hover_rows_at(100.0, 200.0, 1000, 200).unwrap();
+        assert_eq!(bottom - top, 200);
+        assert_eq!(top, 400, "the pointer's row (500) is the band's centre");
+    }
+
+    #[test]
+    fn a_band_near_the_top_or_bottom_is_clamped_into_the_canvas() {
+        let (top, _) = hover_rows_at(0.0, 200.0, 1000, 200).unwrap();
+        assert_eq!(top, 0);
+        let (top, bottom) = hover_rows_at(200.0, 200.0, 1000, 200).unwrap();
+        assert_eq!((top, bottom), (800, 1000));
+    }
+
+    #[test]
+    fn a_band_is_never_taller_than_the_canvas() {
+        let (top, bottom) = hover_rows_at(10.0, 200.0, 50, 400).unwrap();
+        assert_eq!((top, bottom), (0, 50));
+    }
+
+    #[test]
+    fn a_pointer_outside_the_thumbnail_asks_for_nothing() {
+        assert!(hover_rows_at(-1.0, 200.0, 1000, 200).is_none());
+        assert!(hover_rows_at(201.0, 200.0, 1000, 200).is_none());
+        assert!(hover_rows_at(f32::NAN, 200.0, 1000, 200).is_none());
+        assert!(hover_rows_at(10.0, 0.0, 1000, 200).is_none());
+        assert!(hover_rows_at(10.0, 200.0, 0, 200).is_none());
+    }
 }
 
 fn long_status_hint(axis: Axis) -> String {
@@ -264,6 +389,82 @@ fn long_status_hint(axis: Axis) -> String {
         Axis::Vertical => "滚动页面以继续截图".to_string(),
         Axis::Horizontal => "左右滚动页面以继续截图".to_string(),
     }
+}
+
+/// What a thumbnail drag is currently moving.
+///
+/// The drag is recorded when the pointer goes down on a handle or inside the
+/// selected band and stays active until mouse-up, so the handle keeps following
+/// the pointer after it has moved away from the handle itself.
+struct TrimDrag {
+    edge: crate::longtrim::TrimHit,
+    /// Trim selection at press time. Every move recomputes from this instead of
+    /// from the live range, so the pointer delta is never applied twice.
+    start_range: crate::longtrim::TrimRange,
+    /// Pointer y in window-local logical pixels when the drag started. Moves
+    /// apply `current_y - start_ptr_y`, which is all a drag needs: the handlers
+    /// never learn the thumbnail's laid-out position, only its height.
+    start_ptr_y: f32,
+    /// Drawn thumbnail height in logical pixels: the canvas-to-thumbnail scale
+    /// for this drag. Captured at press time so a preview that grows mid-drag
+    /// cannot rescale the pointer delta under the user.
+    thumb_h: f32,
+}
+
+/// Wraps a tight BGRA thumbnail buffer in a GPUI `RenderImage`. The pixel
+/// convention matches `pin.rs`: BGRA bytes go straight into an `RgbaImage` and
+/// GPUI handles the channel order on upload. Returns `None` on a size mismatch
+/// so a malformed preview can never panic the overlay.
+fn render_image(pixels: &Arc<Vec<u8>>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
+    let rgba = image::RgbaImage::from_raw(w, h, pixels.as_ref().clone())?;
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+}
+
+/// Blits one incremental preview band into the session's accumulated buffer and
+/// rebuilds the cached `RenderImage` from it.
+///
+/// The worker only renders the canvas rows that a frame actually added, so this
+/// is the whole accumulation contract: a `reset` band replaces the buffer, a
+/// prepend inserts rows at the top (shifting the older content down), and an
+/// append writes rows at `top_offset`. Row strides are `width * 4` throughout,
+/// matching tight BGRA.
+fn apply_preview_band(
+    buf: &mut Vec<u8>,
+    buf_w: &mut u32,
+    buf_h: &mut u32,
+    band: &crate::longworker::LivePreview,
+) -> Option<(Arc<Vec<u8>>, u32, u32)> {
+    let w = band.width as usize;
+    let full_h = band.full_height as usize;
+    let band_h = band.height as usize;
+    if w == 0 || full_h == 0 || band_h == 0 {
+        return None;
+    }
+    if band.reset || *buf_w != band.width {
+        buf.clear();
+        *buf_w = band.width;
+        *buf_h = 0;
+    }
+    let row_bytes = w * 4;
+    let needed = row_bytes * full_h;
+    if buf.len() < needed {
+        buf.resize(needed, 0);
+    }
+    // A prepend lands at the top and pushes the older rows down; the band then
+    // covers exactly those inserted rows, so nothing stale survives at [0, band_h).
+    if band.prepend_shift > 0 {
+        let shift = (band.prepend_shift as usize).min(full_h);
+        let old_h = (*buf_h as usize).min(full_h.saturating_sub(shift));
+        if shift > 0 && old_h > 0 {
+            buf.copy_within(0..old_h * row_bytes, shift * row_bytes);
+        }
+    }
+    let y0 = (band.top_offset as usize).min(full_h.saturating_sub(band_h));
+    let src_len = band.pixels.len().min(band_h * row_bytes);
+    let dst_start = y0 * row_bytes;
+    buf[dst_start..dst_start + src_len].copy_from_slice(&band.pixels[..src_len]);
+    *buf_h = band.full_height;
+    Some((Arc::new(buf.clone()), band.width, band.full_height))
 }
 
 /// Axis every long-capture session starts on. Deliberately a constant rather
@@ -283,20 +484,16 @@ fn axis_after_bar_click(current: Axis, clicked: bool) -> Axis {
     }
 }
 
-/// How often auto-scroll posts a wheel notch. The poll runs every `LONG_POLL`
-/// (150 ms) and one notch must not outrun the stitching of the frame before
-/// it: a notch is a few text lines (roughly 60-150 px in a 1000 px viewport),
-/// so 600 ms -- four polls -- lets the worker align and append the frame
-/// before the page moves again. Faster let the content outrun the overlap
-/// strip, slower read as a stalled bar.
-const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(600);
-
 /// Consecutive unconfirmed notches before the page is treated as at its end:
 /// 10 x 600 ms = 6 s of scrolling without a single new row.
 const AUTO_SCROLL_MAX_IDLE_POSTS: u32 = 10;
 
 const AUTO_SCROLL_POST_FAILED: &str = "无法向目标窗口发送滚动，请手动滚动";
 const AUTO_SCROLL_NO_PROGRESS: &str = "自动滚动已停止：未检测到更多内容";
+
+/// Smallest sub-element worth snapping to. Hairline borders and separators make
+/// poor crop edges, so they are dropped before the hover walk.
+const MIN_CANDIDATE_EXTENT: u32 = 6;
 
 /// Pacing and give-up accounting for opt-in auto-scroll. Pure bookkeeping --
 /// no Win32 and no timer: the host asks [`AutoScroll::plan`] on each poll,
@@ -312,6 +509,9 @@ struct AutoScroll {
     idle_posts: u32,
     /// Stitched height after the last applied frame, to detect growth.
     last_height: Option<usize>,
+    /// Beat interval and step magnitude. One source of truth shared with the
+    /// manual single step, so the two can never drift apart.
+    step: crate::scroll_step::ScrollStep,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -325,6 +525,18 @@ enum AutoScrollStep {
 }
 
 impl AutoScroll {
+    /// Session starts from the persisted cadence. The config struct clamps on
+    /// the way in, so a hand-edited file can never outrun the stitcher.
+    fn with_step(step: crate::scroll_step::ScrollStep) -> Self {
+        Self {
+            enabled: false,
+            last_post: None,
+            idle_posts: 0,
+            last_height: None,
+            step,
+        }
+    }
+
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -370,7 +582,7 @@ impl AutoScroll {
         }
         let due = self
             .last_post
-            .is_none_or(|t| now.saturating_duration_since(t) >= AUTO_SCROLL_INTERVAL);
+            .is_none_or(|t| now.saturating_duration_since(t) >= self.step.interval);
         if !due {
             return AutoScrollStep::Wait;
         }
@@ -382,17 +594,33 @@ impl AutoScroll {
         self.idle_posts = self.idle_posts.saturating_add(1);
         AutoScrollStep::Post
     }
+
+    /// The configured step magnitude, in native notches.
+    fn notch_multiplier(&self) -> i32 {
+        self.step.notch_multiplier()
+    }
+
+    /// A manual step restarts the beat, so the automatic post cannot fire
+    /// immediately on top of it: two steps within one interval would move the
+    /// page twice under the same in-flight frame and could outrun the
+    /// estimator's motion window.
+    fn observe_manual_step(&mut self, now: Instant) {
+        self.last_post = Some(now);
+    }
 }
 
-/// Message and signed delta of one notch that continues the capture
-/// direction. Win32 signs: `WM_MOUSEWHEEL` is positive when the wheel turns
-/// forward (away from the user), which scrolls most apps further down the
-/// page; `WM_MOUSEHWHEEL` is positive to the right. Both are the direction the
-/// stitched image grows, so both are `+WHEEL_DELTA`.
-fn wheel_notch(axis: Axis) -> (u32, i32) {
+/// Message and signed delta of one step that continues the capture direction.
+/// Win32 signs: `WM_MOUSEWHEEL` is positive when the wheel turns forward (away
+/// from the user), which scrolls most apps further down the page;
+/// `WM_MOUSEHWHEEL` is positive to the right. Both are the direction the
+/// stitched image grows, so both take a positive delta. `multiplier` widens one
+/// step to several native notches; it is never negative, so a step can only
+/// ever move the page the way the capture is growing.
+fn wheel_notch(axis: Axis, multiplier: i32) -> (u32, i32) {
+    let delta = (WHEEL_DELTA as i32).saturating_mul(multiplier.max(1));
     match axis {
-        Axis::Vertical => (WM_MOUSEWHEEL, WHEEL_DELTA as i32),
-        Axis::Horizontal => (WM_MOUSEHWHEEL, WHEEL_DELTA as i32),
+        Axis::Vertical => (WM_MOUSEWHEEL, delta),
+        Axis::Horizontal => (WM_MOUSEHWHEEL, delta),
     }
 }
 
@@ -403,16 +631,17 @@ fn wheel_lparam(x: i32, y: i32) -> isize {
     (((y as u16 as u32) << 16) | (x as u16 as u32)) as i32 as isize
 }
 
-/// Posts one wheel notch to `hwnd` at screen point `center`.
+/// Posts one scroll step (possibly several notches) to `hwnd` at screen point
+/// `center`.
 ///
 /// `false` when the window is gone or refused the message; the caller then
 /// turns auto-scroll off with a visible reason instead of keeping a switch
 /// that cannot do anything.
-fn post_wheel(hwnd: HWND, axis: Axis, center: POINT) -> bool {
+fn post_wheel(hwnd: HWND, axis: Axis, center: POINT, multiplier: i32) -> bool {
     if hwnd.0.is_null() || unsafe { !IsWindow(Some(hwnd)).as_bool() } {
         return false;
     }
-    let (msg, delta) = wheel_notch(axis);
+    let (msg, delta) = wheel_notch(axis, multiplier);
     // Low word of wParam is the key state (none), high word the signed delta.
     let wparam = ((delta as u32) << 16) as usize;
     let lparam = LPARAM(wheel_lparam(center.x, center.y));
@@ -445,9 +674,10 @@ struct LongLive {
 }
 
 /// How often a frame is sampled. Was 450 ms (the C# cadence) with a full SAD
-/// sweep per direction on the UI thread; coarse-to-fine alignment is ~20x
-/// cheaper, so a 150 ms cadence keeps far more overlap per scroll step instead
-/// of letting the content outrun the strip between samples.
+/// sweep per direction on the UI thread; ORB feature matching now runs on the
+/// worker and recovers offsets up to 0.6 x the viewport between samples, so a
+/// 150 ms cadence keeps plenty of overlap per small-step scroll without
+/// queueing frames the worker cannot align.
 const LONG_POLL: Duration = Duration::from_millis(150);
 /// D3D texture height limit, same cap as the C# LongImageBuffer. Derived from
 /// the shared image budget so the stitcher and the export path cannot drift.
@@ -457,6 +687,14 @@ const LONG_MAX_H: usize = crate::image_budget::MAX_SIDE as usize;
 /// a rotation and a full-frame grayscale pass every 150 ms; a 4x slower poll
 /// notices the resumed scroll within 600 ms.
 const SLOW_POLL_EVERY: u64 = 4;
+/// Cross-axis cap for the hover preview raster. The band is shown at up to
+/// 240 px wide on the bar, so rendering wider than this only costs memory; a
+/// region read at this width still has 4x the detail of the thumbnail.
+const HOVER_PREVIEW_WIDTH: u32 = 640;
+/// How long the tick waits on a hover render. It runs on the worker thread, so
+/// this is a stall bound rather than an expected duration; a timeout simply
+/// drops the preview and the capture resumes.
+const HOVER_PREVIEW_WAIT: Duration = Duration::from_millis(400);
 
 /// Click-through for the selection while a long capture runs: the wheel must
 /// reach the app underneath, not the overlay. HTTRANSPARENT from a WM_NCHITTEST
@@ -572,7 +810,8 @@ pub fn show_overlay(
 ) -> Entity<OverlayView> {
     bind_overlay_keys(cx);
     let session = std::mem::replace(perf, PerfSession::start());
-    match show_overlay_inner(cx, cap, session, copy_only) {
+    let smart_selection = crate::config::get().screenshot.smart_selection;
+    match show_overlay_inner(cx, cap, session, copy_only, smart_selection) {
         Ok(entity) => entity,
         Err(e) => {
             eprintln!("overlay: {e}");
@@ -591,6 +830,9 @@ fn bind_overlay_keys(cx: &mut App) {
         KeyBinding::new("escape", CancelOverlay, Some("Overlay")),
         KeyBinding::new("ctrl-z", UndoEdit, Some("Overlay")),
         KeyBinding::new("ctrl-y", RedoEdit, Some("Overlay")),
+        // `c` / `f` are handled in `on_key_down` rather than bound here: a
+        // binding is dispatched before character input, so it would swallow
+        // the letters while the text tool is active.
     ]);
     KEYS_BOUND.set(true);
 }
@@ -600,6 +842,7 @@ fn show_overlay_inner(
     cap: CapturedDesktop,
     perf: PerfSession,
     copy_only: bool,
+    smart_selection: crate::config::SmartSelectionMode,
 ) -> Result<Entity<OverlayView>> {
     let swap = match cx.with_gpu_context(|device, context| {
         present_freeze_from_texture(
@@ -619,7 +862,7 @@ fn show_overlay_inner(
     if let Some(handle) = OVERLAY_WINDOW.with(|slot| *slot.borrow()) {
         if let Ok(entity) = handle.entity(cx) {
             let _ = handle.update(cx, |view, window, cx| {
-                view.reset_from_capture(cap, perf, swap, copy_only, window);
+                view.reset_from_capture(cap, perf, swap, copy_only, smart_selection, window);
                 view.attach_and_show(window, cx);
             });
             return Ok(entity);
@@ -645,7 +888,17 @@ fn show_overlay_inner(
                 ..Default::default()
             },
             |window, cx| {
-                cx.new(|cx| OverlayView::from_capture(cx, cap, perf, swap, copy_only, window))
+                cx.new(|cx| {
+                    OverlayView::from_capture(
+                        cx,
+                        cap,
+                        perf,
+                        swap,
+                        copy_only,
+                        smart_selection,
+                        window,
+                    )
+                })
             },
         )
         .map_err(|e| crate::error::Error::new(e.to_string()))?;
@@ -701,6 +954,9 @@ impl OverlayView {
             from_drag: false,
             has_sel: false,
             windows: Vec::new(),
+            candidates: Vec::new(),
+            smart_selection: crate::config::SmartSelectionMode::default(),
+            candidates_at: None,
             monitor_rects: Vec::new(),
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
@@ -712,9 +968,13 @@ impl OverlayView {
             text_edit: None,
             mosaic_cache: RefCell::new(None),
             mask_cache: RefCell::new(None),
+            spotlight_cache: RefCell::new(None),
             panel: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
             copy_only: false,
+            picked_color: None,
+            color_format: crate::colorpicker::ColorFormat::Hex,
+            last_color_notice: None,
             color_open: false,
             long: None,
             long_seq: 0,
@@ -727,6 +987,7 @@ impl OverlayView {
         perf: PerfSession,
         swap: IDXGISwapChain1,
         copy_only: bool,
+        smart_selection: crate::config::SmartSelectionMode,
         window: &mut Window,
     ) -> Self {
         let freeze_generation = Some(cap.generation);
@@ -749,6 +1010,9 @@ impl OverlayView {
             from_drag: false,
             has_sel: false,
             windows: Vec::new(),
+            candidates: Vec::new(),
+            smart_selection,
+            candidates_at: None,
             monitor_rects: Vec::new(),
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
@@ -760,9 +1024,13 @@ impl OverlayView {
             text_edit: None,
             mosaic_cache: RefCell::new(None),
             mask_cache: RefCell::new(None),
+            spotlight_cache: RefCell::new(None),
             panel: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
             copy_only,
+            picked_color: None,
+            color_format: crate::colorpicker::ColorFormat::Hex,
+            last_color_notice: None,
             color_open: false,
             long: None,
             long_seq: 0,
@@ -777,6 +1045,7 @@ impl OverlayView {
         perf: PerfSession,
         swap: IDXGISwapChain1,
         copy_only: bool,
+        smart_selection: crate::config::SmartSelectionMode,
         window: &mut Window,
     ) {
         self.selection = Rect::new(0.0, 0.0, 0.0, 0.0);
@@ -803,6 +1072,11 @@ impl OverlayView {
         self.panel = None;
         self.hidden_toolbar_items = crate::config::get().screenshot.hidden_toolbar_items;
         self.copy_only = copy_only;
+        self.picked_color = None;
+        self.last_color_notice = None;
+        self.smart_selection = smart_selection;
+        self.candidates.clear();
+        self.candidates_at = None;
         self.color_open = false;
         self.long = None;
         self.long_seq = self.long_seq.wrapping_add(1);
@@ -829,16 +1103,36 @@ impl OverlayView {
             .unwrap_or_default();
         let hwnd = crate::platform::hwnd_of(window);
         self.windows = detect_windows(hwnd, ox, oy);
+        // Read the cursor before probing candidates: the first frame used to
+        // snap to the previous mouse position because the probe ran before
+        // `GetCursorPos`.
         let mut mouse = Point { x: 0.0, y: 0.0 };
         let mut pt = POINT::default();
-        unsafe {
-            if GetCursorPos(&mut pt).is_ok() {
-                mouse.x = (pt.x - ox) as f64;
-                mouse.y = (pt.y - oy) as f64;
-            }
+        let got_cursor = unsafe { GetCursorPos(&mut pt).is_ok() };
+        if got_cursor {
+            mouse.x = (pt.x - ox) as f64;
+            mouse.y = (pt.y - oy) as f64;
+        } else {
+            pt = POINT {
+                x: (self.mouse.x + ox as f64) as i32,
+                y: (self.mouse.y + oy as f64) as i32,
+            };
+            mouse = Point {
+                x: self.mouse.x,
+                y: self.mouse.y,
+            };
         }
         self.mouse = mouse;
         self.down_pt = mouse;
+        self.candidates = detect_candidates(
+            self.smart_selection,
+            hwnd,
+            pt,
+            ox,
+            oy,
+            self.freeze_size.0,
+            self.freeze_size.1,
+        );
         self.hover = hit_window(&self.windows, mouse);
     }
 
@@ -1066,6 +1360,8 @@ impl OverlayView {
         // here means the click landed outside both.
         self.color_open = false;
         self.editor.shape_open = false;
+        // Any click dismisses the last "copied colour / format" notice.
+        self.last_color_notice = None;
         if event.button == MouseButton::Right {
             // Cancel happens on release (same as the C# WM_RBUTTONUP path),
             // so a right press mid-capture does nothing yet.
@@ -1164,14 +1460,59 @@ impl OverlayView {
         if !self.visible {
             return;
         }
+        // A trim drag outranks the canvas tools: it owns the pointer from press
+        // to release, even after it leaves the thumbnail. Recomputing from the
+        // press-time range keeps the pointer delta authoritative.
+        if let Some(drag) = self.long.as_ref().and_then(|s| s.trim_drag.as_ref()) {
+            let pointer_y = f32::from(event.position.y) / window.scale_factor();
+            let delta = pointer_y - drag.start_ptr_y;
+            let edge = drag.edge;
+            let start_range = drag.start_range;
+            let thumb_h = drag.thumb_h;
+            if let Some(state) = self.long.as_mut() {
+                let canvas = state.total_height.max(1) as u32;
+                let next = match edge {
+                    crate::longtrim::TrimHit::Handle(which) => crate::longtrim::dragged_edge(
+                        start_range,
+                        which,
+                        match which {
+                            crate::longtrim::TrimEdge::Top => start_range.top,
+                            crate::longtrim::TrimEdge::Bottom => start_range.bottom,
+                        },
+                        delta,
+                        thumb_h,
+                        canvas,
+                    ),
+                    crate::longtrim::TrimHit::Band => {
+                        crate::longtrim::dragged_band(start_range, delta, thumb_h, canvas)
+                    }
+                    crate::longtrim::TrimHit::None => None,
+                };
+                if let Some(next) = next {
+                    state.trim = next;
+                }
+            }
+            cx.notify();
+            return;
+        }
         self.mouse = Self::pointer_to_capture(event.position, window.scale_factor());
-        self.on_move();
+        self.on_move(window);
         cx.notify();
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.visible {
             return;
+        }
+        // Ending a trim drag: release the pointer before anything else looks at
+        // it, so the click that ends a drag is not also read as a canvas click.
+        if event.button == MouseButton::Left {
+            if let Some(state) = self.long.as_mut() {
+                if state.trim_drag.take().is_some() {
+                    cx.notify();
+                    return;
+                }
+            }
         }
         if event.button == MouseButton::Right {
             if self.text_edit.take().is_some() {
@@ -1200,7 +1541,7 @@ impl OverlayView {
         cx.notify();
     }
 
-    fn on_move(&mut self) {
+    fn on_move(&mut self, window: &mut Window) {
         if self.down && self.phase == Phase::Selecting {
             let dx = (self.mouse.x - self.down_pt.x).abs();
             let dy = (self.mouse.y - self.down_pt.y).abs();
@@ -1240,7 +1581,32 @@ impl OverlayView {
                     resize_rect(self.sel_at_press, self.hit, self.mouse, bounds, MIN_RECT);
             }
         } else if self.phase == Phase::Selecting {
-            self.hover = hit_window(&self.windows, self.mouse);
+            // Recompute candidates when the mouse moves to a new pixel.
+            if self.candidates_at != Some(self.mouse) {
+                let hwnd = crate::platform::hwnd_of(window);
+                let pt = POINT {
+                    x: (self.mouse.x + self.origin_x as f64) as i32,
+                    y: (self.mouse.y + self.origin_y as f64) as i32,
+                };
+                self.candidates = detect_candidates(
+                    self.smart_selection,
+                    hwnd,
+                    pt,
+                    self.origin_x,
+                    self.origin_y,
+                    self.freeze_size.0,
+                    self.freeze_size.1,
+                );
+                self.candidates_at = Some(self.mouse);
+            }
+            // Candidates are ordered deepest-first, but still ask for the one
+            // containing the cursor so a stale or empty list cannot snap to an
+            // unrelated pane.
+            self.hover = crate::smart_selection::preview_rect(
+                self.smart_selection,
+                &self.candidates,
+                self.mouse,
+            );
         }
     }
 
@@ -1259,8 +1625,12 @@ impl OverlayView {
             let dx = (self.mouse.x - self.down_pt.x).abs();
             let dy = (self.mouse.y - self.down_pt.y).abs();
             let selected = if dx <= MIN_RECT && dy <= MIN_RECT {
-                if let Some(h) = self.hover {
-                    self.selection = h;
+                if let Some(rect) = crate::smart_selection::preview_rect(
+                    self.smart_selection,
+                    &self.candidates,
+                    self.mouse,
+                ) {
+                    self.selection = rect;
                     self.from_drag = false;
                     self.has_sel = true;
                     true
@@ -1377,12 +1747,21 @@ impl OverlayView {
     /// `EntityInputHandler` below (WM_CHAR and the IME result string), which is
     /// also what makes Chinese input work; inserting `key_char` as well would
     /// type every Latin key twice.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(edit) = self.text_edit.as_mut() else {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(edit) = self.text_edit.as_mut() {
+            if event.keystroke.key == "backspace" && edit.backspace() {
+                cx.notify();
+            }
             return;
-        };
-        if event.keystroke.key == "backspace" && edit.backspace() {
-            cx.notify();
+        }
+        // Plain `c` / `f` are colour-picker shortcuts outside text editing.
+        // Checking the modifiers keeps `ctrl-c` and `shift-f` out.
+        if event.keystroke.modifiers == Default::default() {
+            match event.keystroke.key.as_str() {
+                "c" => self.copy_picked_color(&CopyPickedColor, window, cx),
+                "f" => self.cycle_picked_color_format(&CycleColorFormat, window, cx),
+                _ => {}
+            }
         }
     }
 
@@ -1525,6 +1904,10 @@ impl OverlayView {
         annotate::mark_masks(&self.mask_cache, marks)
     }
 
+    fn spotlight_dim_runs(&self, bounds: Rect, marks: &[Element]) -> Option<Rc<Vec<CoverageRun>>> {
+        annotate::spotlight_dim_runs(&self.spotlight_cache, bounds, marks)
+    }
+
     /// What OCR reads is the annotated crop, same as the C# `FlattenSelection`:
     /// a mosaic over a password must hide it from the recognizer too.
     fn selection_pixels(&self, cx: &mut Context<Self>) -> Option<(Vec<u8>, u32, u32, u32)> {
@@ -1618,33 +2001,23 @@ impl OverlayView {
         if pw != result.w || ph != result.h {
             return;
         }
-        let (norm, nw, nh) = match normalize_bgra(&px, w, h, axis) {
-            Ok(v) => v,
-            Err(e) => {
-                self.show_panel("长截图失败", e.to_string(), false, cx);
-                return;
-            }
-        };
         // The 16384 px cap applies in matcher space, i.e. to the scroll axis:
         // for a horizontal session that is the stitched long side (exported
         // width), which is exactly the D3D limit that matters.
-        let mut stitcher = match Stitcher::new(nw, nh, LONG_MAX_H) {
+        let mut stitcher = match OrbStitcher::new(axis, w, h, LONG_MAX_H) {
             Ok(s) => s,
             Err(e) => {
                 self.show_panel("长截图失败", e.to_string(), false, cx);
                 return;
             }
         };
-        if !stitcher.fill_first(norm.as_ref()) {
+        // Seed the stitcher with the first frame. This only initializes snow's
+        // canvas / ORB reference (no matching), and the neutral decision is
+        // discarded here — the worker owns every later frame.
+        if let Err(e) = stitcher.push(&px, w, h) {
+            self.show_panel("长截图失败", e.to_string(), false, cx);
             return;
         }
-        let prev_gray = match bgra_to_gray(norm.as_ref(), nw, nh) {
-            Ok(g) => g,
-            Err(e) => {
-                self.show_panel("长截图失败", e.to_string(), false, cx);
-                return;
-            }
-        };
         self.long_seq = self.long_seq.wrapping_add(1);
         let gen = self.long_seq;
         let gpu_generation = self
@@ -1656,14 +2029,14 @@ impl OverlayView {
         // budget refusal can still be shown before the phase changes, then
         // handed to the worker, which owns it (and every later frame) for the
         // rest of the session.
-        let worker = match LongWorker::new(gen, axis, stitcher, prev_gray) {
+        let worker = match LongWorker::new(gen, axis, stitcher) {
             Ok(w) => w,
             Err(e) => {
                 self.show_panel("长截图失败", format!("后台任务启动失败：{e}"), false, cx);
                 return;
             }
         };
-        let (segments, total_height) = (1, nh);
+        let (segments, total_height) = (1, h);
         self.long = Some(LongCaptureState {
             abs_x,
             abs_y,
@@ -1680,17 +2053,34 @@ impl OverlayView {
             stall_paused: false,
             segments,
             total_height,
+            preview: None,
+            preview_buf: Vec::new(),
+            preview_buf_w: 0,
+            preview_buf_h: 0,
+            // A fresh session selects everything: 完成 without touching a
+            // handle exports the whole stitch, exactly as before this existed.
+            trim: crate::longtrim::TrimRange::full(h.clamp(1, u32::MAX as usize) as u32),
+            trim_drag: None,
             gate: ResultGate::new(gen),
             worker,
             // Filled in just below by `focus_window_under`; auto-scroll cannot
             // post anything until that window is known.
             target: None,
-            auto_scroll: AutoScroll::default(),
+            auto_scroll: AutoScroll::with_step(crate::config::get().screenshot.auto_scroll.step()),
+            cadence: crate::capture_cadence::CaptureCadence::new(),
+            hover: crate::hoverpreview::HoverPreview::new(),
+            hover_image: None,
+            hover_rows: None,
         });
         // The OCR/translate panel has no meaning mid-capture; the C# build
         // collapses ResultPanel here too.
         self.panel = None;
         self.phase = Phase::LongCapturing;
+        // The hover preview is a scrolling-phase feature: it only makes sense
+        // once there is a thumbnail to hover.
+        if let Some(state) = self.long.as_mut() {
+            state.hover.set_enabled(true);
+        }
         let (bar, bar_h) = self.long_bar_placement(window.scale_factor(), 0.0);
         let rect = hole_clear_of_bar(
             RECT {
@@ -1710,6 +2100,9 @@ impl OverlayView {
         let target = focus_window_under(crate::platform::hwnd_of(window), center);
         if let Some(state) = self.long.as_mut() {
             state.target = target;
+            // Auto-scroll is opt-in: it starts off and the user flips it on
+            // from the long-capture bar. It never turns itself on, so a fresh
+            // capture never scrolls unless the user asks it to.
         }
         self.spawn_long_poll(gen, cx);
         cx.notify();
@@ -1750,7 +2143,19 @@ impl OverlayView {
     fn spawn_long_poll(&self, gen: u64, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(LONG_POLL).await;
+                // Adaptive cadence: the interval follows the slower of the
+                // capture / stitch costs measured on the frames processed so
+                // far. Falls back to the fixed 150 ms until a session exists
+                // or after it ends.
+                let interval = this
+                    .update(cx, |this, _cx| {
+                        this.long
+                            .as_ref()
+                            .map(|state| state.cadence.interval())
+                            .unwrap_or(LONG_POLL)
+                    })
+                    .unwrap_or(LONG_POLL);
+                cx.background_executor().timer(interval).await;
                 match this.update(cx, |this, cx| this.long_tick(gen, cx)) {
                     Ok(true) => {}
                     // View gone, session over, or the cap stopped the polling.
@@ -1759,22 +2164,6 @@ impl OverlayView {
             }
         })
         .detach();
-    }
-
-    /// A frame could not be converted or rotated because it is over the image
-    /// budget. Stop polling but leave the bar up for 完成/取消, with a status
-    /// the user can read; the full reason goes to the diagnostic log.
-    fn stop_long_for_budget(
-        &mut self,
-        e: &crate::image_budget::BudgetError,
-        cx: &mut Context<Self>,
-    ) {
-        crate::perf::log_diag(&format!("long-capture stopped: {e}"));
-        if let Some(state) = self.long.as_mut() {
-            state.maxed = true;
-            state.status = "图像超出内存预算".to_string();
-        }
-        cx.notify();
     }
 
     /// One poll: fresh frame, then hand it to the worker, which aligns it
@@ -1844,6 +2233,49 @@ impl OverlayView {
         if !should_keep_polling(true, state.maxed, self.phase == Phase::LongCapturing) {
             return false;
         }
+        // Hover preview handshake. A hover pauses the capture so the canvas
+        // cannot move under the band being rendered; the pause only becomes
+        // real once no job is in flight, which is exactly the state this tick
+        // waits for before it submits anything.
+        if state.hover.paused() && !state.hover.want_pause() {
+            if let Some(request) = state.hover.next_request() {
+                let (epoch, revision) = (state.hover.epoch(), state.hover.content_revision());
+                let job = crate::longworker::RegionJob {
+                    generation: gen,
+                    top: request.top,
+                    bottom: request.bottom,
+                    target_width: HOVER_PREVIEW_WIDTH,
+                };
+                match state.worker.render_region(job, HOVER_PREVIEW_WAIT) {
+                    Some((pixels, w, h)) => {
+                        if state.hover.accept(request, epoch, revision, true) {
+                            let rows = (request.top, request.bottom);
+                            state.hover_rows = Some(rows);
+                            state.hover_image =
+                                render_image(&Arc::new(pixels), w, h).map(|img| (img, w, h));
+                        }
+                    }
+                    None => {
+                        state.hover.accept(request, epoch, revision, false);
+                        state.hover_image = None;
+                        state.hover_rows = None;
+                    }
+                }
+                cx.notify();
+            }
+        }
+        let Some(state) = self.long.as_mut() else {
+            return false;
+        };
+        // While a hover holds the capture no frame is submitted: the canvas is
+        // what the preview is reading.
+        if state.hover.paused() {
+            if !state.gate.in_flight() {
+                state.hover.pause_ready();
+            }
+            state.poll_ticks = state.poll_ticks.wrapping_add(1);
+            return true;
+        }
         // Auto-scroll runs on its own beat, independent of the frame cadence:
         // a paused page (which decimates polling) is exactly what it is for.
         // Its plan refuses to post while a job is in flight.
@@ -1858,6 +2290,9 @@ impl OverlayView {
         if state.gate.in_flight() {
             state.late_ticks = state.late_ticks.wrapping_add(1);
             state.poll_ticks = state.poll_ticks.wrapping_add(1);
+            // Consecutive in-flight polls are backpressure: the worker cannot
+            // drain as fast as we are polling, so lower the target rate.
+            state.cadence.record_pressure(state.late_ticks as usize);
             return true;
         }
         // Reduced cadence while the page is still (P1-05): skip the capture
@@ -1939,9 +2374,10 @@ impl OverlayView {
                     x: state.abs_x + (state.w / 2) as i32,
                     y: state.abs_y + (state.h / 2) as i32,
                 };
+                let multiplier = state.auto_scroll.notch_multiplier();
                 let posted = state
                     .target
-                    .is_some_and(|hwnd| post_wheel(hwnd, state.axis, center));
+                    .is_some_and(|hwnd| post_wheel(hwnd, state.axis, center, multiplier));
                 if !state.auto_scroll.observe_post(posted) {
                     state.status = AUTO_SCROLL_POST_FAILED.to_string();
                     crate::perf::log_diag("long-capture: auto scroll post failed");
@@ -1981,6 +2417,42 @@ impl OverlayView {
         cx.notify();
     }
 
+    /// Single-step scroll: posts exactly one configured step to the capture
+    /// target, on demand, whether or not auto-scroll is running.
+    ///
+    /// This is the manual counterpart of the auto beat and the API snow-shot
+    /// exposes as `scrollOnce`. It deliberately ignores the beat and the
+    /// in-flight guard's *timing*: it is a user action, so the caller decides
+    /// when to press it. It still refuses to run with no target, and it does
+    /// not touch `idle_posts`, so a manual nudge can neither trip nor silence
+    /// the automatic give-up rule.
+    fn step_scroll_once(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.long.as_mut() else {
+            return;
+        };
+        let Some(hwnd) = state.target else {
+            state.status = AUTO_SCROLL_POST_FAILED.to_string();
+            cx.notify();
+            return;
+        };
+        let center = POINT {
+            x: state.abs_x + (state.w / 2) as i32,
+            y: state.abs_y + (state.h / 2) as i32,
+        };
+        let multiplier = state.auto_scroll.notch_multiplier();
+        if post_wheel(hwnd, state.axis, center, multiplier) {
+            // A manual step means the user is driving the wheel: turn
+            // auto-scroll off so its own beat can't fight the user's scroll.
+            state.auto_scroll.set_enabled(false);
+            state.auto_scroll.observe_manual_step(Instant::now());
+            state.status = format!("已滚动一步（{multiplier} 格）");
+        } else {
+            state.status = AUTO_SCROLL_POST_FAILED.to_string();
+            crate::perf::log_diag("long-capture: manual step post failed");
+        }
+        cx.notify();
+    }
+
     /// Applies one finished worker result. Returns false when polling must
     /// stop (the session ended or the worker refused the frame).
     fn apply_long_done(&mut self, done: Done, cx: &mut Context<Self>) -> bool {
@@ -2009,12 +2481,65 @@ impl OverlayView {
                 false
             }
             Outcome::Frame(frame) => {
+                // Feed the adaptive cadence with this frame's two real costs:
+                // capture on the UI thread, stitch (ORB + canvas) on the worker.
+                // The slower stage drives the next poll interval.
+                state
+                    .cadence
+                    .record_frame(frame.spans.capture, frame.spans.process);
                 state.segments = frame.segments;
                 state.total_height = frame.total_height;
                 state.stall_paused = frame.paused;
+                // A progress frame carries only the canvas rows it added; blit
+                // them into the accumulated buffer and rebuild the thumbnail
+                // from that. Idle frames leave the previous preview in place.
+                // `reset` also drives the trim update below, so read it before
+                // the band is moved into the blit.
+                let preview_reset = frame.preview.as_ref().is_some_and(|band| band.reset);
+                if let Some(band) = frame.preview {
+                    if let Some((buf, w, h)) = apply_preview_band(
+                        &mut state.preview_buf,
+                        &mut state.preview_buf_w,
+                        &mut state.preview_buf_h,
+                        &band,
+                    ) {
+                        if let Some(image) = render_image(&buf, w, h) {
+                            state.preview = Some((image, w, h));
+                        }
+                    }
+                }
                 // New rows confirm that scrolling works, whether they came
                 // from auto-scroll or from the user's own wheel.
                 state.auto_scroll.observe_height(frame.total_height);
+                // Keep the trim selection meaningful as the canvas grows. The
+                // growth direction comes from the frame that grew it: a reset
+                // (first frame, axis flip) selects everything again, an upward
+                // scroll inserted rows above the selection, anything else
+                // appended below it. Ported from the snow-shot controller's
+                // Initial/Replaced, PrependedUp and append branches.
+                let canvas = frame.total_height as u32;
+                state.trim = if preview_reset {
+                    crate::longtrim::TrimRange::after_reset(canvas)
+                } else {
+                    match frame.verdict {
+                        Verdict::Progress {
+                            is_up: true,
+                            new_rows,
+                        } => state.trim.after_prepend(new_rows as u32, canvas),
+                        _ => state.trim.after_append(canvas),
+                    }
+                }
+                .unwrap_or(crate::longtrim::TrimRange::full(canvas));
+                // A drag in flight is anchored to a range that may no longer be
+                // meaningful after a reset; drop it rather than let the next
+                // move jump the handle across the canvas.
+                if state
+                    .trim_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.start_range.bottom > canvas)
+                {
+                    state.trim_drag = None;
+                }
                 match frame.verdict {
                     Verdict::Progress { .. } => {
                         state.status = format!(
@@ -2038,6 +2563,11 @@ impl OverlayView {
                     // A transient bad frame was skipped; keep capturing.
                     Verdict::FrameSkipped => {
                         state.status = "捕获帧瞬时异常，已跳过该帧".to_string();
+                    }
+                    Verdict::SceneCut => {
+                        // The page navigated or reflowed: full poll speed, no
+                        // end, and an honest status instead of "match failed".
+                        state.status = "检测到页面内容切换，请继续滚动".to_string();
                     }
                     Verdict::StaticEdge => {
                         // The band is covering the strip right now: say so on
@@ -2133,14 +2663,8 @@ impl OverlayView {
         let Some(px) = self.long_frame(cx, ax, ay, w, h) else {
             return;
         };
-        let (norm, nw, nh) = match normalize_bgra(&px, w as usize, h as usize, next) {
-            Ok(v) => v,
-            Err(e) => {
-                self.stop_long_for_budget(&e, cx);
-                return;
-            }
-        };
-        let mut stitcher = match Stitcher::new(nw, nh, LONG_MAX_H) {
+        let (wu, hu) = (w as usize, h as usize);
+        let mut stitcher = match OrbStitcher::new(next, wu, hu, LONG_MAX_H) {
             Ok(s) => s,
             Err(e) => {
                 crate::perf::log_diag(&format!("long-capture axis switch: {e}"));
@@ -2151,16 +2675,15 @@ impl OverlayView {
                 return;
             }
         };
-        if !stitcher.fill_first(norm.as_ref()) {
+        if let Err(e) = stitcher.push(&px, wu, hu) {
+            crate::perf::log_diag(&format!("long-capture axis switch: {e}"));
+            if let Some(state) = self.long.as_mut() {
+                state.status = "图像超出内存预算".to_string();
+            }
+            cx.notify();
             return;
         }
-        let prev_gray = match bgra_to_gray(norm.as_ref(), nw, nh) {
-            Ok(g) => g,
-            Err(e) => {
-                self.stop_long_for_budget(&e, cx);
-                return;
-            }
-        };
+        let nh = h as usize;
         if let Some(state) = self.long.as_mut() {
             // A fresh epoch invalidates the in-flight frame of the old axis and
             // hands the worker a new baseline, so the two axes can never mix
@@ -2172,7 +2695,6 @@ impl OverlayView {
                 epoch,
                 axis: next,
                 stitcher,
-                prev_gray,
             });
             state.gate.rebaseline(epoch);
             state.axis = next;
@@ -2187,21 +2709,41 @@ impl OverlayView {
         cx.notify();
     }
 
-    /// 完成 on the bar: stitch whatever was captured and export it like a
-    /// finished shot, then close the overlay without another export.
+    /// 完成 on the bar: stitch whatever was captured, hand the result to the
+    /// review window, then close the overlay.
     ///
     /// The worker owns the stitcher now, so 完成 is a terminal hand-off: it
     /// folds the headroom away, rotates a horizontal capture back to screen
     /// space and returns the pixels. That wait is bounded by one pass over the
     /// already-captured buffer and only happens when the user ends the session.
+    ///
+    /// The pixels go to `longpreview` rather than straight to the screenshot
+    /// folder, so the user sees the stitch before it lands anywhere — snow-shot
+    /// does the same with its `ImageStitchingWindow` and treats closing that
+    /// window without saving as discarding the result.
     fn finish_long_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut state) = self.long.take() else {
             return;
         };
         set_long_passthrough(crate::platform::hwnd_of(window), None);
         self.phase = Phase::Active;
+        // The session is over: the hover preview holds a pause that must never
+        // outlive the canvas it was reading.
+        state.hover.reset();
         match state.worker.finish(FINISH_WAIT) {
-            Ok((px, w, h)) => crate::app::export_long_capture(px, w, h),
+            Ok((px, w, h)) => {
+                // The stitched image is the whole canvas; honour the trim
+                // selection the user made on the thumbnail. A selection that no
+                // longer covers exactly the canvas (a frame landed between the
+                // last blit and 完成) still yields the intersection, and a
+                // degenerate one falls back to the full image rather than
+                // exporting nothing.
+                let (px, w, h) = state
+                    .trim
+                    .crop_bgra_axis(&px, w, h, state.axis)
+                    .unwrap_or((px, w, h));
+                crate::longpreview::show_long_preview(cx, px, w, h);
+            }
             Err(msg) => {
                 // The stitched buffer was already within budget, so this is a
                 // failed allocation or a stopped worker rather than a size
@@ -2216,7 +2758,10 @@ impl OverlayView {
 
     /// 取消 / Esc / right-click: drop the session, back to the editor.
     fn cancel_long_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.long.take().is_none() {
+        if let Some(mut state) = self.long.take() {
+            state.hover.reset();
+            state.worker.shutdown();
+        } else {
             return;
         }
         set_long_passthrough(crate::platform::hwnd_of(window), None);
@@ -2380,6 +2925,65 @@ impl OverlayView {
         } else {
             None
         };
+        // The magnifier is a MAG_COUNT×MAG_COUNT crop centred on the cursor, so
+        // its middle pixel is exactly the colour under the crosshair.
+        self.picked_color = self.mag.as_ref().and_then(|(buf, w, h, stride)| {
+            let half = MAG_COUNT / 2;
+            crate::colorpicker::Color::from_bgra(buf, half, half, *w, *h, *stride)
+        });
+    }
+
+    /// `C`: copy the colour under the cursor in the current format. Mirrors
+    /// snow-shot's `copyColorToClipboard` — it flushes the picker first so the
+    /// text always matches the pixel currently under the crosshair.
+    fn copy_picked_color(
+        &mut self,
+        _: &CopyPickedColor,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Never steal keys from a text draft — the IME already got this `c`.
+        if self.text_edit.is_some() {
+            return;
+        }
+        self.refresh_magnifier_gpu(cx);
+        let Some(color) = self.picked_color else {
+            return;
+        };
+        let text = crate::colorpicker::format_color(color, self.color_format);
+        match crate::codec::set_clipboard_text(&text) {
+            Ok(()) => {
+                self.last_color_notice = Some(format!("已复制颜色 {text}").into());
+            }
+            Err(_) => {
+                self.last_color_notice = Some("复制颜色失败".into());
+            }
+        }
+        cx.notify();
+    }
+
+    /// `F`: cycle Hex → HexWithoutHash → Rgb → Hsl, matching snow-shot's
+    /// `ScreenshotColorPickerWindow::cycleColorFormat`.
+    fn cycle_picked_color_format(
+        &mut self,
+        _: &CycleColorFormat,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.text_edit.is_some() {
+            return;
+        }
+        self.color_format = self.color_format.next();
+        if let Some(color) = self.picked_color {
+            self.last_color_notice = Some(
+                format!(
+                    "颜色格式 {}",
+                    crate::colorpicker::format_color(color, self.color_format)
+                )
+                .into(),
+            );
+        }
+        cx.notify();
     }
 
     fn toolbar_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -2420,6 +3024,7 @@ impl OverlayView {
                 arrow_head: self.editor.arrow_head,
                 badge_style: self.editor.badge_style,
                 badge_size: self.editor.badge_size,
+                spotlight_kind: self.editor.spotlight_kind,
             },
             Rc::new(|id, this: &mut Self, window, cx| this.handle_toolbar(id, window, cx)),
             Rc::new(|f, this: &mut Self, _, cx| {
@@ -2580,15 +3185,249 @@ impl OverlayView {
         } else {
             "自动滚动:关".into()
         };
+
+        // Live preview: a downsampled snapshot of the growing canvas, sent from
+        // the worker on each progress frame. It is cached as a RenderImage on
+        // the session, so drawing costs nothing. Kept small so the capture bar
+        // stays unobtrusive; the full image is shown in the preview window on
+        // 完成.
+        //
+        // The thumbnail doubles as the trim editor (the snow-shot scrolling
+        // thumbnail widget): the rows outside the selection are dimmed, and two
+        // handles drag the top and bottom edges. GPUI does not hand a mouse
+        // handler its element's bounds, so the handlers work in thumbnail
+        // coordinates obtained from the pointer minus the position the bar was
+        // laid out at -- the same placement the element uses.
+        let preview_el: gpui::AnyElement = if let Some((image, pw, ph)) = &state.preview {
+            const MAX_W: f32 = 240.0;
+            const MAX_H: f32 = 170.0;
+            let pw = *pw;
+            let ph = *ph;
+            let k = (MAX_W / pw.max(1) as f32)
+                .min(MAX_H / ph.max(1) as f32)
+                .min(1.0);
+            let dw = (pw.max(1) as f32 * k).max(1.0);
+            let dh = (ph.max(1) as f32 * k).max(1.0);
+            // Thumbnail geometry, in the same logical pixels GPUI reports mouse
+            // positions in. The bar is placed at `pos` (capture coordinates,
+            // divided by the scale factor to get logical pixels) and pads its
+            // content by 12px horizontally and 6px vertically, so the thumbnail
+            // starts one padding below the bar's top edge.
+            const BAR_PAD_Y: f32 = 6.0;
+            let thumb_top = pos.y as f32 / scale + BAR_PAD_Y;
+            let canvas = state.total_height.max(1) as u32;
+            let trim = state.trim;
+            let trim_scale = dh / canvas as f32;
+            let top_y = trim.top as f32 * trim_scale;
+            let bottom_y = trim.bottom as f32 * trim_scale;
+            div()
+                .flex()
+                .justify_center()
+                .w_full()
+                .mb(px(6.))
+                .child(
+                    div()
+                        .id("long-thumb")
+                        .relative()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme::border())
+                        .overflow_hidden()
+                        .cursor(if state.trim_drag.is_some() {
+                            CursorStyle::ClosedHand
+                        } else {
+                            CursorStyle::Arrow
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                let pointer_y = f32::from(event.position.y) / window.scale_factor();
+                                let y = pointer_y - thumb_top;
+                                let Some(state) = this.long.as_mut() else {
+                                    return;
+                                };
+                                let canvas = state.total_height.max(1) as u32;
+                                match crate::longtrim::hit_test(y, dh, state.trim, canvas) {
+                                    crate::longtrim::TrimHit::None => {}
+                                    hit => {
+                                        cx.stop_propagation();
+                                        state.trim_drag = Some(TrimDrag {
+                                            edge: hit,
+                                            start_range: state.trim,
+                                            start_ptr_y: pointer_y,
+                                            thumb_h: dh,
+                                        });
+                                        // A trim drag and the hover preview want
+                                        // the same pointer: cropping wins, so
+                                        // the capture resumes while dragging.
+                                        state.hover.set_hover(None);
+                                        state.hover_image = None;
+                                        state.hover_rows = None;
+                                        cx.notify();
+                                    }
+                                }
+                            }),
+                        )
+                        // Hover preview: the pointer picks a band of canvas
+                        // rows and the capture pauses while it is rendered at
+                        // full resolution. Tracking only while no trim drag is
+                        // active keeps one pointer from doing two jobs.
+                        .on_mouse_move(cx.listener(
+                            move |this, event: &MouseMoveEvent, window, cx| {
+                                let Some(state) = this.long.as_mut() else {
+                                    return;
+                                };
+                                if state.trim_drag.is_some() {
+                                    return;
+                                }
+                                let pointer_y = f32::from(event.position.y) / window.scale_factor();
+                                let canvas = state.total_height.max(1) as u32;
+                                // One viewport-tall band, along the stitch axis:
+                                // the height of a vertical capture, the width of a
+                                // horizontal one.
+                                let viewport = match state.axis {
+                                    Axis::Vertical => state.h,
+                                    Axis::Horizontal => state.w,
+                                };
+                                let rows =
+                                    hover_rows_at(pointer_y - thumb_top, dh, canvas, viewport);
+                                if state.hover.hover() != rows {
+                                    state.hover.set_cropping(false);
+                                    state.hover.set_hover(rows);
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                            if *hovered {
+                                return;
+                            }
+                            let Some(state) = this.long.as_mut() else {
+                                return;
+                            };
+                            state.hover.set_hover(None);
+                            state.hover_image = None;
+                            state.hover_rows = None;
+                            cx.notify();
+                        }))
+                        .child(img(ImageSource::Render(image.clone())).w(px(dw)).h(px(dh)))
+                        // Dim the rows the selection excludes: two translucent
+                        // bands, one above and one below the chosen range.
+                        .when(top_y > 0.5, |el| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .top(px(0.))
+                                    .left(px(0.))
+                                    .w(px(dw))
+                                    .h(px(top_y))
+                                    .bg(theme::base().opacity(0.55)),
+                            )
+                        })
+                        .when(bottom_y < dh - 0.5, |el| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .top(px(bottom_y))
+                                    .left(px(0.))
+                                    .w(px(dw))
+                                    .h(px((dh - bottom_y).max(0.)))
+                                    .bg(theme::base().opacity(0.55)),
+                            )
+                        })
+                        // The two edges of the kept range, drawn as thin accent
+                        // rules so the boundary is visible without a handle
+                        // glyph on so small a thumbnail.
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(top_y))
+                                .left(px(0.))
+                                .w(px(dw))
+                                .h(px(1.))
+                                .bg(theme::accent()),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px((bottom_y - 1.).max(0.)))
+                                .left(px(0.))
+                                .w(px(dw))
+                                .h(px(1.))
+                                .bg(theme::accent()),
+                        )
+                        // Hover band: the rows the pointer picked, outlined on the
+                        // thumbnail so the user can tell which part of the page
+                        // the floating preview belongs to.
+                        .when_some(state.hover_rows, |el, (h_top, h_bottom)| {
+                            let hy = h_top as f32 * trim_scale;
+                            let hh = ((h_bottom - h_top) as f32 * trim_scale).max(1.0);
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .top(px(hy))
+                                    .left(px(0.))
+                                    .w(px(dw))
+                                    .h(px(hh))
+                                    .border_1()
+                                    .border_color(theme::primary_fg()),
+                            )
+                        }),
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
+        // Hover preview: the band under the pointer, rendered from the canvas
+        // at capture resolution while the capture is held. It sits under the
+        // thumbnail rather than over it so neither occludes the other, and it
+        // is sized to the same width the thumbnail is capped at.
+        let hover_el: gpui::AnyElement = match (&state.hover_image, state.hover_rows) {
+            (Some((image, hw, hh)), Some((top, bottom))) => {
+                const MAX_W: f32 = 240.0;
+                const MAX_H: f32 = 120.0;
+                let k = (MAX_W / (*hw).max(1) as f32)
+                    .min(MAX_H / (*hh).max(1) as f32)
+                    .min(1.0);
+                let dw = ((*hw).max(1) as f32 * k).max(1.0);
+                let dh = ((*hh).max(1) as f32 * k).max(1.0);
+                let label: SharedString = format!("第 {top}–{bottom} 行（采集已暂停）").into();
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(2.))
+                    .w_full()
+                    .mb(px(6.))
+                    .child(
+                        div()
+                            .relative()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme::primary_fg())
+                            .overflow_hidden()
+                            .child(img(ImageSource::Render(image.clone())).w(px(dw)).h(px(dh))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(theme::secondary_fg())
+                            .child(label),
+                    )
+                    .into_any_element()
+            }
+            _ => div().into_any_element(),
+        };
+
         Some(
             div()
                 .absolute()
                 .left(px(pos.x as f32 / scale))
                 .top(px(pos.y as f32 / scale))
                 .flex()
-                .flex_row()
+                .flex_col()
                 .items_center()
-                .gap(px(8.))
                 .px(px(12.))
                 .py(px(6.))
                 .rounded_xl()
@@ -2606,104 +3445,137 @@ impl OverlayView {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
                 })
+                .child(preview_el)
+                .child(hover_el)
                 .child(
-                    // Direction toggle: wide pages are captured left/right.
-                    // Toggling resets the session so the two axes never mix.
                     div()
-                        .id("long-axis")
-                        .px(px(10.))
-                        .py(px(5.))
-                        .rounded_md()
-                        .text_size(px(12.))
-                        .text_color(theme::primary_fg())
-                        .bg(theme::active_background())
-                        .hover(|s| s.bg(theme::elevated_surface()))
-                        .cursor(CursorStyle::PointingHand)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _window, cx| {
-                                cx.stop_propagation();
-                                this.switch_long_axis(cx);
-                            }),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        // Direction toggle: wide pages are captured left/right.
+                        // Toggling resets the session so the two axes never mix.
+                        .child(
+                            div()
+                                .id("long-axis")
+                                .px(px(10.))
+                                .py(px(5.))
+                                .rounded_md()
+                                .text_size(px(12.))
+                                .text_color(theme::primary_fg())
+                                .bg(theme::active_background())
+                                .hover(|s| s.bg(theme::elevated_surface()))
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.switch_long_axis(cx);
+                                    }),
+                                )
+                                .child(axis_label),
                         )
-                        .child(axis_label),
-                )
-                .child(
-                    // Auto-scroll switch: opt-in, session-only, and independent
-                    // of the axis and the buffer. Off is the manual model
-                    // exactly as it was.
-                    div()
-                        .id("long-auto")
-                        .px(px(10.))
-                        .py(px(5.))
-                        .rounded_md()
-                        .text_size(px(12.))
-                        .text_color(if auto_on {
-                            theme::on_accent()
-                        } else {
-                            theme::primary_fg()
-                        })
-                        .bg(if auto_on {
-                            theme::accent()
-                        } else {
-                            theme::active_background()
-                        })
-                        .hover(|s| s.bg(theme::elevated_surface()))
-                        .cursor(CursorStyle::PointingHand)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _window, cx| {
-                                cx.stop_propagation();
-                                this.toggle_auto_scroll(cx);
-                            }),
+                        // Auto-scroll switch: opt-in, session-only, and
+                        // independent of the axis and the buffer. Off is the
+                        // manual model exactly as it was.
+                        .child(
+                            div()
+                                .id("long-auto")
+                                .px(px(10.))
+                                .py(px(5.))
+                                .rounded_md()
+                                .text_size(px(12.))
+                                .text_color(if auto_on {
+                                    theme::on_accent()
+                                } else {
+                                    theme::primary_fg()
+                                })
+                                .bg(if auto_on {
+                                    theme::accent()
+                                } else {
+                                    theme::active_background()
+                                })
+                                .hover(|s| s.bg(theme::elevated_surface()))
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_auto_scroll(cx);
+                                    }),
+                                )
+                                .child(auto_label),
                         )
-                        .child(auto_label),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme::primary_fg())
-                        .child(status),
-                )
-                .child(
-                    div()
-                        .id("long-finish")
-                        .px(px(10.))
-                        .py(px(5.))
-                        .rounded_md()
-                        .text_size(px(12.))
-                        .text_color(theme::on_accent())
-                        .bg(theme::accent())
-                        .hover(|s| s.bg(theme::accent_hover()))
-                        .cursor(CursorStyle::PointingHand)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.finish_long_capture(window, cx);
-                            }),
+                        // Single-step nudge: posts one configured step on
+                        // demand, whether auto-scroll is running or not. The
+                        // snow-shot `scrollOnce` equivalent, handy to push
+                        // past a stall or to step a page by hand.
+                        .child(
+                            div()
+                                .id("long-step")
+                                .px(px(10.))
+                                .py(px(5.))
+                                .rounded_md()
+                                .text_size(px(12.))
+                                .text_color(theme::primary_fg())
+                                .bg(theme::active_background())
+                                .hover(|s| s.bg(theme::elevated_surface()))
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.step_scroll_once(cx);
+                                    }),
+                                )
+                                .child("单步"),
                         )
-                        .child("完成"),
-                )
-                .child(
-                    div()
-                        .id("long-cancel")
-                        .px(px(10.))
-                        .py(px(5.))
-                        .rounded_md()
-                        .text_size(px(12.))
-                        .text_color(theme::primary_fg())
-                        .bg(theme::active_background())
-                        .hover(|s| s.bg(theme::elevated_surface()))
-                        .cursor(CursorStyle::PointingHand)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.cancel_long_capture(window, cx);
-                            }),
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme::primary_fg())
+                                .child(status),
                         )
-                        .child("取消"),
+                        .child(
+                            div()
+                                .id("long-finish")
+                                .px(px(10.))
+                                .py(px(5.))
+                                .rounded_md()
+                                .text_size(px(12.))
+                                .text_color(theme::on_accent())
+                                .bg(theme::accent())
+                                .hover(|s| s.bg(theme::accent_hover()))
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.finish_long_capture(window, cx);
+                                    }),
+                                )
+                                .child("完成"),
+                        )
+                        .child(
+                            div()
+                                .id("long-cancel")
+                                .px(px(10.))
+                                .py(px(5.))
+                                .rounded_md()
+                                .text_size(px(12.))
+                                .text_color(theme::primary_fg())
+                                .bg(theme::active_background())
+                                .hover(|s| s.bg(theme::elevated_surface()))
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.cancel_long_capture(window, cx);
+                                    }),
+                                )
+                                .child("取消"),
+                        ),
                 ),
         )
     }
@@ -2973,6 +3845,7 @@ impl Render for OverlayView {
         let has_sel = self.has_sel;
         let marks: Vec<Element> = self.editor.visible().cloned().collect();
         let masks = self.mark_masks(&marks);
+        let dim = shown.and_then(|r| self.spotlight_dim_runs(r, &marks));
         let mosaic = self.mosaic_tiles(&marks, cx);
         let tool = self.editor.tool;
         // Registered from the canvas paint so the IME talks to this view while
@@ -2988,6 +3861,10 @@ impl Render for OverlayView {
             (Phase::Active, Tool::Text, _) => CursorStyle::IBeam,
             _ => CursorStyle::Crosshair,
         };
+        let candidates = self.candidates.clone();
+        let picked_color = self.picked_color;
+        let color_format = self.color_format;
+        let color_notice = self.last_color_notice.clone();
 
         div()
             .id("overlay-root")
@@ -3006,6 +3883,8 @@ impl Render for OverlayView {
             .on_action(cx.listener(Self::cancel_action))
             .on_action(cx.listener(Self::undo_action))
             .on_action(cx.listener(Self::redo_action))
+            .on_action(cx.listener(Self::copy_picked_color))
+            .on_action(cx.listener(Self::cycle_picked_color_format))
             // Everything visible hangs off `visible`, so the frame drawn on the way
             // out is empty. gpui's layer is a separate swap chain from the freeze
             // frame and keeps its last frame while the window is hidden; leaving the
@@ -3036,7 +3915,9 @@ impl Render for OverlayView {
                                     scale,
                                     marks,
                                     masks,
+                                    dim,
                                     mosaic,
+                                    candidates,
                                 },
                             );
                         },
@@ -3044,6 +3925,14 @@ impl Render for OverlayView {
                     .size_full(),
                 )
                 .child(coord_label(shown, mouse, phase, scale))
+                .child(color_picker_label(
+                    picked_color,
+                    color_format,
+                    color_notice,
+                    mouse,
+                    phase,
+                    scale,
+                ))
                 .children(self.toolbar_element(scale, cx))
                 .children(self.props_element(scale, cx))
                 .children(self.long_bar_element(scale, cx))
@@ -3086,6 +3975,57 @@ fn coord_label(shown: Option<Rect>, mouse: Point, phase: Phase, scale: f32) -> i
         .child(text)
 }
 
+/// Colour swatch + value next to the magnifier while selecting. `C` copies the
+/// value, `F` cycles the format; a transient notice confirms the last action.
+fn color_picker_label(
+    color: Option<crate::colorpicker::Color>,
+    format: crate::colorpicker::ColorFormat,
+    notice: Option<SharedString>,
+    mouse: Point,
+    phase: Phase,
+    scale: f32,
+) -> impl IntoElement {
+    if phase != Phase::Selecting || color.is_none() && notice.is_none() {
+        return div();
+    }
+    // Sits just below the coordinate label, to the right of the cursor.
+    let x = mouse.x as f32 / scale + 12.0;
+    let y = mouse.y as f32 / scale + 30.0;
+    let text = match color {
+        Some(c) => crate::colorpicker::format_color(c, format),
+        None => String::new(),
+    };
+    let notice = notice.unwrap_or_default();
+    let swatch = color
+        .map(|c| rgb((u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b)))
+        .unwrap_or_else(|| hsla(0., 0., 0., 1.).into());
+    div()
+        .absolute()
+        .left(px(x.max(0.0)))
+        .top(px(y.max(0.0)))
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .bg(hsla(0., 0., 0., 0.8))
+        .text_color(white())
+        .text_xs()
+        .px(px(4.))
+        .py(px(2.))
+        .child(
+            div()
+                .w(px(10.0))
+                .h(px(10.0))
+                .bg(swatch)
+                .border_1()
+                .border_color(white()),
+        )
+        .child(
+            div()
+                .child(text)
+                .when(!notice.is_empty(), |el| el.child(div().child(notice))),
+        )
+}
+
 struct OverlayPaint {
     shown: Option<Rect>,
     mouse: Point,
@@ -3096,7 +4036,9 @@ struct OverlayPaint {
     scale: f32,
     marks: Vec<Element>,
     masks: Vec<Option<Rc<ElementRuns>>>,
+    dim: Option<Rc<Vec<CoverageRun>>>,
     mosaic: Rc<MosaicTiles>,
+    candidates: Vec<crate::smart_selection::Candidate>,
 }
 
 fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPaint) {
@@ -3110,7 +4052,9 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
         scale,
         marks,
         masks,
+        dim,
         mosaic,
+        candidates,
     } = paint;
     let origin = Point { x: 0.0, y: 0.0 };
     let hole = shown.map(|r| annotate::rect_to_bounds(r, scale));
@@ -3125,6 +4069,16 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
             paint_handles(window, dest, scale);
         }
     }
+    // Smart selection candidates: draw a subtle outline around the candidate
+    // boundaries when in selecting mode and no selection is made yet.
+    if phase == Phase::Selecting && shown.is_none() {
+        // Candidates are in screen-space pixels (capture-relative). We need to
+        // draw them with the same scale as the overlay.
+        if let Some(cand) = candidates.first() {
+            let bounds = annotate::rect_to_bounds(cand.rect, scale);
+            window.paint_quad(outline(bounds, hsla(0., 0.8, 1., 0.8), BorderStyle::Solid));
+        }
+    }
     // Annotations are clipped to the selection: the export composites onto a buffer
     // that IS the crop, so anything outside it never reaches the saved image. Without
     // the same clip here the overlay would promise strokes the file does not have.
@@ -3134,10 +4088,18 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
                 bounds: annotate::rect_to_bounds(r, scale),
             };
             window.with_content_mask(Some(mask), |window| {
+                if let Some(runs) = &dim {
+                    annotate::paint_spotlight(window, runs, origin, scale);
+                }
                 annotate::paint_marks(window, &marks, &masks, &mosaic, origin, scale);
             });
         }
-        None => annotate::paint_marks(window, &marks, &masks, &mosaic, origin, scale),
+        None => {
+            if let Some(runs) = &dim {
+                annotate::paint_spotlight(window, runs, origin, scale);
+            }
+            annotate::paint_marks(window, &marks, &masks, &mosaic, origin, scale);
+        }
     }
     if phase == Phase::Selecting {
         if let Some(pixels) = mag {
@@ -3309,6 +4271,205 @@ fn detect_windows(self_hwnd: HWND, ox: i32, oy: i32) -> Vec<Rect> {
         let _ = EnumWindows(Some(enum_win), LPARAM(&mut ctx as *mut _ as isize));
     }
     ctx.rects
+}
+
+/// Collects the smart-selection candidates under `pt`, in screen pixels then
+/// shifted into the frozen image's coordinate space.
+///
+/// Two sources, matching snow-shot's split between whole windows and the panes
+/// inside them:
+///
+/// * `Window` mode asks only for the top-level window at the point — a single
+///   rect, no child enumeration.
+/// * `WindowSubElement` adds the visible child HWNDs under the cursor (the way
+///   snow-shot's `visible_child_window_rects` does, for classic Win32 apps) and
+///   the UIA elements under it (for apps that paint panes inside one HWND).
+///
+/// Depth is assigned by rect containment: a pane inside another candidate is
+/// one layer deeper. That puts the same scale on child HWNDs and UIA elements,
+/// so the hover walk can order them without knowing where each came from.
+fn detect_candidates(
+    mode: crate::config::SmartSelectionMode,
+    self_hwnd: HWND,
+    pt: POINT,
+    ox: i32,
+    oy: i32,
+    capture_w: u32,
+    capture_h: u32,
+) -> Vec<crate::smart_selection::Candidate> {
+    use crate::smart_selection::{candidates_for, Candidate};
+    if !mode.enabled() {
+        return Vec::new();
+    }
+    // The top-level window under the point: the same z-ordered walk the
+    // long-capture focus hand-off uses, so both features agree on what "the
+    // window under the cursor" is.
+    let Some(top) = window_under_point(self_hwnd, pt) else {
+        return Vec::new();
+    };
+    let shift = |r: RECT| -> Rect {
+        Rect::new(
+            (r.left - ox) as f64,
+            (r.top - oy) as f64,
+            (r.right - r.left) as f64,
+            (r.bottom - r.top) as f64,
+        )
+    };
+    let mut rects: Vec<Rect> = Vec::new();
+    if let Some(bounds) = real_window_rect(top) {
+        rects.push(shift(bounds));
+        if mode.wants_sub_elements() {
+            // Two sources of sub-elements, mirroring snow-shot's split:
+            // classic child HWNDs ...
+            let mut ctx = ChildCtx {
+                bounds,
+                pt,
+                rects: Vec::new(),
+            };
+            unsafe {
+                let _ = EnumChildWindows(
+                    Some(top),
+                    Some(enum_child_window_proc),
+                    LPARAM(&mut ctx as *mut _ as isize),
+                );
+            }
+            rects.extend(ctx.rects.into_iter().map(shift));
+
+            // ... and UIA elements for modern apps that paint their panes
+            // inside a single HWND (WPF / Electron / Chromium).
+            rects.extend(
+                crate::uia::elements_at_point(top, pt)
+                    .into_iter()
+                    .map(|el| shift(el.rect)),
+            );
+        }
+    }
+    if rects.is_empty() {
+        return Vec::new();
+    }
+    // Nesting gives depth: a rect contained by another is one layer deeper.
+    let depths: Vec<u32> = rects
+        .iter()
+        .map(|r| {
+            rects
+                .iter()
+                .filter(|o| o != &r && contains_rect(o, r))
+                .count() as u32
+        })
+        .collect();
+    let raw: Vec<Candidate> = rects
+        .into_iter()
+        .zip(depths)
+        .map(|(rect, depth)| Candidate { rect, depth })
+        .collect();
+    // Deepest / smallest first, filter to the frozen image. Without this the
+    // window rect — pushed first — would always win `.first()` and the picker
+    // would never snap to a child pane.
+    candidates_for(
+        mode,
+        raw,
+        Rect::new(0.0, 0.0, capture_w as f64, capture_h as f64),
+        MIN_CANDIDATE_EXTENT as f64,
+    )
+}
+
+/// Whether `outer` fully contains `inner`.
+fn contains_rect(outer: &Rect, inner: &Rect) -> bool {
+    outer.x <= inner.x
+        && outer.y <= inner.y
+        && outer.right() >= inner.right()
+        && outer.bottom() >= inner.bottom()
+        && (outer.width > inner.width || outer.height > inner.height)
+}
+
+/// Top-level window under a screen point, skipping this overlay.
+fn window_under_point(self_hwnd: HWND, pt: POINT) -> Option<HWND> {
+    struct Ctx {
+        exclude: HWND,
+        pt: POINT,
+        found: HWND,
+    }
+    unsafe extern "system" fn walk(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        unsafe {
+            let ctx = &mut *(lparam.0 as *mut Ctx);
+            if hwnd == ctx.exclude {
+                return windows::core::BOOL(1);
+            }
+            let Some(wr) = real_window_rect(hwnd) else {
+                return windows::core::BOOL(1);
+            };
+            if ctx.pt.x >= wr.left
+                && ctx.pt.x < wr.right
+                && ctx.pt.y >= wr.top
+                && ctx.pt.y < wr.bottom
+            {
+                ctx.found = hwnd;
+                return windows::core::BOOL(0);
+            }
+            windows::core::BOOL(1)
+        }
+    }
+    let mut ctx = Ctx {
+        exclude: self_hwnd,
+        pt,
+        found: HWND::default(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(walk), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    if ctx.found.0.is_null() {
+        None
+    } else {
+        Some(ctx.found)
+    }
+}
+
+struct ChildCtx {
+    bounds: RECT,
+    pt: POINT,
+    rects: Vec<RECT>,
+}
+
+/// Collects one visible child window's rect, clipped to the parent window.
+///
+/// This mirrors snow-shot's `enum_child_window_proc`: invisible children and
+/// children that cover the whole parent are skipped, because a child identical
+/// to its parent adds no boundary and would duplicate the window rect. Only
+/// panes that actually sit under the cursor are candidates — a sibling pane on
+/// the other side of the window must never become a hover/click boundary.
+unsafe extern "system" fn enum_child_window_proc(
+    hwnd: HWND,
+    lparam: LPARAM,
+) -> windows::core::BOOL {
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() {
+            return windows::core::BOOL(1);
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return windows::core::BOOL(1);
+        }
+        let ctx = &mut *(lparam.0 as *mut ChildCtx);
+        let clipped = RECT {
+            left: rect.left.max(ctx.bounds.left),
+            top: rect.top.max(ctx.bounds.top),
+            right: rect.right.min(ctx.bounds.right),
+            bottom: rect.bottom.min(ctx.bounds.bottom),
+        };
+        let non_empty = clipped.right - clipped.left > 5 && clipped.bottom - clipped.top > 5;
+        let same_as_parent = clipped.left == ctx.bounds.left
+            && clipped.top == ctx.bounds.top
+            && clipped.right == ctx.bounds.right
+            && clipped.bottom == ctx.bounds.bottom;
+        let under_cursor = ctx.pt.x >= clipped.left
+            && ctx.pt.x < clipped.right
+            && ctx.pt.y >= clipped.top
+            && ctx.pt.y < clipped.bottom;
+        if non_empty && !same_as_parent && under_cursor {
+            ctx.rects.push(clipped);
+        }
+        windows::core::BOOL(1)
+    }
 }
 
 /// Frame bounds of a window a user could actually be looking at: visible, not
@@ -3596,6 +4757,11 @@ mod tests {
 
     // ---- opt-in auto scroll -------------------------------------------------
 
+    /// The beat the tests advance by: the configured default, so a change to
+    /// the policy in `scroll_step` shows up here as a test failure rather than
+    /// as a silently different cadence.
+    const BEAT: Duration = crate::scroll_step::DEFAULT_INTERVAL;
+
     #[test]
     fn auto_scroll_off_by_default() {
         let mut auto = AutoScroll::default();
@@ -3614,7 +4780,7 @@ mod tests {
         // Due (nothing posted yet), but the worker still owns a frame.
         assert_eq!(auto.plan(t0, true), AutoScrollStep::Wait);
         assert_eq!(
-            auto.plan(t0 + AUTO_SCROLL_INTERVAL * 3, true),
+            auto.plan(t0 + BEAT * 3, true),
             AutoScrollStep::Wait,
             "a long in-flight frame must not accumulate posts"
         );
@@ -3625,9 +4791,50 @@ mod tests {
             AutoScrollStep::Wait,
             "the beat has to elapse before the next notch"
         );
+        assert_eq!(auto.plan(t0 + BEAT, false), AutoScrollStep::Post);
+    }
+
+    /// A fresh session must carry the persisted step into its beat. Without
+    /// this, the settings dropdown would write a value the capture never reads.
+    #[test]
+    fn auto_scroll_session_starts_from_the_configured_step() {
+        let configured = crate::config::AutoScroll {
+            interval_ms: 250,
+            notches: 4,
+        }
+        .step();
+        let mut auto = AutoScroll::with_step(configured);
+        auto.set_enabled(true);
+        let t0 = Instant::now();
+        assert_eq!(auto.plan(t0, false), AutoScrollStep::Post);
         assert_eq!(
-            auto.plan(t0 + AUTO_SCROLL_INTERVAL, false),
+            auto.plan(t0 + Duration::from_millis(249), false),
+            AutoScrollStep::Wait
+        );
+        assert_eq!(
+            auto.plan(t0 + Duration::from_millis(250), false),
             AutoScrollStep::Post
+        );
+        assert_eq!(auto.step.notch_multiplier(), 4);
+    }
+
+    /// The beat comes from the configuration, not from a constant buried in
+    /// this file, so a slower step really does slow the session down.
+    #[test]
+    fn auto_scroll_honours_the_configured_interval() {
+        let mut auto = AutoScroll::default();
+        auto.set_enabled(true);
+        auto.step.set_interval(Duration::from_millis(200));
+        let t0 = Instant::now();
+        assert_eq!(auto.plan(t0, false), AutoScrollStep::Post);
+        assert_eq!(
+            auto.plan(t0 + Duration::from_millis(199), false),
+            AutoScrollStep::Wait
+        );
+        assert_eq!(
+            auto.plan(t0 + Duration::from_millis(200), false),
+            AutoScrollStep::Post,
+            "a 200 ms step must beat at 200 ms, not at the old 600 ms"
         );
     }
 
@@ -3642,7 +4849,7 @@ mod tests {
             assert!(auto.enabled());
             // Nothing new arrived from this notch.
             auto.observe_height(1000);
-            now += AUTO_SCROLL_INTERVAL;
+            now += BEAT;
         }
         assert_eq!(auto.plan(now, false), AutoScrollStep::StopNoProgress);
         assert!(
@@ -3650,7 +4857,7 @@ mod tests {
             "a switch that scrolls nothing must not stay on"
         );
         assert_eq!(
-            auto.plan(now + AUTO_SCROLL_INTERVAL, false),
+            auto.plan(now + BEAT, false),
             AutoScrollStep::Wait,
             "stopped, not paused: nothing more is posted"
         );
@@ -3677,7 +4884,7 @@ mod tests {
         for _ in 0..AUTO_SCROLL_MAX_IDLE_POSTS - 1 {
             assert_eq!(auto.plan(now, false), AutoScrollStep::Post);
             auto.observe_height(1000);
-            now += AUTO_SCROLL_INTERVAL;
+            now += BEAT;
         }
         // One real scroll arrives: the next notches start from zero again.
         auto.observe_height(1400);
@@ -3690,11 +4897,11 @@ mod tests {
     #[test]
     fn wheel_notch_continues_the_capture_direction() {
         assert_eq!(
-            wheel_notch(Axis::Vertical),
+            wheel_notch(Axis::Vertical, 1),
             (WM_MOUSEWHEEL, WHEEL_DELTA as i32)
         );
         assert_eq!(
-            wheel_notch(Axis::Horizontal),
+            wheel_notch(Axis::Horizontal, 1),
             (WM_MOUSEHWHEEL, WHEEL_DELTA as i32)
         );
         // MAKELPARAM packs x in the low word and y in the high word.
@@ -3702,6 +4909,25 @@ mod tests {
         assert_eq!(wheel_lparam(-1, 0), 0x0000_ffff);
     }
 
+    /// A wider step multiplies the delta and is never negative, so a step can
+    /// only ever move the page the way the capture is growing.
+    #[test]
+    fn a_wider_step_posts_proportionally_more() {
+        assert_eq!(
+            wheel_notch(Axis::Vertical, 3),
+            (WM_MOUSEWHEEL, (WHEEL_DELTA as i32) * 3)
+        );
+        assert_eq!(
+            wheel_notch(Axis::Vertical, 0),
+            (WM_MOUSEWHEEL, WHEEL_DELTA as i32),
+            "a zero multiplier still posts one notch, never nothing"
+        );
+        assert_eq!(
+            wheel_notch(Axis::Vertical, -5),
+            (WM_MOUSEWHEEL, WHEEL_DELTA as i32),
+            "a step never reverses direction"
+        );
+    }
     // ---- axis: vertical by default, horizontal only on the button ----------
 
     #[test]

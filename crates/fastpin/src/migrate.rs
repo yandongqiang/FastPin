@@ -134,9 +134,12 @@ mod tests {
     use super::*;
 
     /// Unique scratch root per test; never touches the real profile folders.
+    /// Lives under target/ because %TEMP% is blocked by the harness sandbox.
     fn scratch(name: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("fastpin-migrate-{}-{name}", std::process::id()));
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("migrate-tests")
+            .join(format!("fastpin-migrate-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root

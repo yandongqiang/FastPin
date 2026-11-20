@@ -43,11 +43,23 @@ impl AssetSource for ToolbarAssets {
             "toolbar/arrow.svg" => Some(Cow::Borrowed(include_bytes!(
                 "../../../../assets/toolbar/arrow.svg"
             ))),
+            "toolbar/line.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/toolbar/line.svg"
+            ))),
             "toolbar/pen.svg" => Some(Cow::Borrowed(include_bytes!(
                 "../../../../assets/toolbar/pen.svg"
             ))),
+            "toolbar/highlighter.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/toolbar/highlighter.svg"
+            ))),
             "toolbar/mosaic.svg" => Some(Cow::Borrowed(include_bytes!(
                 "../../../../assets/toolbar/mosaic.svg"
+            ))),
+            "toolbar/spotlight.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/toolbar/spotlight.svg"
+            ))),
+            "toolbar/eraser.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/toolbar/eraser.svg"
             ))),
             "toolbar/text.svg" => Some(Cow::Borrowed(include_bytes!(
                 "../../../../assets/toolbar/text.svg"

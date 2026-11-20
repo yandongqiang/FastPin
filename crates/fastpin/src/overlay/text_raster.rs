@@ -35,12 +35,51 @@ fn wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Joins COM on the current thread for the lifetime of the value.
+///
+/// WIC and D2D hand back reference-counted objects whose `Release` is a vtable
+/// call, so releasing one on a thread that never joined an apartment faults: the
+/// suite caught exactly that inside `IWICBitmap::drop`. `rasterize` is called
+/// from the overlay's STA UI thread, from MTA export workers, and from plain
+/// test threads, so it cannot assume a caller did this.
+///
+/// A thread that already belongs to a different apartment reports
+/// `RPC_E_CHANGED_MODE`; joining would fail, and the existing apartment is the
+/// one to use, so nothing is undone.
+struct Apartment {
+    uninit: bool,
+}
+
+impl Apartment {
+    fn join() -> Self {
+        let hr = unsafe {
+            windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_MULTITHREADED,
+            )
+        };
+        // S_OK and S_FALSE both mean the count was incremented and must be
+        // balanced; a failure means this thread keeps its current model.
+        Self { uninit: hr.is_ok() }
+    }
+}
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        if self.uninit {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
 /// Premultiplied BGRA bitmap of `text` at `font_size` px (tight `width*4` stride),
 /// sized to the laid-out text. `argb` is the fill colour (alpha honoured).
 ///
-/// Caller must have COM initialized already (the overlay UI thread is STA; the
-/// export worker thread initializes MTA) -- this never calls CoInitializeEx.
+/// COM is joined for the duration of the call and left again on return, so this
+/// may be called from any thread. A caller that already lives in an apartment
+/// (the overlay UI thread is STA, export workers are MTA) keeps its own model.
 pub fn rasterize(text: &str, font_size: f64, argb: u32) -> Result<(Vec<u8>, u32, u32)> {
+    let _apartment = Apartment::join();
     unsafe {
         let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
         let family = wide_null(FONT_FAMILY);

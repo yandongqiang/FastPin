@@ -11,6 +11,13 @@ pub const SHAPE: &str = "shape";
 pub const SHAPE_RECT: &str = "shapeRect";
 pub const SHAPE_ELLIPSE: &str = "shapeEllipse";
 pub const LINE: &str = "line";
+pub const HIGHLIGHTER: &str = "highlighter";
+pub const SPOTLIGHT: &str = "spotlight";
+/// Spotlight cutout kind selectors on the second row when the spotlight tool is active.
+pub const SPOTLIGHT_RECT: &str = "spotlightRect";
+pub const SPOTLIGHT_ELLIPSE: &str = "spotlightEllipse";
+pub const SPOTLIGHT_CIRCLE: &str = "spotlightCircle";
+pub const ERASER: &str = "eraser";
 /// The bar's arrow button (ARROW_GROUP icon) and the three arrow tool ids it
 /// selects. The three variants are chosen on the properties row, not a picker.
 pub const ARROW_GROUP: &str = "arrowGroup";
@@ -70,9 +77,13 @@ pub const CUSTOMIZABLE: &[&str] = &[
     ARROW,
     POLYLINE_ARROW,
     CURVE_ARROW,
+    LINE,
     PEN,
+    HIGHLIGHTER,
     TEXT,
     MOSAIC,
+    SPOTLIGHT,
+    ERASER,
     NUMBER,
     UNDO,
     REDO,
@@ -94,8 +105,12 @@ pub const PHASE1_ITEMS: &[&str] = &[
     SELECT,
     SHAPE,
     ARROW_GROUP,
+    LINE,
     PEN,
+    HIGHLIGHTER,
     MOSAIC,
+    SPOTLIGHT,
+    ERASER,
     TEXT,
     NUMBER,
     COLOR,
@@ -250,8 +265,12 @@ pub const TOOLBAR_ICONS: &[&str] = &[
     "toolbar/arrow.svg",
     "toolbar/polylineArrow.svg",
     "toolbar/curveArrow.svg",
+    "toolbar/line.svg",
     "toolbar/pen.svg",
+    "toolbar/highlighter.svg",
     "toolbar/mosaic.svg",
+    "toolbar/spotlight.svg",
+    "toolbar/eraser.svg",
     "toolbar/text.svg",
     "toolbar/undo.svg",
     "toolbar/redo.svg",
@@ -289,11 +308,18 @@ pub fn icon_path(id: &str) -> Option<&'static str> {
         ARROW => "toolbar/arrow.svg",
         POLYLINE_ARROW => "toolbar/polylineArrow.svg",
         CURVE_ARROW => "toolbar/curveArrow.svg",
+        LINE => "toolbar/line.svg",
         LINE_SOLID => "toolbar/lineSolid.svg",
         LINE_DASHED => "toolbar/lineDashed.svg",
         LINE_CLOUD => "toolbar/lineCloud.svg",
         PEN => "toolbar/pen.svg",
+        HIGHLIGHTER => "toolbar/highlighter.svg",
         MOSAIC => "toolbar/mosaic.svg",
+        SPOTLIGHT => "toolbar/spotlight.svg",
+        SPOTLIGHT_RECT => "toolbar/rect.svg",
+        SPOTLIGHT_ELLIPSE => "toolbar/ellipse.svg",
+        SPOTLIGHT_CIRCLE => "toolbar/ellipse.svg",
+        ERASER => "toolbar/eraser.svg",
         TEXT => "toolbar/text.svg",
         NUMBER => "toolbar/number.svg",
         UNDO => "toolbar/undo.svg",
@@ -341,8 +367,15 @@ pub fn label(id: &str) -> &'static str {
         ARROW => "箭头",
         POLYLINE_ARROW => "折线箭头",
         CURVE_ARROW => "曲线箭头",
+        LINE => "直线",
         PEN => "画笔",
+        HIGHLIGHTER => "荧光笔",
         MOSAIC => "马赛克",
+        SPOTLIGHT => "聚光灯",
+        SPOTLIGHT_RECT => "矩形",
+        SPOTLIGHT_ELLIPSE => "椭圆",
+        SPOTLIGHT_CIRCLE => "圆形",
+        ERASER => "橡皮擦",
         TEXT => "文字",
         NUMBER => "序号",
         COLOR => "颜色",

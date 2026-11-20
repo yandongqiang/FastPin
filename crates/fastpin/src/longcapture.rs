@@ -812,6 +812,12 @@ pub struct ScrollReport {
     /// A candidate offset was refused by [`verify_shift`]: the strip matched,
     /// the rest of the frame disagreed.
     pub rejected_by_verification: bool,
+    /// The estimator saw a genuine content jump (its 3-frame
+    /// `MotionStage::SceneCut` streak): low direct similarity with no
+    /// consistent offset. This is a navigation / reflow, not a user pause and
+    /// not an ordinary match failure, so the host shows a distinct status and
+    /// keeps full poll speed. `false` for hand-built reports.
+    pub scene_cut: bool,
     /// The frame changed, but the changes are concentrated in only a few
     /// horizontal bands: a static page with a local animation (caret / clock /
     /// video), not a whole-page scroll. Computed by [`change_is_local`] on the
@@ -1169,6 +1175,11 @@ pub enum StallPhase {
     /// alive at a reduced poll rate, and any later stitched tick restores full
     /// speed. Never reported as "no scrolling detected".
     Stalled,
+    /// The content jumped (the estimator's 3-frame `MotionStage::SceneCut`
+    /// streak): a navigation / reflow, NOT a pause and NOT an ordinary match
+    /// failure. The page is definitely changing, so the idle counter resets
+    /// and polling stays at full speed; the host shows a distinct hint.
+    SceneCut,
 }
 
 /// Per-session no-progress counter.
@@ -1212,6 +1223,12 @@ impl StallTracker {
         let phase = if report.direction.is_some() {
             self.idle = 0;
             StallPhase::Progress
+        } else if report.scene_cut {
+            // A genuine content jump (the estimator's 3-frame SceneCut streak).
+            // The page is definitely changing, so this is neither a pause nor
+            // an unalignable stall: reset the idle counter and keep full speed.
+            self.idle = 0;
+            StallPhase::SceneCut
         } else if report.changed > MOTION_CHANGED {
             // The page is moving; the matcher just could not confirm an
             // offset. Never a pause, never a stall.
@@ -3413,6 +3430,25 @@ mod tests {
         }
         assert_eq!(phase, StallPhase::Paused);
         assert!(stall.paused());
+    }
+
+    #[test]
+    fn a_scene_cut_resets_idle_and_never_pauses() {
+        // A content jump is not a pause: even after accumulating almost a full
+        // stall run, a SceneCut tick resets the counter and keeps full speed.
+        let mut stall = StallTracker::new();
+        let still = ScrollReport::default();
+        for _ in 0..STALL_TICKS - 1 {
+            stall.observe(&still);
+        }
+        assert!(!stall.paused());
+        let cut = ScrollReport {
+            scene_cut: true,
+            ..ScrollReport::default()
+        };
+        assert_eq!(stall.observe(&cut), StallPhase::SceneCut);
+        assert_eq!(stall.idle_ticks(), 0);
+        assert!(!stall.paused(), "a scene cut must not decimate polling");
     }
 
     #[test]

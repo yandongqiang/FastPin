@@ -5,8 +5,8 @@
 use crate::config::{Watermark, WatermarkPosition};
 use crate::geom::{Point, Rect};
 use crate::overlay::editor::{
-    badge_font_size, cloud_polyline, dash_segments, ellipse_ring, ArrowEnds, ArrowHead, BadgeStyle,
-    DashPattern, Element, LineStyle, Shape,
+    badge_font_size, cloud_polyline, dash_segments, ellipse_ring, spotlight_dim_argb, ArrowEnds,
+    ArrowHead, BadgeStyle, DashPattern, Element, LineStyle, Shape, SpotlightKind,
 };
 use crate::overlay::text_raster;
 
@@ -32,28 +32,48 @@ pub fn apply_annotations(
         height,
         stride,
     };
-    for el in elements {
-        let mut local = el.clone();
-        local.bounds.x -= origin_x;
-        local.bounds.y -= origin_y;
-        match &mut local.shape {
-            Shape::Arrow { start, end, .. } => {
-                start.x -= origin_x;
-                start.y -= origin_y;
-                end.x -= origin_x;
-                end.y -= origin_y;
-            }
-            Shape::Pen { points }
-            | Shape::PolylineArrow { points, .. }
-            | Shape::CurveArrow { points, .. } => {
-                for p in points {
-                    p.x -= origin_x;
-                    p.y -= origin_y;
+    // Translate once into crop space: the dim layer and every element must
+    // address the same pixels.
+    let locals: Vec<Element> = elements
+        .iter()
+        .map(|el| {
+            let mut local = el.clone();
+            local.bounds.x -= origin_x;
+            local.bounds.y -= origin_y;
+            match &mut local.shape {
+                Shape::Arrow { start, end, .. } => {
+                    start.x -= origin_x;
+                    start.y -= origin_y;
+                    end.x -= origin_x;
+                    end.y -= origin_y;
                 }
+                Shape::Pen { points }
+                | Shape::PolylineArrow { points, .. }
+                | Shape::CurveArrow { points, .. } => {
+                    for p in points {
+                        p.x -= origin_x;
+                        p.y -= origin_y;
+                    }
+                }
+                Shape::Spotlight { center, .. } => {
+                    center.x -= origin_x;
+                    center.y -= origin_y;
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        draw_element(&mut buf, &local);
+            local
+        })
+        .collect();
+    // Snow Shot paints the dim backdrop beneath scene items. Carving the
+    // spotlight holes first keeps annotations inside a highlight at full
+    // brightness, and the empty case costs one scan of the element list.
+    if let Some(mask) =
+        spotlight_dim_mask(Rect::new(0.0, 0.0, width as f64, height as f64), &locals)
+    {
+        blend_mask(&mut buf, &mask, argb_to_bgra(spotlight_dim_argb()));
+    }
+    for el in &locals {
+        draw_element(&mut buf, el);
     }
     // Burn the watermark last so it sits above every annotation, matching
     // FastPin's post-process stage. Skipped entirely when the config is empty,
@@ -292,6 +312,15 @@ pub fn element_coverage(el: &Element) -> ElementCoverage {
             fill: None,
             stroke: styled_mask(points, el.stroke_width, LineStyle::Solid, false),
         },
+        Shape::Line { start, end } => ElementCoverage {
+            fill: None,
+            stroke: styled_mask(&[*start, *end], el.stroke_width, LineStyle::Solid, false),
+        },
+        // A spotlight is a hole in the whole-image dim layer, not a painted
+        // element. `spotlight_dim_mask` rasterizes it once over the crop for
+        // both the preview and the export; drawing a fill here would put a
+        // pen-coloured disc back where the clear cutout belongs.
+        Shape::Spotlight { .. } => ElementCoverage::default(),
         // Mosaic smudges pixels, text is a GPU-side div in the overlay, and a
         // badge is a disc + numeral drawn directly.
         Shape::Mosaic { .. } | Shape::Text { .. } | Shape::Badge { .. } => {
@@ -596,6 +625,82 @@ fn ellipse_fill_mask(r: Rect) -> Option<CoverageMask> {
             }
         }
     }
+    Some(CoverageMask {
+        x0,
+        y0,
+        width,
+        height,
+        data,
+    })
+}
+
+/// Coverage of the global spotlight dim layer: 255 everywhere in `bounds`
+/// except inside the union of the cutout shapes, where it falls to 0 with
+/// antialiased edges. Rect cutouts use `rect_fill_mask`, ellipse/circle
+/// cutouts use `ellipse_fill_mask`. The preview and the export both
+/// rasterize this mask, so the clear area lands on identical pixels.
+pub fn spotlight_dim_mask(bounds: Rect, elements: &[Element]) -> Option<CoverageMask> {
+    let cutouts: Vec<(Rect, bool)> = elements
+        .iter()
+        .filter_map(|el| match &el.shape {
+            Shape::Spotlight { center, size, kind } if size.width > 0.0 && size.height > 0.0 => {
+                Some((
+                    Rect::new(
+                        center.x - size.width as f64 * 0.5,
+                        center.y - size.height as f64 * 0.5,
+                        size.width as f64,
+                        size.height as f64,
+                    ),
+                    matches!(kind, SpotlightKind::Rect),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    if cutouts.is_empty() {
+        return None;
+    }
+    let x0 = bounds.x.floor() as i32;
+    let y0 = bounds.y.floor() as i32;
+    let x1 = (bounds.x + bounds.width).ceil() as i32;
+    let y1 = (bounds.y + bounds.height).ceil() as i32;
+    let width = (x1 - x0).max(0) as usize;
+    let height = (y1 - y0).max(0) as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    // Accumulate the maximum cutout coverage first: two overlapping antialiased
+    // rims would over-carve the dim if each subtracted from the running value.
+    let mut holes = vec![0u8; width * height];
+    for (cutout, is_rect) in cutouts {
+        let mask = if is_rect {
+            rect_fill_mask(cutout)
+        } else {
+            ellipse_fill_mask(cutout)
+        };
+        let Some(mask) = mask else {
+            continue;
+        };
+        for row in 0..mask.height {
+            let y = mask.y0 + row as i32;
+            if y < y0 || y >= y1 {
+                continue;
+            }
+            for col in 0..mask.width {
+                let cov = mask.data[row * mask.width + col];
+                if cov == 0 {
+                    continue;
+                }
+                let x = mask.x0 + col as i32;
+                if x < x0 || x >= x1 {
+                    continue;
+                }
+                let i = (y - y0) as usize * width + (x - x0) as usize;
+                holes[i] = holes[i].max(cov);
+            }
+        }
+    }
+    let data = holes.into_iter().map(|h| 255 - h).collect();
     Some(CoverageMask {
         x0,
         y0,
@@ -1196,7 +1301,7 @@ pub fn export_annotated_png(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::overlay::editor::{Element, Shape, DEFAULT_MOSAIC_BLOCK};
+    use crate::overlay::editor::{Element, Shape, DEFAULT_MOSAIC_BLOCK, DEFAULT_STROKE_WIDTH};
     use crate::overlay::theme::STROKE_ARGB;
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
@@ -2697,5 +2802,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn spotlight_dim_mask_carves_discs_and_keeps_overlaps_clear() {
+        let disc = |x: f64, y: f64| Element {
+            stroke: 0xFFFF_0000,
+            stroke_width: DEFAULT_STROKE_WIDTH,
+            line_style: Default::default(),
+            stroke_enabled: true,
+            fill: None,
+            arrow_ends: Default::default(),
+            arrow_head: Default::default(),
+            bounds: Rect::new(x - 24.0, y - 24.0, 48.0, 48.0),
+            shape: Shape::Spotlight {
+                center: Point { x, y },
+                size: gpui::Size::new(48.0, 48.0),
+                kind: SpotlightKind::Ellipse,
+            },
+            id: 1,
+        };
+        let bounds = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let mask = spotlight_dim_mask(bounds, &[disc(50.0, 50.0)]).expect("dim mask");
+        assert_eq!(
+            (mask.x0, mask.y0, mask.width, mask.height),
+            (0, 0, 200, 100)
+        );
+        assert_eq!(mask_at(&mask, 10, 10), 255, "outside must be fully dimmed");
+        assert_eq!(mask_at(&mask, 50, 50), 0, "cutout must be fully clear");
+        assert_eq!(mask_at(&mask, 72, 50), 0, "inside the rim stays clear");
+        assert_eq!(mask_at(&mask, 78, 50), 255, "outside the rim stays dim");
+
+        let overlap =
+            spotlight_dim_mask(bounds, &[disc(50.0, 50.0), disc(74.0, 50.0)]).expect("dim mask");
+        // Both discs cover this pixel fully; taking the max coverage (rather
+        // than subtracting twice) keeps the union exactly clear.
+        assert_eq!(mask_at(&overlap, 62, 50), 0);
+    }
+
+    #[test]
+    fn spotlight_export_dims_around_a_clear_disc_and_ignores_pen_colour() {
+        use crate::overlay::editor::{Session, Tool};
+
+        let mut s = Session::new();
+        s.stroke = 0xFFFF_0000; // the reported red-dot regression
+        s.tool = Tool::Spotlight;
+        s.pointer_pressed(Point { x: 128.0, y: 128.0 });
+        s.pointer_released();
+        assert_eq!(s.elements.len(), 1);
+
+        let (w, h) = (256u32, 256u32);
+        let mut px = vec![255u8; (w * h * 4) as usize];
+        apply_annotations(&mut px, w, h, w * 4, 0.0, 0.0, &s.elements);
+        let at = |x: u32, y: u32| -> [u8; 4] {
+            let i = (y * w * 4 + x * 4) as usize;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        // Inside the cutout: unchanged white, never a solid red disc.
+        assert_eq!(at(128, 128), [255, 255, 255, 255]);
+        assert_eq!(at(160, 128), [255, 255, 255, 255]);
+        // Outside: neutral dark, not the red pen colour.
+        let outside = at(2, 2);
+        assert!(outside[0] < 255 && outside[1] < 255 && outside[2] < 255);
+        assert_eq!(outside[0], outside[1], "dim must be neutral, not red");
+        assert_eq!(outside[1], outside[2], "dim must be neutral, not red");
+        assert_eq!(outside[3], 255, "the screenshot stays opaque");
+        let alpha = (64.0_f64 * 255.0 / 100.0).round();
+        let expected = (255.0_f64 * (255.0 - alpha) / 255.0).round() as u8;
+        assert!(outside[2] <= expected + 1, "dim too weak: {}", outside[2]);
     }
 }

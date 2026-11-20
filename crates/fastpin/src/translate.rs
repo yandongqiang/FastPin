@@ -9,10 +9,9 @@ use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Security::Credentials::{PasswordCredential, PasswordVault};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest, WinHttpSetTimeouts, URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-    WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WinHttpQueryHeaders, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
+    URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
 use crate::config;
@@ -47,14 +46,26 @@ pub fn translate(text: &str) -> Result<String> {
     })
     .to_string();
 
+    let key = api_key()?;
+    if !key.is_empty() && is_insecure_http(&cfg.base_url) && !cfg.allow_insecure_http {
+        return Err(Error::new(
+            "API Key 将通过明文 HTTP 发送。请先在 设置 → 翻译 中确认此风险。",
+        ));
+    }
     let response = post_json(
         &endpoint(&cfg.base_url),
-        &api_key()?,
+        &key,
         &body,
-        cfg.timeout_seconds.max(5),
+        cfg.timeout_seconds.clamp(5, 300),
     )?;
     message_content(&response)
         .ok_or_else(|| Error::new("Translation API returned an empty result."))
+}
+
+/// Whether the configured Base URL uses plaintext HTTP. Used by both the
+/// runtime guard and the settings warning banner so the two cannot disagree.
+pub fn is_insecure_http(base_url: &str) -> bool {
+    base_url.trim().to_ascii_lowercase().starts_with("http://")
 }
 
 /// The vault entry is optional: local gateways commonly take no key.
@@ -191,8 +202,12 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
         dwExtraInfoLength: u32::MAX,
         ..Default::default()
     };
-    unsafe { WinHttpCrackUrl(&wide, 0, &mut parts) }
-        .map_err(|_| Error::new(format!("Translation Base URL is not a valid URL: {url}")))?;
+    unsafe { WinHttpCrackUrl(&wide, 0, &mut parts) }.map_err(|_| {
+        Error::new(format!(
+            "Translation Base URL is not a valid URL: {}",
+            crate::net::redact_url(url)
+        ))
+    })?;
 
     let host = unsafe { slice_of(parts.lpszHostName, parts.dwHostNameLength) };
     let mut path = unsafe { slice_of(parts.lpszUrlPath, parts.dwUrlPathLength) };
@@ -272,27 +287,7 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
             std::ptr::null_mut(),
         )?;
 
-        let mut payload = Vec::new();
-        loop {
-            let mut available = 0u32;
-            WinHttpQueryDataAvailable(request.0, &mut available)?;
-            if available == 0 {
-                break;
-            }
-            let at = payload.len();
-            payload.resize(at + available as usize, 0u8);
-            let mut read = 0u32;
-            WinHttpReadData(
-                request.0,
-                payload.as_mut_ptr().add(at) as *mut c_void,
-                available,
-                &mut read,
-            )?;
-            payload.truncate(at + read as usize);
-            if read == 0 {
-                break;
-            }
-        }
+        let payload = crate::net::read_response(request.0, crate::net::MAX_RESPONSE_BYTES)?;
 
         if !(200..300).contains(&status) {
             // The body often names the real cause (bad key, unknown model), but
@@ -324,6 +319,14 @@ fn nul_terminated_from(s: &[u16]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_plaintext_http_endpoints() {
+        assert!(is_insecure_http("http://localhost:11434"));
+        assert!(is_insecure_http("  HTTP://gateway.local/v1 "));
+        assert!(!is_insecure_http("https://api.openai.com/v1"));
+        assert!(!is_insecure_http(""));
+    }
 
     #[test]
     fn endpoint_accepts_the_three_shapes_users_paste() {

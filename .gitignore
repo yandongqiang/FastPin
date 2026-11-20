@@ -1,6 +1,11 @@
-/target
+target/
 **/*.pdb
 .superpowers/
 /dist
 /installer/Output
 build.log
+
+# Scratch checkouts used while porting snow-shot's stitcher; the code that
+# actually ships was vendored into crates/, so these are disposable.
+.snow-shot-src/
+.npmcache/

@@ -487,6 +487,7 @@ impl Render for PinToolbar {
                         arrow_head: e.session.arrow_head,
                         badge_style: e.session.badge_style,
                         badge_size: e.session.badge_size,
+                        spotlight_kind: e.session.spotlight_kind,
                     })
                 }
             };

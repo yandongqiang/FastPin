@@ -80,14 +80,14 @@ impl Page {
             Page::General => "启动与语言等基础行为。",
             Page::Screenshot => "截图内容、工具栏按钮与注释工具的默认值。",
             Page::Record => "录屏方式、编码与输出。",
-            Page::History => "浏览、保留或删除截图历史。",
+            Page::History => "查看、复制或删除已保存的截图历史。",
             Page::Output => "保存位置与导出的水印。",
             Page::Pin => "贴图的默认行为与编辑工具栏。",
             Page::Appearance => "界面主题与标注外观。",
             Page::Hotkey => "全局快捷键，在任何界面都可以触发。",
             Page::Translate => "翻译服务的接口、模型与目标语言。",
             Page::Resources => "本地识别模型的存放位置。",
-            Page::Data => "数据目录、日志与存储占用。",
+            Page::Data => "数据目录、日志、存储占用与截图历史。",
             Page::About => "版本信息与更新检查。",
         }
     }
@@ -120,6 +120,7 @@ impl Page {
                 | Page::Hotkey
                 | Page::Translate
                 | Page::Resources
+                | Page::Data
         )
     }
 
@@ -127,7 +128,7 @@ impl Page {
     /// exist in the navigation so the layout matches the reference, but they
     /// carry one disabled note instead of fake controls.
     pub fn unsupported(self) -> bool {
-        matches!(self, Page::Record | Page::History)
+        matches!(self, Page::Record)
     }
 }
 
@@ -174,6 +175,21 @@ pub const ROWS: &[RowMeta] = &[
     },
     RowMeta {
         page: Page::Screenshot,
+        title: "智能选区",
+        desc: "框选时吸附到窗口或其内部元素；禁用后为自由拖拽。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "自动滚动间隔",
+        desc: "长截图自动滚动时两次滚动之间的等待时间，间隔越短滚动越快。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "自动滚动步长",
+        desc: "每次滚动发送的原生滚轮格数，格数越大一步跨过的页面越多。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
         title: "截屏模式",
         desc: "当前版本固定为冻结屏幕后框选区域。",
     },
@@ -183,17 +199,26 @@ pub const ROWS: &[RowMeta] = &[
         title: "录屏",
         desc: "当前版本暂不支持屏幕录制。",
     },
-    // 历史图片
-    RowMeta {
-        page: Page::History,
-        title: "历史图片",
-        desc: "当前版本不保存截图历史，截图不会写入图片库。",
-    },
     // 输出
     RowMeta {
         page: Page::Output,
         title: "保存位置",
-        desc: "工具栏的保存按钮把 PNG 写到这里。",
+        desc: "工具栏的保存按钮把导出的图片写到这里。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "图片格式",
+        desc: "保存和导出使用的编码格式：PNG、JPG 或 WebP。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "图片质量",
+        desc: "JPG / WebP 的编码质量，PNG 不受影响。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "文件名称",
+        desc: "文件名模板，支持 {date}、{time} 和 {datetime} 占位符。",
     },
     RowMeta {
         page: Page::Output,
@@ -229,6 +254,16 @@ pub const ROWS: &[RowMeta] = &[
         page: Page::Output,
         title: "平铺水印",
         desc: "把文字水印重复铺满整张图片。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "图片切图",
+        desc: "把一张图片切成等分或精确的网格，逐块导出。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "拼图工具",
+        desc: "把多张图片排成版式，导出 PNG 或多页 PDF。",
     },
     // 贴图
     RowMeta {
@@ -328,8 +363,48 @@ pub const ROWS: &[RowMeta] = &[
     },
     RowMeta {
         page: Page::Data,
+        title: "记录截图历史",
+        desc: "保存截图时自动留存一份副本到历史目录。",
+    },
+    RowMeta {
+        page: Page::Data,
+        title: "保留期限",
+        desc: "超过该天数的历史记录会在启动时和保存后自动清理；选择“永久”等同于开启“始终保留”。",
+    },
+    RowMeta {
+        page: Page::Data,
+        title: "数量上限",
+        desc: "最多保留的记录条数，超出后删除最旧的。",
+    },
+    RowMeta {
+        page: Page::Data,
+        title: "占用上限",
+        desc: "历史目录的最大体积，超出后删除最旧的记录。",
+    },
+    RowMeta {
+        page: Page::Data,
+        title: "始终保留",
+        desc: "开启后忽略保留期限，只按数量与体积上限清理。",
+    },
+    RowMeta {
+        page: Page::Data,
+        title: "历史目录",
+        desc: "历史图片是保存截图的独立副本，删除记录不影响原截图。",
+    },
+    RowMeta {
+        page: Page::Data,
+        title: "浏览历史",
+        desc: "打开历史窗口，查看、复制或删除以往截图。",
+    },
+    RowMeta {
+        page: Page::Data,
+        title: "清空历史",
+        desc: "删除所有历史记录；此操作不可撤销。",
+    },
+    RowMeta {
+        page: Page::History,
         title: "历史图片",
-        desc: "当前版本不保存截图历史，没有可清理的图片。",
+        desc: "打开独立历史窗口，查看、复制或删除已保存的截图。",
     },
     // 关于
     RowMeta {
@@ -372,11 +447,20 @@ pub fn reset_page(settings: &mut Settings, page: Page) -> bool {
             settings.screenshot.hidden_toolbar_items =
                 default.screenshot.hidden_toolbar_items.clone();
             settings.screenshot.annotation = default.screenshot.annotation.clone();
+            settings.screenshot.smart_selection = default.screenshot.smart_selection;
+            settings.screenshot.auto_scroll = default.screenshot.auto_scroll.clone();
             true
         }
         Page::Output => {
             settings.screenshot.save_dir = default.screenshot.save_dir.clone();
             settings.screenshot.watermark = default.screenshot.watermark.clone();
+            settings.screenshot.export = default.screenshot.export.clone();
+            true
+        }
+        // History settings live on the Data page now; resetting that page must
+        // not silently skip the history fields it shows.
+        Page::Data => {
+            settings.history = default.history.clone();
             true
         }
         Page::Hotkey => {
@@ -437,6 +521,8 @@ mod tests {
         s.screenshot.annotation.stroke_width = 9.0;
         s.screenshot.annotation.stroke_color = "#123456".into();
         s.screenshot.annotation.mosaic_block = 32;
+        s.screenshot.auto_scroll.interval_ms = 1000;
+        s.screenshot.auto_scroll.notches = 8;
         s.screenshot.watermark.text = "机密".into();
         s.screenshot.watermark.opacity = 75;
         s.screenshot.watermark.position = "topLeft".into();
@@ -448,6 +534,12 @@ mod tests {
         s.hotkeys.copy_only = "Ctrl+Shift+2".into();
         s.hotkeys.fullscreen = "Ctrl+Shift+3".into();
         s.appearance = crate::config::APPEARANCE_DARK.into();
+        s.history.enabled = false;
+        s.history.dir = Some("D:/history".into());
+        s.history.retention_days = 30;
+        s.history.limit = 300;
+        s.history.max_disk_mib = 512;
+        s.history.keep_permanently = true;
         s
     }
 
@@ -478,6 +570,43 @@ mod tests {
                     "{page:?} lacks a title-matching disabled row"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn history_settings_are_owned_by_the_data_page() {
+        let titles: Vec<_> = rows_of(Page::Data).map(|r| r.title).collect();
+        for title in [
+            "记录截图历史",
+            "保留期限",
+            "数量上限",
+            "占用上限",
+            "始终保留",
+            "历史目录",
+            "浏览历史",
+            "清空历史",
+        ] {
+            assert!(titles.contains(&title), "Data page lost '{title}'");
+        }
+        assert!(Page::Data.has_config());
+        // A search for a history row must land on the page that renders it.
+        assert!(search("保留期限").iter().all(|r| r.page == Page::Data));
+    }
+
+    #[test]
+    fn every_rendered_tool_launcher_and_scroll_row_is_searchable() {
+        for (query, page) in [
+            ("自动滚动间隔", Page::Screenshot),
+            ("自动滚动步长", Page::Screenshot),
+            ("图片切图", Page::Output),
+            ("拼图工具", Page::Output),
+        ] {
+            assert!(
+                search(query)
+                    .iter()
+                    .any(|r| r.title == query && r.page == page),
+                "search lost '{query}' on {page:?}"
+            );
         }
     }
 
@@ -521,6 +650,8 @@ mod tests {
             Page::Screenshot => {
                 s.screenshot.hidden_toolbar_items.is_empty()
                     && s.screenshot.annotation.stroke_color == "#FA3C3C"
+                    && s.screenshot.auto_scroll.interval_ms == 600
+                    && s.screenshot.auto_scroll.notches == 1
             }
             Page::Output => {
                 s.screenshot.save_dir.is_none() && s.screenshot.watermark.text.is_empty()
@@ -529,6 +660,14 @@ mod tests {
             Page::Appearance => s.appearance == "light",
             Page::Translate => s.translation.model == "gpt-4o-mini",
             Page::Resources => s.ocr.models_dir.is_none(),
+            Page::Data => {
+                s.history.enabled
+                    && s.history.dir.is_none()
+                    && s.history.retention_days == 7
+                    && s.history.limit == 100
+                    && s.history.max_disk_mib == 1024
+                    && !s.history.keep_permanently
+            }
             _ => false,
         };
 
@@ -569,6 +708,11 @@ mod tests {
                     Page::Resources => {
                         assert_eq!(s.translation.base_url, "https://api.example.com/v1");
                         assert_eq!(s.screenshot.watermark.position, "topLeft");
+                    }
+                    Page::Data => {
+                        assert_eq!(s.translation.model, "qwen-plus");
+                        assert_eq!(s.screenshot.watermark.text, "机密");
+                        assert_eq!(s.hotkeys.region, "Ctrl+Shift+1");
                     }
                     _ => {}
                 }

@@ -8,10 +8,9 @@ use std::ffi::c_void;
 use windows::core::PCWSTR;
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest, WinHttpSetTimeouts, URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-    WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WinHttpQueryHeaders, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
+    URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -62,13 +61,42 @@ pub fn check_latest() -> Result<Release> {
     if tag.is_empty() || url.is_empty() {
         return Err(Error::new("发布信息缺少 tag_name 或 html_url"));
     }
+    // The URL came from the network; never hand an unvalidated scheme/host to
+    // ShellExecuteW (file:// and local paths would launch arbitrary programs).
+    if !trusted_release_url(url) {
+        return Err(Error::new("发布页地址不可信，已拒绝打开"));
+    }
     Ok(Release {
         version: tag.trim_start_matches(['v', 'V']).to_string(),
         url: url.to_string(),
     })
 }
 
+/// Only `https://github.com/...` release pages may be opened. Rejects
+/// userinfo tricks (`https://github.com@evil.com/`) as well as other schemes.
+fn trusted_release_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let Some(authority_and_path) = lower.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority);
+    host == "github.com"
+}
+
 pub fn open_release_page(url: &str) -> Result<()> {
+    if !trusted_release_url(url) {
+        return Err(Error::new("发布页地址不可信，已拒绝打开"));
+    }
     let verb: Vec<u16> = "open".encode_utf16().chain([0]).collect();
     let target: Vec<u16> = url.encode_utf16().chain([0]).collect();
     let result = unsafe {
@@ -103,7 +131,7 @@ fn get(url: &str) -> Result<String> {
         ..Default::default()
     };
     unsafe { WinHttpCrackUrl(&wide, 0, &mut parts) }
-        .map_err(|_| Error::new(format!("更新地址无效：{url}")))?;
+        .map_err(|_| Error::new(format!("更新地址无效：{}", crate::net::redact_url(url))))?;
 
     let host = unsafe { slice_of(parts.lpszHostName, parts.dwHostNameLength) };
     let mut path = unsafe { slice_of(parts.lpszUrlPath, parts.dwUrlPathLength) };
@@ -165,27 +193,7 @@ fn get(url: &str) -> Result<String> {
             std::ptr::null_mut(),
         )?;
 
-        let mut payload = Vec::new();
-        loop {
-            let mut available = 0u32;
-            WinHttpQueryDataAvailable(request.0, &mut available)?;
-            if available == 0 {
-                break;
-            }
-            let at = payload.len();
-            payload.resize(at + available as usize, 0u8);
-            let mut read = 0u32;
-            WinHttpReadData(
-                request.0,
-                payload.as_mut_ptr().add(at) as *mut c_void,
-                available,
-                &mut read,
-            )?;
-            payload.truncate(at + read as usize);
-            if read == 0 {
-                break;
-            }
-        }
+        let payload = crate::net::read_response(request.0, crate::net::MAX_RESPONSE_BYTES)?;
 
         if !(200..300).contains(&status) {
             return Err(Error::new(format!("检查更新失败（HTTP {status}）")));
@@ -234,5 +242,25 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("v0.1.0", "0.1"));
         assert!(!is_newer("0.1.0-beta", "0.1.0"));
+    }
+
+    #[test]
+    fn only_github_https_release_pages_are_trusted() {
+        assert!(trusted_release_url(
+            "https://github.com/yandongqiang/FastPin/releases/tag/v0.3.0"
+        ));
+        assert!(trusted_release_url(
+            "HTTPS://GitHub.com/owner/repo/releases"
+        ));
+        assert!(!trusted_release_url("http://github.com/owner/repo"));
+        assert!(!trusted_release_url("https://github.com@evil.example/x"));
+        assert!(!trusted_release_url("file:///C:/Windows/System32/cmd.exe"));
+        assert!(!trusted_release_url("https://evil.example/github.com/x"));
+    }
+
+    #[test]
+    fn open_releases_page_refuses_untrusted_urls() {
+        assert!(open_release_page("file:///C:/Windows/System32/cmd.exe").is_err());
+        assert!(open_release_page("https://github.com@evil.example/x").is_err());
     }
 }

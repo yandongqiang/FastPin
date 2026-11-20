@@ -30,7 +30,7 @@ use crate::capture::{
     capture_for_action, crop_live_frame, crop_sdr_bgra, drop_gpu_resources, prepare_capture,
     CapturedDesktop, Gpu, GpuShaders, WgcLive,
 };
-use crate::codec::{set_clipboard_dib, write_png_file};
+use crate::codec::{set_clipboard_dib, write_image_file};
 use crate::error::{Error, Result};
 use crate::gpui_bridge::drop_freeze_swapchain;
 use crate::hotkey::{HotkeyAction, HotkeyBindings};
@@ -234,14 +234,6 @@ pub(crate) fn capture_region_live(
     }
 }
 
-/// The stitched long screenshot exports like a finished capture: PNG file
-/// plus clipboard, so both the 保存 and 完成 habits keep working. The stitched
-/// image can be 16384 px tall, so its DIB copy is the biggest one -- run it
-/// off the UI thread like every other export.
-pub(crate) fn export_long_capture(px: Vec<u8>, w: u32, h: u32) {
-    export_pixels_async(px, w, h, w * 4, true, true, None);
-}
-
 /// Pin copy / save: tight BGRA, already composited, no marks to apply.
 pub(crate) fn export_pin_pixels(px: Vec<u8>, w: u32, h: u32, write_file: bool, copy: bool) {
     export_pixels_async(px, w, h, w * 4, write_file, copy, None);
@@ -276,6 +268,10 @@ pub fn run() -> Result<()> {
     // Before anything reads settings: move the pre-rebrand profile over. It is
     // a no-op on second start and never aborts startup.
     crate::migrate::migrate_legacy_paths();
+    // Reclaim directories left by an interrupted history delete and apply
+    // retention to records accumulated while the app was closed. No-op when
+    // history is disabled.
+    crate::history::startup_maintenance();
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         attach_parent_console();
@@ -335,7 +331,18 @@ pub fn once_capture(path: PathBuf) -> Result<()> {
             let r = (|| {
                 let cap = capture_from_app(cx, false, None, &mut perf)?;
                 let (px, w, h, stride) = crop_from_app(cx, &cap, 0, 0, cap.width, cap.height)?;
-                write_png_file(&path, &px, w, h, stride)?;
+                // `--once-capture` always writes PNG: the path comes from the
+                // command line, so honouring a configured JPG/WebP format here
+                // would put WebP bytes in a file the caller named `.png`.
+                write_image_file(
+                    &path,
+                    crate::config::ImageFormat::Png,
+                    90,
+                    &px,
+                    w,
+                    h,
+                    stride,
+                )?;
                 let _ = perf.write_log();
                 Ok((w, h))
             })();
@@ -1031,9 +1038,28 @@ fn export_pixels(
     copy: bool,
 ) -> Result<()> {
     // Full-screen 4K is ~33 MB; share it with the writer thread instead of cloning.
-    let px = std::sync::Arc::new(px);
+    export_pixels_shared(std::sync::Arc::new(px), cw, ch, stride, write_file, copy)
+}
+
+/// Same export, but the caller already holds the buffer behind an `Arc`.
+///
+/// The long-capture preview window keeps the stitched pixels alive for its own
+/// rendering, so it can hand the same allocation here instead of cloning what
+/// can be a 16384 px tall buffer on the UI thread.
+pub(crate) fn export_pixels_shared(
+    px: std::sync::Arc<Vec<u8>>,
+    cw: u32,
+    ch: u32,
+    stride: u32,
+    write_file: bool,
+    copy: bool,
+) -> Result<()> {
     if write_file {
-        let path = default_png_path()?;
+        let mut export = crate::config::get().screenshot.export.clone();
+        // A format this machine cannot encode falls back to PNG, so a config
+        // copied from another PC still saves the screenshot instead of failing.
+        export.format = crate::codec::effective_format(export.format);
+        let path = default_image_path(&export)?;
         let px_file = px.clone();
         std::thread::spawn(move || {
             unsafe {
@@ -1042,44 +1068,91 @@ fn export_pixels(
                     windows::Win32::System::Com::COINIT_MULTITHREADED,
                 );
             }
-            if let Err(e) = write_png_file(&path, &px_file, cw, ch, stride) {
-                crate::perf::log_app(&format!("png write failed: {e}"));
+            if let Err(e) = write_image_file(
+                &path,
+                export.format,
+                export.clamped_quality(),
+                &px_file,
+                cw,
+                ch,
+                stride,
+            ) {
+                crate::perf::log_app(&format!("image write failed: {e}"));
+                return;
+            }
+            // Read back the exact bytes the user saved so the history copy is
+            // byte-identical (and uses the same format/extension) without a
+            // second encode. Failures here never affect the save itself.
+            if let Ok(bytes) = std::fs::read(&path) {
+                crate::history::record_saved_image(
+                    &bytes,
+                    export.format.extension(),
+                    cw,
+                    ch,
+                    "saved_to_file",
+                );
             }
         });
     }
     if copy {
         // Not swallowed: copy-only exports have no PNG to prove they ran, so a
         // silent failure here reads as "the hotkey is dead".
-        set_clipboard_dib(&px, cw, ch, stride).map_err(|e| {
-            crate::perf::log_app(&format!("clipboard write failed: {e}"));
-            e
-        })?;
-        crate::perf::log_app(&format!("clipboard: {cw}x{ch} copied"));
+        match set_clipboard_dib(&px, cw, ch, stride) {
+            Ok(()) => {
+                crate::perf::log_app(&format!("clipboard: {cw}x{ch} copied"));
+                // Copy-only captures (no saved file) still get a history record
+                // so copied screenshots appear in the gallery, mirroring
+                // CitePix. When the same capture also wrote a file, the
+                // saved_to_file record is the canonical one and we don't
+                // duplicate it here. History failures never fail the copy.
+                if !write_file {
+                    // PNG-encode on a worker thread: a full-screen 4K buffer is
+                    // ~30 MB and synchronous encoding here would stall the UI.
+                    // The clipboard DIB is already written above on this thread;
+                    // history is bookkeeping and may finish slightly later.
+                    let px_hist = px.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(png) = crate::codec::encode_png_bgra(&px_hist, cw, ch, stride) {
+                            crate::history::record_saved_image(
+                                &png,
+                                "png",
+                                cw,
+                                ch,
+                                "copied_to_clipboard",
+                            );
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                crate::perf::log_app(&format!("clipboard write failed: {e}"));
+                return Err(e);
+            }
+        }
     }
     Ok(())
 }
 
-fn default_png_path() -> Result<PathBuf> {
+fn default_image_path(export: &crate::config::Export) -> Result<PathBuf> {
     let dir = crate::config::screenshot_dir()?;
     std::fs::create_dir_all(&dir)?;
     // Local time, not UTC: the name is for the user reading their own folder.
     let t = unsafe { GetLocalTime() };
-    let stem = format!(
-        "FastPin_{:04}{:02}{:02}_{:02}{:02}{:02}",
-        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
-    );
-    Ok(unique_path(&dir, &stem))
+    let date = format!("{:04}{:02}{:02}", t.wYear, t.wMonth, t.wDay);
+    let time = format!("{:02}{:02}{:02}", t.wHour, t.wMinute, t.wSecond);
+    let stem = export.expand_name(&date, &time);
+    Ok(unique_path(&dir, &stem, export.format.extension()))
 }
 
 /// Two shots inside the same second share a stem; a screenshot silently
 /// overwriting the previous one is the worst way to lose one.
-fn unique_path(dir: &Path, stem: &str) -> PathBuf {
-    let first = dir.join(format!("{stem}.png"));
+fn unique_path(dir: &Path, stem: &str, extension: &str) -> PathBuf {
+    let first = dir.join(format!("{stem}.{extension}"));
     if !first.exists() {
         return first;
     }
     (2..)
-        .map(|n| dir.join(format!("{stem}_{n}.png")))
+        .map(|n| dir.join(format!("{stem}_{n}.{extension}")))
         .find(|p| !p.exists())
         .unwrap_or(first)
 }
@@ -1094,21 +1167,59 @@ mod tests {
 
     #[test]
     fn unique_path_suffixes_only_on_collision() {
-        let dir = std::env::temp_dir().join("fastpin-unique-path-test");
+        // Scratch under target/: the harness sandbox denies writes to %TEMP%.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("unique-path-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
 
-        let first = unique_path(&dir, "FastPin_20260828_143052");
+        let first = unique_path(&dir, "FastPin_20260828_143052", "png");
         assert_eq!(first.file_name().unwrap(), "FastPin_20260828_143052.png");
 
         std::fs::write(&first, b"").expect("write");
-        let second = unique_path(&dir, "FastPin_20260828_143052");
+        let second = unique_path(&dir, "FastPin_20260828_143052", "png");
         assert_eq!(second.file_name().unwrap(), "FastPin_20260828_143052_2.png");
 
         std::fs::write(&second, b"").expect("write");
-        let third = unique_path(&dir, "FastPin_20260828_143052");
+        let third = unique_path(&dir, "FastPin_20260828_143052", "png");
         assert_eq!(third.file_name().unwrap(), "FastPin_20260828_143052_3.png");
 
+        // A different format does not collide with the PNGs above.
+        let other = unique_path(&dir, "FastPin_20260828_143052", "jpg");
+        assert_eq!(other.file_name().unwrap(), "FastPin_20260828_143052.jpg");
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_expands_and_sanitizes_the_filename_template() {
+        let mut export = crate::config::Export::default();
+        assert_eq!(
+            export.expand_name("20260828", "143052"),
+            "FastPin_20260828_143052"
+        );
+
+        export.filename_template = "shot-{datetime}".into();
+        assert_eq!(
+            export.expand_name("20260828", "143052"),
+            "shot-20260828_143052"
+        );
+
+        // Characters Windows refuses in a name become underscores.
+        export.filename_template = "a/b:c".into();
+        assert_eq!(export.expand_name("20260828", "143052"), "a_b_c");
+
+        // A template made only of illegal characters sanitizes to underscores:
+        // non-empty, so it is used as-is rather than silently swapped.
+        export.filename_template = "???".into();
+        assert_eq!(export.expand_name("20260828", "143052"), "___");
+
+        // A blank template is the default, not an empty stem.
+        export.filename_template = "   ".into();
+        assert_eq!(
+            export.expand_name("20260828", "143052"),
+            "FastPin_20260828_143052"
+        );
     }
 }

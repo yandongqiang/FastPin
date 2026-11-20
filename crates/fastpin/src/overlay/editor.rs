@@ -18,6 +18,34 @@ pub fn badge_font_size(radius: f64) -> f64 {
 }
 const MIN_KEEP: f64 = 2.0;
 
+/// Default spotlight size, in image px.
+pub const SPOTLIGHT_SIZE: f64 = 96.0;
+
+/// Whether a spotlight cutout is a rectangle or an ellipse. A circle is just
+/// an ellipse whose width equals its height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SpotlightKind {
+    #[default]
+    Ellipse,
+    Rect,
+    Circle,
+}
+/// Opacity of the dim layer in percent. Snow Shot's spotlight defaults to 64%;
+/// the dim is a fixed property of the tool, never the pen opacity, so a red
+/// pen can never paint a red "spotlight".
+pub const SPOTLIGHT_DIM_ALPHA: u8 = 64;
+
+/// ARGB of the dim layer: black at `SPOTLIGHT_DIM_ALPHA`.
+pub fn spotlight_dim_argb() -> u32 {
+    alpha_channel(SPOTLIGHT_DIM_ALPHA) << 24
+}
+/// Highlighter strokes are fat by default so they read as marker ink even
+/// when the user left the width slider at the pen's hairline default.
+pub const HIGHLIGHTER_MIN_WIDTH: f64 = 14.0;
+/// Highlighter opacity ceiling, in percent: marker ink never hides the text
+/// it flies over.
+pub const HIGHLIGHTER_ALPHA_MAX: u8 = 50;
+
 /// Percent opacity (0..=100) to the ARGB alpha byte.
 fn alpha_channel(percent: u8) -> u32 {
     (percent.min(100) as u32 * 255 / 100) & 0xFF
@@ -208,6 +236,21 @@ pub enum Shape {
     Pen {
         points: Vec<Point>,
     },
+    /// A two-point straight line with no head. Kept separate from `Arrow` so
+    /// the head geometry can never bleed into it.
+    Line {
+        start: Point,
+        end: Point,
+    },
+    /// A clear cutout carved out of a whole-image dim layer (a spotlight). The
+    /// dim is global, so the element only stores the cutout geometry; the pen
+    /// colour has no say in it. `composite::spotlight_dim_mask` rasterizes the
+    /// dim layer for both the preview and the export.
+    Spotlight {
+        center: Point,
+        size: gpui::Size<f32>,
+        kind: SpotlightKind,
+    },
     Mosaic {
         points: Vec<Point>,
         block_size: i32,
@@ -251,7 +294,7 @@ impl Element {
         self.bounds.x += dx;
         self.bounds.y += dy;
         match &mut self.shape {
-            Shape::Arrow { start, end, .. } => {
+            Shape::Arrow { start, end, .. } | Shape::Line { start, end } => {
                 start.x += dx;
                 start.y += dy;
                 end.x += dx;
@@ -265,6 +308,12 @@ impl Element {
                     p.x += dx;
                     p.y += dy;
                 }
+            }
+            // The cutout must travel with the shape; otherwise dragging a
+            // spotlight would leave its clear hole behind at the old spot.
+            Shape::Spotlight { center, .. } => {
+                center.x += dx;
+                center.y += dy;
             }
             _ => {}
         }
@@ -295,6 +344,16 @@ impl Element {
                 };
                 *head *= k;
             }
+            Shape::Line { start, end } => {
+                *start = Point {
+                    x: start.x * k,
+                    y: start.y * k,
+                };
+                *end = Point {
+                    x: end.x * k,
+                    y: end.y * k,
+                };
+            }
             Shape::Pen { points } => {
                 for p in points {
                     p.x *= k;
@@ -314,6 +373,16 @@ impl Element {
                     p.y *= k;
                 }
                 *block_size = ((*block_size as f64 * k).round() as i32).max(2);
+            }
+            Shape::Spotlight { center, size, .. } => {
+                *center = Point {
+                    x: center.x * k,
+                    y: center.y * k,
+                };
+                *size = gpui::Size {
+                    width: size.width * k as f32,
+                    height: size.height * k as f32,
+                };
             }
             Shape::Text { font_size, .. } => *font_size *= k,
             Shape::Badge { radius, .. } => *radius *= k,
@@ -338,6 +407,11 @@ impl Element {
             Shape::Arrow { start, end, .. } => {
                 dist_to_segment(p, *start, *end) <= self.stroke_width.max(4.0)
             }
+            Shape::Line { start, end } => {
+                dist_to_segment(p, *start, *end) <= self.stroke_width.max(6.0)
+            }
+            // A spotlight is grabbed anywhere on its disc, like a shape body.
+            Shape::Spotlight { .. } => self.bounds.contains(p),
             Shape::Pen { points }
             | Shape::PolylineArrow { points, .. }
             | Shape::CurveArrow { points, .. } => hit_path(p, points, self.stroke_width.max(4.0)),
@@ -380,8 +454,19 @@ pub(super) fn dist_to_segment(p: Point, a: Point, b: Point) -> f64 {
 #[derive(Clone, Debug)]
 enum Command {
     Add(Element),
-    Clear { snapshot: Vec<Element> },
-    Move { id: u64, dx: f64, dy: f64 },
+    Clear {
+        snapshot: Vec<Element>,
+    },
+    Move {
+        id: u64,
+        dx: f64,
+        dy: f64,
+    },
+    /// Eraser: removes one element; undo puts it back at its position.
+    Remove {
+        id: u64,
+        el: Element,
+    },
 }
 
 #[derive(Debug)]
@@ -458,6 +543,15 @@ fn apply(doc: &mut Vec<Element>, cmd: &Command, undo: bool) {
                 el.move_by(dx, dy);
             }
         }
+        Command::Remove { id, el } => {
+            if undo {
+                if !doc.iter().any(|e| e.id == *id) {
+                    doc.push(el.clone());
+                }
+            } else {
+                doc.retain(|e| e.id != *id);
+            }
+        }
     }
 }
 
@@ -469,8 +563,12 @@ pub enum Tool {
     Arrow,
     PolylineArrow,
     CurveArrow,
+    Line,
     Pen,
+    Highlighter,
+    Spotlight,
     Mosaic,
+    Eraser,
     Text,
     Number,
 }
@@ -484,8 +582,12 @@ impl Tool {
             Tool::Arrow => super::toolbar::ARROW,
             Tool::PolylineArrow => super::toolbar::POLYLINE_ARROW,
             Tool::CurveArrow => super::toolbar::CURVE_ARROW,
+            Tool::Line => super::toolbar::LINE,
             Tool::Pen => super::toolbar::PEN,
+            Tool::Highlighter => super::toolbar::HIGHLIGHTER,
+            Tool::Spotlight => super::toolbar::SPOTLIGHT,
             Tool::Mosaic => super::toolbar::MOSAIC,
+            Tool::Eraser => super::toolbar::ERASER,
             Tool::Text => super::toolbar::TEXT,
             Tool::Number => super::toolbar::NUMBER,
         }
@@ -499,8 +601,12 @@ impl Tool {
             super::toolbar::ARROW => Tool::Arrow,
             super::toolbar::POLYLINE_ARROW => Tool::PolylineArrow,
             super::toolbar::CURVE_ARROW => Tool::CurveArrow,
+            super::toolbar::LINE => Tool::Line,
             super::toolbar::PEN => Tool::Pen,
+            super::toolbar::HIGHLIGHTER => Tool::Highlighter,
+            super::toolbar::SPOTLIGHT => Tool::Spotlight,
             super::toolbar::MOSAIC => Tool::Mosaic,
+            super::toolbar::ERASER => Tool::Eraser,
             super::toolbar::TEXT => Tool::Text,
             super::toolbar::NUMBER => Tool::Number,
             _ => return None,
@@ -517,6 +623,12 @@ impl Tool {
     /// inline there.
     pub fn is_arrow(self) -> bool {
         matches!(self, Tool::Arrow | Tool::PolylineArrow | Tool::CurveArrow)
+    }
+
+    /// Tools that drag out a draft on press-move-release and commit on release
+    /// via the shared tiny-discard check. The eraser deletes on click instead.
+    pub fn is_drawing(self) -> bool {
+        !matches!(self, Tool::Select | Tool::Eraser | Tool::Text)
     }
 }
 
@@ -563,6 +675,8 @@ pub struct Session {
     /// Bubble radius for new numbers, in image px.
     pub badge_size: f64,
     mosaic_block: i32,
+    /// Rect or Ellipse cutout for newly drawn spotlights.
+    pub spotlight_kind: SpotlightKind,
 }
 
 impl Default for Session {
@@ -597,6 +711,7 @@ impl Session {
             badge_style: BadgeStyle::Filled,
             badge_size: BADGE_RADIUS,
             mosaic_block: ann.clamped_mosaic_block(),
+            spotlight_kind: SpotlightKind::default(),
         }
     }
 
@@ -666,6 +781,24 @@ impl Session {
             self.dragging = false;
             crate::perf::log_diag("pointer_pressed tool=Text (requests text field, no draft)");
             return PressKind::RequestText;
+        }
+        if self.tool == Tool::Eraser {
+            self.dragging = false;
+            // Remove the topmost element under the pointer, matching the
+            // select tool's hit order. No hit is a no-op click.
+            if let Some((id, el)) = self
+                .elements
+                .iter()
+                .rev()
+                .find(|e| e.hit_test(pt))
+                .map(|e| (e.id, e.clone()))
+            {
+                crate::perf::log_diag(&format!("erase element id={id}"));
+                self.selected_id = None;
+                self.history
+                    .execute(&mut self.elements, Command::Remove { id, el });
+            }
+            return PressKind::Capture;
         }
         self.draft = Some(self.create_draft(pt));
         crate::perf::log_diag(&format!(
@@ -854,7 +987,13 @@ impl Session {
                 points: vec![pt],
                 head: 12.0,
             },
-            Tool::Pen => Shape::Pen { points: vec![pt] },
+            Tool::Pen | Tool::Highlighter => Shape::Pen { points: vec![pt] },
+            Tool::Line => Shape::Line { start: pt, end: pt },
+            Tool::Spotlight => Shape::Spotlight {
+                center: pt,
+                size: gpui::Size::new(SPOTLIGHT_SIZE as f32, SPOTLIGHT_SIZE as f32),
+                kind: self.spotlight_kind,
+            },
             Tool::Mosaic => Shape::Mosaic {
                 points: vec![pt],
                 block_size: self.mosaic_block,
@@ -866,15 +1005,33 @@ impl Session {
             },
             _ => Shape::Rect,
         };
+        // The highlighter reuses the pen's rendering path but lays down fat,
+        // translucent marker ink: width is floored and opacity capped.
+        let (stroke, stroke_width) = if self.tool == Tool::Highlighter {
+            let a = self.alpha.min(HIGHLIGHTER_ALPHA_MAX);
+            (
+                (alpha_channel(a) << 24) | (self.stroke & 0x00FF_FFFF),
+                self.stroke_width.max(HIGHLIGHTER_MIN_WIDTH),
+            )
+        } else {
+            (self.stroke_argb(), self.stroke_width)
+        };
+        // A spotlight is a cutout in the global dim layer, not a filled shape:
+        // inheriting the pen colour here is what used to paint a red disc.
+        let fill = if self.tool == Tool::Spotlight {
+            None
+        } else {
+            self.fill_argb()
+        };
         let mut el = Element {
             id,
             bounds,
-            stroke: self.stroke_argb(),
-            stroke_width: self.stroke_width,
+            stroke,
+            stroke_width,
             line_style: self.line_style,
             shape,
             stroke_enabled: self.stroke_enabled,
-            fill: self.fill_argb(),
+            fill,
             arrow_ends: self.arrow_ends,
             arrow_head: self.arrow_head,
         };
@@ -887,6 +1044,12 @@ impl Session {
         if let Shape::Badge { radius, .. } = &el.shape {
             let r = *radius;
             el.bounds = Rect::new(pt.x - r, pt.y - r, r * 2.0, r * 2.0);
+        }
+        // Same for a spotlight: click (no drag) must still land a cutout.
+        if let Shape::Spotlight { center, size, .. } = &el.shape {
+            let w = size.width as f64;
+            let h = size.height as f64;
+            el.bounds = Rect::new(center.x - w * 0.5, center.y - h * 0.5, w, h);
         }
         el
     }
@@ -918,9 +1081,28 @@ fn recalc_path_bounds(el: &mut Element) {
 
 fn update_draft(draft: &mut Element, start: Point, current: Point) {
     match &mut draft.shape {
-        Shape::Arrow { end, .. } => {
+        Shape::Arrow { end, .. } | Shape::Line { end, .. } => {
             *end = current;
             draft.bounds = rect_from_points(start, current);
+        }
+        Shape::Spotlight { center, size, kind } => {
+            // Drag from press point sizes the cutout; the press point stays the
+            // centre. A circle forces width == height; an ellipse stretches with
+            // the drag; a rect sizes independently.
+            let dx = (current.x - start.x).abs().max(1.0);
+            let dy = (current.y - start.y).abs().max(1.0);
+            *size = match *kind {
+                SpotlightKind::Circle => {
+                    let d = dx.max(dy);
+                    gpui::Size::new(d as f32, d as f32)
+                }
+                SpotlightKind::Ellipse | SpotlightKind::Rect => {
+                    gpui::Size::new(dx as f32, dy as f32)
+                }
+            };
+            let w = size.width as f64;
+            let h = size.height as f64;
+            draft.bounds = Rect::new(center.x - w * 0.5, center.y - h * 0.5, w, h);
         }
         Shape::Pen { points }
         | Shape::Mosaic { points, .. }
@@ -1790,5 +1972,193 @@ mod tests {
             })
             .collect();
         assert_eq!(nums, vec![1, 2]);
+    }
+
+    // ---- new annotation tools --------------------------------------------
+
+    #[test]
+    fn line_press_move_release_creates_a_line() {
+        let mut s = Session::new();
+        s.tool = Tool::Line;
+        s.pointer_pressed(pt(10.0, 20.0));
+        s.pointer_moved(pt(40.0, 60.0));
+        s.pointer_released();
+        assert_eq!(s.elements.len(), 1);
+        match &s.elements[0].shape {
+            Shape::Line { start, end } => {
+                assert_eq!(*start, pt(10.0, 20.0));
+                assert_eq!(*end, pt(40.0, 60.0));
+            }
+            other => panic!("expected line, got {other:?}"),
+        }
+        assert_eq!(s.elements[0].bounds, Rect::new(10.0, 20.0, 30.0, 40.0));
+        // A line has no path, so a pure click (no drag) is discarded.
+        s.pointer_pressed(pt(5.0, 5.0));
+        s.pointer_released();
+        assert_eq!(s.elements.len(), 1);
+    }
+
+    #[test]
+    fn highlighter_reuses_pen_with_fat_translucent_stroke() {
+        let mut s = Session::new();
+        s.set_stroke_width(1.0);
+        s.set_alpha(100.0);
+        s.tool = Tool::Highlighter;
+        s.pointer_pressed(pt(4.0, 4.0));
+        s.pointer_moved(pt(40.0, 4.0));
+        s.pointer_released();
+        assert_eq!(s.elements.len(), 1);
+        let el = &s.elements[0];
+        assert!(matches!(el.shape, Shape::Pen { .. }));
+        assert!(el.stroke_width >= HIGHLIGHTER_MIN_WIDTH);
+        assert!(
+            ((el.stroke >> 24) & 0xFF) <= alpha_channel(HIGHLIGHTER_ALPHA_MAX),
+            "highlighter alpha must be capped"
+        );
+    }
+
+    #[test]
+    fn spotlight_click_lands_a_sized_disc() {
+        let mut s = Session::new();
+        s.tool = Tool::Spotlight;
+        s.pointer_pressed(pt(100.0, 100.0));
+        s.pointer_released();
+        assert_eq!(s.elements.len(), 1);
+        let el = &s.elements[0];
+        match &el.shape {
+            Shape::Spotlight { center, size, kind } => {
+                assert_eq!(*center, pt(100.0, 100.0));
+                assert_eq!(size.width as f64, SPOTLIGHT_SIZE);
+                assert_eq!(size.height as f64, SPOTLIGHT_SIZE);
+                assert_eq!(*kind, SpotlightKind::Ellipse);
+            }
+            other => panic!("expected spotlight, got {other:?}"),
+        }
+        assert_eq!(
+            el.bounds,
+            Rect::new(
+                100.0 - SPOTLIGHT_SIZE * 0.5,
+                100.0 - SPOTLIGHT_SIZE * 0.5,
+                SPOTLIGHT_SIZE,
+                SPOTLIGHT_SIZE
+            )
+        );
+        assert!(
+            el.fill.is_none(),
+            "spotlight is a dim cutout, not a pen-coloured fill"
+        );
+    }
+
+    #[test]
+    fn spotlight_never_inherits_the_stroke_colour() {
+        let mut s = Session::new();
+        s.stroke = 0xFFFF_0000; // the reported red-dot regression
+        s.set_alpha(100.0);
+        s.tool = Tool::Spotlight;
+        s.pointer_pressed(pt(100.0, 100.0));
+        s.pointer_released();
+        let el = &s.elements[0];
+        assert_eq!(el.fill, None);
+        assert_ne!(el.fill, Some(el.stroke));
+        assert_eq!((el.stroke >> 24) & 0xFF, 0xFF);
+    }
+
+    #[test]
+    fn moving_a_spotlight_moves_its_cutout() {
+        let mut s = Session::new();
+        s.tool = Tool::Spotlight;
+        s.pointer_pressed(pt(100.0, 100.0));
+        s.pointer_released();
+        let id = s.elements[0].id;
+        s.tool = Tool::Select;
+        assert_eq!(s.pointer_pressed(pt(100.0, 100.0)), PressKind::Capture);
+        s.pointer_moved(pt(140.0, 170.0));
+        let el = s.elements.iter().find(|e| e.id == id).unwrap();
+        match &el.shape {
+            Shape::Spotlight { center, size, kind } => {
+                assert_eq!(*center, pt(140.0, 170.0));
+                assert_eq!(size.width as f64, SPOTLIGHT_SIZE);
+                assert_eq!(size.height as f64, SPOTLIGHT_SIZE);
+                assert_eq!(*kind, SpotlightKind::Ellipse);
+            }
+            other => panic!("expected spotlight, got {other:?}"),
+        }
+        assert_eq!(el.bounds, Rect::new(92.0, 122.0, 96.0, 96.0));
+    }
+
+    #[test]
+    fn spotlight_drag_sizes_the_cutout_from_press_point() {
+        let mut s = Session::new();
+        s.tool = Tool::Spotlight;
+        s.spotlight_kind = SpotlightKind::Rect;
+        // Press at (100, 100), drag to (140, 130) -> 40x30 rect centred at (100,100)
+        s.pointer_pressed(pt(100.0, 100.0));
+        s.pointer_moved(pt(140.0, 130.0));
+        s.pointer_released();
+        assert_eq!(s.elements.len(), 1);
+        let el = &s.elements[0];
+        match &el.shape {
+            Shape::Spotlight { center, size, kind } => {
+                assert_eq!(*center, pt(100.0, 100.0));
+                assert_eq!(size.width as f64, 40.0);
+                assert_eq!(size.height as f64, 30.0);
+                assert_eq!(*kind, SpotlightKind::Rect);
+            }
+            other => panic!("expected spotlight rect, got {other:?}"),
+        }
+        // Bounds centred on press point: 80..120 x, 85..115 y
+        assert_eq!(el.bounds, Rect::new(80.0, 85.0, 40.0, 30.0));
+    }
+
+    #[test]
+    fn spotlight_drag_circle_keeps_equal_dims() {
+        let mut s = Session::new();
+        s.tool = Tool::Spotlight;
+        s.spotlight_kind = SpotlightKind::Circle;
+        // Drag farther horizontally than vertically -> circle uses max dim
+        s.pointer_pressed(pt(100.0, 100.0));
+        s.pointer_moved(pt(150.0, 110.0));
+        s.pointer_released();
+        assert_eq!(s.elements.len(), 1);
+        let el = &s.elements[0];
+        match &el.shape {
+            Shape::Spotlight { center, size, kind } => {
+                assert_eq!(*center, pt(100.0, 100.0));
+                assert_eq!(size.width as f64, 50.0);
+                assert_eq!(size.height as f64, 50.0);
+                assert_eq!(*kind, SpotlightKind::Circle);
+            }
+            other => panic!("expected spotlight circle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eraser_deletes_topmost_hit_and_undo_restores_it() {
+        let mut s = Session::new();
+        s.tool = Tool::Rect;
+        s.pointer_pressed(pt(10.0, 10.0));
+        s.pointer_moved(pt(50.0, 50.0));
+        s.pointer_released();
+        assert_eq!(s.elements.len(), 1);
+        let id = s.elements[0].id;
+
+        s.tool = Tool::Eraser;
+        // Hit inside the rect: it must be removed via a reversible command.
+        assert_eq!(s.pointer_pressed(pt(30.0, 30.0)), PressKind::Capture);
+        assert!(s.elements.is_empty());
+        assert!(s.undo());
+        assert_eq!(s.elements.len(), 1);
+        assert_eq!(s.elements[0].id, id);
+
+        // A miss is a harmless click.
+        assert_eq!(s.pointer_pressed(pt(500.0, 500.0)), PressKind::Capture);
+        assert_eq!(s.elements.len(), 1);
+    }
+
+    #[test]
+    fn new_tool_ids_roundtrip() {
+        for tool in [Tool::Line, Tool::Highlighter, Tool::Spotlight, Tool::Eraser] {
+            assert_eq!(Tool::from_id(tool.id()), Some(tool), "{tool:?}");
+        }
     }
 }

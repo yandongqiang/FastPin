@@ -18,7 +18,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpui::{
@@ -33,10 +33,10 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CreatePopupMenu, DeferWindowPos, DestroyMenu, EndDeferWindowPos,
-    GetClientRect, GetCursorPos, GetWindowRect, InsertMenuW, PostMessageW, SetForegroundWindow,
-    SetWindowPos, TrackPopupMenu, HWND_TOPMOST, MF_BYPOSITION, MF_SEPARATOR, MF_STRING,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON,
+    GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowRect, InsertMenuW, PostMessageW,
+    SetForegroundWindow, SetWindowPos, TrackPopupMenu, HWND_TOPMOST, MF_BYPOSITION, MF_SEPARATOR,
+    MF_STRING, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SYSTEM_METRICS_INDEX, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
 };
 
 use crate::geom::{Point, Rect};
@@ -581,6 +581,19 @@ pub(crate) fn snapshots(cx: &mut App, group: u64, mine: Option<TileSnapshot>) ->
 
 // ---- view -----------------------------------------------------------------
 
+/// One OLE drag loop at a time, process-wide: the shell's modal loop and a
+/// concurrent second `DoDragDrop` do not compose.
+static EXPORT_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The process-wide drag-export file retention. Leases live here because the
+/// gesture thread ends, but the staged file must survive until the receiver
+/// finishes its copy or the grace window closes.
+fn drag_retention() -> &'static std::sync::Mutex<crate::dragexport::Retention> {
+    use std::sync::{Mutex, OnceLock};
+    static RETENTION: OnceLock<Mutex<crate::dragexport::Retention>> = OnceLock::new();
+    RETENTION.get_or_init(|| Mutex::new(crate::dragexport::Retention::new()))
+}
+
 /// A snap that is showing its ✓: `target` is the pin this one is flush with.
 #[derive(Clone, Copy)]
 struct Pending {
@@ -599,6 +612,10 @@ pub struct PinView {
     layout_rect: Option<Rect>,
     /// Cursor position minus the window origin at drag start, screen coords.
     drag_offset: Option<(i32, i32)>,
+    /// Screen cursor at a Ctrl+press that may grow into a drag-export gesture.
+    /// Mutually exclusive with `drag_offset`: the armed gesture swallows the
+    /// move, so the window does not follow the pointer.
+    export_drag_origin: Option<(i32, i32)>,
     /// A resize drag in progress; mutually exclusive with `drag_offset`.
     resize: Option<ResizeDrag>,
     /// Edge under the pointer while idle, so the cursor shows what it does.
@@ -627,6 +644,7 @@ impl PinView {
             zoom: 1.0,
             layout_rect: None,
             drag_offset: None,
+            export_drag_origin: None,
             resize: None,
             hover_edge: None,
             pending: None,
@@ -1006,6 +1024,16 @@ impl PinView {
             self.close_group(window, cx);
             return;
         }
+        // Ctrl+press arms a drag-export gesture (upstream snow-shot): the pin
+        // itself never moves while it is armed. Resizing beats nothing here --
+        // an armed press owns the pointer until release or threshold.
+        if event.modifiers.secondary() {
+            let mut cursor = POINT::default();
+            if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
+                self.export_drag_origin = Some((cursor.x, cursor.y));
+            }
+            return;
+        }
         // Edge hot zones beat the move drag: pressing the border resizes,
         // pressing inside moves.
         if let Some(edge) = self.resize_edge_under(window, event.position) {
@@ -1133,6 +1161,12 @@ impl PinView {
             }
             return;
         }
+        // The armed gesture crossing the system drag threshold starts the OLE
+        // loop on a worker thread. The press is consumed: no move, no resize.
+        if self.export_drag_origin.is_some() {
+            self.begin_export_drag(window, cx);
+            return;
+        }
         if let Some(drag) = self.resize.clone() {
             self.drag_resize(drag, window, cx);
             return;
@@ -1198,6 +1232,9 @@ impl PinView {
             MouseButton::Left => {
                 if self.editing() {
                     self.edit_release(cx);
+                } else if self.export_drag_origin.take().is_some() {
+                    // Released before the threshold: not a drag, just a click.
+                    cx.notify();
                 } else if self.resize.take().is_some() {
                     // Resizing never starts a stitch: the group stays put.
                     cx.notify();
@@ -1373,6 +1410,105 @@ impl PinView {
                 flatten_gaps(&mut px, [255, 255, 255, 255]);
             }
             crate::app::export_pin_pixels(px, w, h, write_file, copy);
+        });
+    }
+
+    /// Starts the OLE drag loop once the armed press crosses the drag
+    /// threshold. The gesture is disarmed immediately (the loop runs on its
+    /// own thread and reports through `export_dragging`), so a slow start
+    /// cannot double-fire and a mid-drag release is not a move.
+    fn begin_export_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let origin = self.export_drag_origin.take();
+        if origin.is_none() {
+            return;
+        }
+        // A global gate keeps two pins from racing the same threshold press
+        // (one OLE loop per process is also what the shell tolerates best).
+        if EXPORT_DRAG_ACTIVE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        // The system threshold decides when a press becomes a drag, matching
+        // Qt's startDragDistance. Not yet past it: keep the gesture armed.
+        let (dx, dy) = unsafe {
+            let mut cursor = POINT::default();
+            if GetCursorPos(&mut cursor).is_err() {
+                self.export_drag_origin = origin;
+                return;
+            }
+            (cursor.x - origin.unwrap().0, cursor.y - origin.unwrap().1)
+        };
+        let threshold = unsafe {
+            GetSystemMetrics(SYSTEM_METRICS_INDEX(if dx.abs() >= dy.abs() {
+                SM_CXDRAG.0
+            } else {
+                SM_CYDRAG.0
+            }))
+        };
+        if dx.abs() < threshold && dy.abs() < threshold {
+            self.export_drag_origin = origin;
+            return;
+        }
+        let tiles = snapshots(cx, self.group(), self.snapshot(window));
+        std::thread::spawn(move || {
+            let images: Vec<TileImage> = tiles
+                .iter()
+                .map(|t| TileImage {
+                    rect: t.precise_rect,
+                    pixels: t.pixels.as_slice(),
+                    width: t.size.0,
+                    height: t.size.1,
+                    zoom: t.zoom,
+                })
+                .collect();
+            let (mut px, _w, _h) = match compose(&images) {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::perf::log_app(&format!("drag export compose: {e}"));
+                    return;
+                }
+            };
+            // A dragged image pasted into a white-background target must not
+            // bring its transparent gaps along, same as copy.
+            flatten_gaps(&mut px, [255, 255, 255, 255]);
+            let extension = {
+                let export = &crate::config::get().screenshot.export;
+                crate::codec::effective_format(export.format).extension()
+            };
+            let staged = crate::dragexport::stage(&px, extension);
+            let path = match staged {
+                Ok(p) => p,
+                Err(e) => {
+                    crate::perf::log_app(&format!("drag export stage: {e}"));
+                    return;
+                }
+            };
+            let bytes = px.len() as u64;
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::drag::drag_file_async(path.clone(), move |outcome| {
+                let _ = tx.send(outcome);
+            });
+            // OLE needs an MTA here: the writer thread below touches WIC.
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_MULTITHREADED,
+                );
+            }
+            let outcome = rx.recv().unwrap_or(crate::drag::DragOutcome::Failed);
+            let retention = &mut drag_retention().lock().unwrap();
+            retention.complete(
+                &crate::dragexport::Lease {
+                    path: path.clone(),
+                    bytes,
+                },
+                outcome.accepted(),
+            );
+            // A refused drop keeps its grace window too: the receiver may have
+            // read the file mid-drop even though it refused the final effect.
+            EXPORT_DRAG_ACTIVE.store(false, Ordering::SeqCst);
         });
     }
 

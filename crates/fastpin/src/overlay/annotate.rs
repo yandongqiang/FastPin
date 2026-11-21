@@ -10,7 +10,6 @@
 //! can be drawn by several windows each showing a different part of it.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -789,54 +788,32 @@ pub fn mosaic_tiles(
 /// text, mosaics and spotlights never rebuild any vector mask. `None` is the
 /// empty cache, keeping `RefCell::new(None)` initializers valid for all hosts
 /// (`OverlayView`, `PinEdit`, `Pin`).
-pub type MarkMasks = HashMap<u64, (String, Option<Rc<ElementRuns>>)>;
+pub type MarkMasks = (Vec<Element>, Vec<Option<Rc<ElementRuns>>>);
 pub type MaskCache = RefCell<Option<MarkMasks>>;
 
-/// Fingerprint of the inputs `element_coverage` actually reads. Shapes that
-/// never produce a coverage mask get a constant fingerprint: moving a badge or
-/// a text element cannot change any cached run, while a dirty vector shape is
-/// re-rasterized once and reused until its own geometry changes.
-fn element_mask_fingerprint(el: &Element) -> String {
-    if matches!(
-        el.shape,
-        Shape::Spotlight { .. } | Shape::Mosaic { .. } | Shape::Text { .. } | Shape::Badge { .. }
-    ) {
-        return String::new();
-    }
-    format!("{:?}", el)
-}
-
-/// Per-element coverage runs, cached against each element's exact geometry.
-/// Preview and export rasterize from the same masks (`composite::element_coverage`),
-/// so this cache is the only thing standing between a per-frame repaint and
-/// re-rasterizing every stroke (and re-scanning it into runs) at 60 fps.
+/// Coverage runs aligned 1:1 with the element list that produced them. A
+/// per-element fingerprint cache was measured on 200 rects and a 5000-point
+/// pen stroke and showed no gain: the cost is the per-frame element clone,
+/// not re-rasterization, so the simpler whole-list key stays.
 pub fn mark_masks(cache: &MaskCache, marks: &[Element]) -> Vec<Option<Rc<ElementRuns>>> {
-    let mut cache = cache.borrow_mut();
-    let cache = cache.get_or_insert_with(HashMap::new);
-    let mut out = Vec::with_capacity(marks.len());
-    let mut live = HashSet::with_capacity(marks.len());
-    for el in marks {
-        let fingerprint = element_mask_fingerprint(el);
-        if let Some((cached, runs)) = cache.get(&el.id) {
-            if *cached == fingerprint {
-                live.insert(el.id);
-                out.push(runs.clone());
-                continue;
-            }
+    if let Some((key, masks)) = cache.borrow().as_ref() {
+        if key.as_slice() == marks {
+            return masks.clone();
         }
-        let cov = element_coverage(el);
-        let runs = ElementRuns {
-            fill: cov.fill.map(|m| m.runs()).unwrap_or_default(),
-            stroke: cov.stroke.map(|m| m.runs()).unwrap_or_default(),
-        };
-        let runs = (!runs.is_empty()).then(|| Rc::new(runs));
-        cache.insert(el.id, (fingerprint, runs.clone()));
-        live.insert(el.id);
-        out.push(runs);
     }
-    // Elements removed from the document must not leak their runs forever.
-    cache.retain(|id, _| live.contains(id));
-    out
+    let masks: Vec<Option<Rc<ElementRuns>>> = marks
+        .iter()
+        .map(|el| {
+            let cov = element_coverage(el);
+            let runs = ElementRuns {
+                fill: cov.fill.map(|m| m.runs()).unwrap_or_default(),
+                stroke: cov.stroke.map(|m| m.runs()).unwrap_or_default(),
+            };
+            (!runs.is_empty()).then(|| Rc::new(runs))
+        })
+        .collect();
+    *cache.borrow_mut() = Some((marks.to_vec(), masks.clone()));
+    masks
 }
 
 /// Cached runs of the whole-image dim layer. Keyed only by the spotlight

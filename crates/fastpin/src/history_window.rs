@@ -71,11 +71,10 @@ fn thumb_height(width: u32, height: u32) -> f32 {
     (THUMB_W * height as f32 / width as f32).clamp(MIN_H, MAX_H)
 }
 
-/// 宫格卡片总高度估计，供瀑布流累计列高使用：上下内边距 + 缩略图 +
-/// 图文间距 + 两行信息文字。留出少量余量，保证相邻卡片不会重叠。
+/// 宫格卡片总高度估计，供瀑布流累计列高使用。宫格只显示图片，
+/// 因此高度就是上下内边距 + 缩略图，留少量余量避免相邻卡片重叠。
 fn card_height(record: &HistoryRecord) -> f32 {
-    const INFO_H: f32 = 36.0; // 12px/10px 两行文字 + 3px gap 的保守估计
-    2.0 * CARD_PAD + thumb_height(record.width, record.height) + 8.0 + INFO_H
+    2.0 * CARD_PAD + thumb_height(record.width, record.height) + 2.0
 }
 
 /// 空历史提示（宫格 / 列表共用）。
@@ -640,31 +639,6 @@ impl HistoryWindowView {
                             )
                             .into_any_element(),
                     }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::primary_fg())
-                            .child(crate::history::format_utc(record.created_ms)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(theme::secondary_fg())
-                            .child(format!(
-                                "{} × {} · {} · {}",
-                                record.width,
-                                record.height,
-                                crate::history::source_label(&record.source),
-                                crate::settings::model::human_size(record.bytes)
-                            )),
-                    ),
             )
     }
 

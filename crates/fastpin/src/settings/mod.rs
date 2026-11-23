@@ -4459,7 +4459,8 @@ impl SettingsView {
         const GAP: f32 = 16.0;
         // 卡片中除缩略图以外的固定高度估算：上下内边距 + 图文间距 + 两行文字 + 边框。
         // 只用于瀑布流列高平衡，不影响卡片真实布局。
-        const CARD_CHROME_H: f32 = 2.0 * PAD + 8.0 + 34.0 + 2.0;
+        // Grid cards show the image only, so the chrome is just the card padding.
+        const CARD_CHROME_H: f32 = 2.0 * PAD + 2.0;
 
         let view_id = cx.entity_id();
         let width_cell = self.history_grid_width.clone();
@@ -4617,30 +4618,6 @@ impl SettingsView {
                                         .child("无预览")
                                         .into_any_element(),
                                 }),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(3.))
-                                .child(
-                                    div()
-                                        .text_size(px(12.))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme::primary_fg())
-                                        .child(crate::history::format_utc(record.created_ms)),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(10.))
-                                        .text_color(theme::secondary_fg())
-                                        .child(format!(
-                                            "{} × {} · {}",
-                                            record.width,
-                                            record.height,
-                                            crate::history::source_label(&record.source),
-                                        )),
-                                ),
                         ),
                 );
             }

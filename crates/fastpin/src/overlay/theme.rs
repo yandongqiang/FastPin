@@ -187,8 +187,8 @@ pub fn available_themes() -> Vec<(String, String)> {
 }
 
 /// 把编译进二进制的 `themes/*.json` 全部注册进 gpui-kit，并把 registry 里的
-/// 主题名记到快照里供下拉使用。单个文件注册失败（如缺 `syntax` 的
-/// `citepix.json`）静默跳过；没有 registry 时只清空快照，绝不 panic。
+/// 主题名记到快照里供下拉使用。单个文件注册失败时静默跳过；没有 registry
+/// 时只清空快照，绝不 panic。
 pub fn init_themes(cx: &mut gpui::App) {
     // 正常由 init() 在 gpui_kit::init 之后调用；单独调用时不 panic，静默跳过。
     if !cx.has_global::<ThemeRegistry>() {

@@ -22,7 +22,7 @@ pub struct Settings {
     pub history: History,
     pub hotkeys: Hotkeys,
     /// UI 外观：编译进二进制并注册到 gpui-kit 的主题变体名（如
-    /// `"Catppuccin Latte"`、`"CitePix Dark"`），默认 `"Default Light"`。
+    /// `"Catppuccin Latte"`、`"Tokyo Moon"`），默认 `"Default Light"`。
     /// 纯字符串保持配置文件可手改；未知值在启动时回退到默认浅色主题，
     /// 不会让整个配置文件失效。
     pub appearance: String,
@@ -1482,7 +1482,7 @@ mod tests {
             DEFAULT_DARK_APPEARANCE,
             "Catppuccin Latte",
             "Catppuccin Mocha",
-            "CitePix Dark",
+            "Tokyo Moon",
             "Tokyo Storm",
         ] {
             let s = Settings {
@@ -1509,8 +1509,8 @@ mod tests {
         assert!(!appearance_dark(DEFAULT_APPEARANCE));
         for name in [
             DEFAULT_DARK_APPEARANCE,
-            "CitePix Dark",
             "macOS Classic Dark",
+            "Ayu Dark",
             "legacy-dark",
             "DARK",
         ] {
@@ -1528,7 +1528,7 @@ mod tests {
     #[test]
     fn theme_variant_names_do_not_need_a_dark_suffix() {
         // 变体名直接写进 appearance，深色变体不再要求 -dark 后缀。
-        for name in ["Catppuccin Mocha", "CitePix Dark", "Adventure"] {
+        for name in ["Catppuccin Mocha", "Tokyo Moon", "Adventure"] {
             let settings = Settings {
                 appearance: name.into(),
                 ..Default::default()

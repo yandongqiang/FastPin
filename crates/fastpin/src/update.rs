@@ -21,7 +21,7 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::error::{Error, Result};
-// 下载进度与流式写入由 `net` 统一实现，模型下载与更新包共用同一套上限。
+// 下载进度与流式写入由 `net` 统一实现，更新包下载复用这套上限与写入器。
 pub use crate::net::DownloadProgress;
 use crate::net::{content_length_within_limit, stream_body_to_file, MAX_DOWNLOAD_BYTES};
 

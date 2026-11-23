@@ -1,5 +1,4 @@
-//! Small WinHTTP helpers shared by translation, update checks and model
-//! downloads.
+//! Small WinHTTP helpers shared by translation and update checks.
 //!
 //! Both the response reader and the streaming downloader grow a `Vec` (or a
 //! file) from `WinHttpQueryDataAvailable` with no ceiling unless a cap is
@@ -29,7 +28,7 @@ use crate::error::{Error, Result};
 /// a runaway endpoint cannot put the process into an unrecoverable allocation.
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-/// 512 MiB ceiling for one streamed download (installer or model package).
+/// 512 MiB ceiling for one streamed download (installer package).
 pub const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Body is pulled in 64 KiB pieces so progress can be reported per chunk.
@@ -38,11 +37,11 @@ pub(crate) const DOWNLOAD_CHUNK_BYTES: u32 = 64 * 1024;
 /// 一次下载的整体超时（连接 / 发送 / 接收 / 读取共用一个预算）。
 const DOWNLOAD_TIMEOUT_SECONDS: u32 = 20;
 
-/// 跟随模型托管站常见的 CDN 跳转；超过就放弃，避免无限循环。
+/// 跟随下载托管站常见的 CDN 跳转；超过就放弃，避免无限循环。
 const MAX_DOWNLOAD_REDIRECTS: usize = 5;
 
-/// Streaming progress of one download. Re-exported by `update` for callers that
-/// already used the old path.
+/// Streaming progress of one download. Re-exported by `update` for the settings
+/// window's in-app installer progress display.
 #[derive(Clone, Copy, Debug)]
 pub struct DownloadProgress {
     pub received: u64,
@@ -115,9 +114,8 @@ pub fn redact_url(url: &str) -> String {
     format!("{scheme}***@{authority}")
 }
 
-/// File name to use when a model package is downloaded to
-/// `models/translate/<id>/`: the URL's last path segment, with characters
-/// Windows refuses in a file name replaced. Pure so the settings UI can call
+/// File name for a downloaded asset: the URL's last path segment, with
+/// characters Windows refuses in a file name replaced. Pure so callers can use
 /// it without touching the network.
 pub fn download_file_name(url: &str) -> String {
     let without_query = url.split(['?', '#']).next().unwrap_or(url);
@@ -130,7 +128,7 @@ pub fn download_file_name(url: &str) -> String {
     let last = path
         .rsplit('/')
         .find(|part| !part.is_empty())
-        .unwrap_or("model.bin");
+        .unwrap_or("download.bin");
     let cleaned: String = last
         .chars()
         .map(|c| match c {
@@ -141,7 +139,7 @@ pub fn download_file_name(url: &str) -> String {
         .collect();
     let trimmed = cleaned.trim().trim_end_matches(['.', ' ']);
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        "model.bin".into()
+        "download.bin".into()
     } else {
         trimmed.to_string()
     }
@@ -361,7 +359,7 @@ fn is_redirect(status: u32) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-/// Model hosts redirect to a CDN. Accept only absolute http(s) URLs or a
+/// Download hosts redirect to a CDN. Accept only absolute http(s) URLs or a
 /// root-relative path on the same host — never `file://` or a local path.
 fn resolve_download_redirect(base: &str, location: &str) -> Result<String> {
     let loc = location.trim();
@@ -395,7 +393,7 @@ fn part_path(dest: &Path) -> PathBuf {
     let name = dest
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("model.bin");
+        .unwrap_or("download.bin");
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -404,10 +402,10 @@ fn part_path(dest: &Path) -> PathBuf {
     dest.with_file_name(format!(".{name}.{}-{stamp}-{seq}.part", std::process::id()))
 }
 
-/// Stream one http(s) URL into `dest` (a file path chosen by the caller, e.g.
-/// `models/translate/<id>/<file>`), with a 512 MiB ceiling and per-chunk
-/// progress. Bytes land in a sibling `.part` file first and are renamed into
-/// place only on success, so an interrupted download never looks installed.
+/// Stream one http(s) URL into `dest` (a file path chosen by the caller), with a
+/// 512 MiB ceiling and per-chunk progress. Bytes land in a sibling `.part` file
+/// first and are renamed into place only on success, so an interrupted download
+/// never leaves a half-written file at the destination.
 ///
 /// Blocking. Call it off the UI thread. `on_progress` fires once before the
 /// first read and once after every chunk.
@@ -438,10 +436,10 @@ pub fn download_url_to(
     }
 
     if head.status == 404 {
-        return Err(Error::new("模型文件不存在（HTTP 404）"));
+        return Err(Error::new("下载文件不存在（HTTP 404）"));
     }
     if !(200..300).contains(&head.status) {
-        return Err(Error::new(format!("下载模型失败（HTTP {}）", head.status)));
+        return Err(Error::new(format!("下载失败（HTTP {}）", head.status)));
     }
     if !content_length_within_limit(head.total, MAX_DOWNLOAD_BYTES) {
         return Err(Error::new(format!(
@@ -494,7 +492,7 @@ mod tests {
         );
         assert_eq!(download_file_name("https://example.com/a/b/"), "b");
         assert_eq!(download_file_name("https://example.com/a/..\\b"), ".._b");
-        assert_eq!(download_file_name("https://example.com/"), "model.bin");
+        assert_eq!(download_file_name("https://example.com/"), "download.bin");
         assert_eq!(download_file_name("not a url"), "not a url");
     }
 

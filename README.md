@@ -88,22 +88,7 @@ OCR 取出文字后一键翻译：
 - API Key 存进 Windows 凭据管理器，不写进配置文件
 - 对返回格式做了容错：流式 `delta`、缺字段都不会让程序崩
 
-**本地模型（下载 / 配置骨架）**：设置 → 翻译里可以选本地服务（默认卡片为
-「Haidass Translate 143M · FP16」）。点「下载」会流式下载 CitePix-Resources
-发布的 MNN 部署包 `haidass-translate-143m-a06db229-fp16-v1.zip`（约 214 MiB，
-224,593,262 B），主源为 GitHub Release，失败自动切换 HuggingFace 镜像；
-校验 SHA256 后用系统 PowerShell `Expand-Archive` 解压到
-`models/translate/<服务 id>/`（根目录可由 `translation.localModelsDir` 覆盖）。
-包内 `llm.mnn.weight`（286,376,448 B）存在且大小接近声明值即判定为已安装；
-界面显示下载进度百分比与安装 / 失败状态，下载中忽略重复点击。
-
-原始模型来自 [DALabCommunity/Haidass-Translate-143M](https://huggingface.co/DALabCommunity/Haidass-Translate-143M)，
-Apache-2.0，由 CitePix-Resources 打包为 `mnn-llm` / FP16（en-zh、zh-en）。
-
-**推理仍未实现**：本地翻译只接入了下载与配置，即使部署包已解压完成，推理
-入口也只会明确报「本地翻译推理管线尚未实现」并自动回退到 API，不会假装本地
-翻译可用；没有引入 ONNX Runtime / tokenizer 依赖。API 回退仍需要你配置
-Base URL / Key。
+不提供本地翻译模型：所有翻译都发往你自己在设置里配置的 API 端点。
 
 ### 长截图
 
@@ -160,7 +145,7 @@ Rust 版仍在补齐以下 C# 版已有的能力：
 
 - OCR 典型选区约 1 秒出结果（CPU 推理的固有开销），识别中会显示状态提示
 - 长截图默认手动滚动，可在工具栏打开「自动滚动」；单次滚动超过选区高度的帧会被丢弃
-- 翻译依赖你自己提供的 API；本地翻译只接入了 MNN 部署包的下载 / 解压 / 配置，推理管线未实现，始终回退 API
+- 翻译依赖你自己提供的 API；没有本地翻译模型，也没有内置翻译服务
 
 ## 系统要求
 

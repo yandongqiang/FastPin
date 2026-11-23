@@ -13,8 +13,7 @@ pub mod widgets;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
@@ -55,55 +54,6 @@ const INLINE_FIELD_W: f32 = 220.;
 const DROPDOWN_TOP: f32 = widgets::ROW_MIN_H + 4.;
 
 const LANGUAGES: [(&str, &str); 3] = [("zh-CN", "简体中文"), ("en", "English"), ("ja", "日本語")];
-
-/// 本地 MNN 部署包下载 / 解压的跨线程消息。后台线程发送，UI 任务每 150 ms 取一次。
-enum ModelDownloadMsg {
-    Progress(crate::net::DownloadProgress),
-    /// Ok(来源说明)，Err(明确的失败原因)。
-    Done(std::result::Result<&'static str, String>),
-}
-
-/// 用 Windows 自带的 PowerShell 解压 zip：标准库没有 zip 解码器，不必为一次
-/// 安装引入 `zip` 依赖。给出 sha256 时先用 `Get-FileHash` 校验，避免把损坏或
-/// 被替换的包解压进模型目录。
-fn extract_model_archive(
-    zip: &Path,
-    dir: &Path,
-    expected_sha256: &str,
-) -> std::result::Result<(), String> {
-    // PowerShell 单引号字符串里用两个单引号表示一个单引号，避免路径注入。
-    let ps = |p: &Path| p.to_string_lossy().replace('\'', "''");
-    let zip = ps(zip);
-    let dir = ps(dir);
-    let sha = expected_sha256
-        .trim()
-        .to_ascii_lowercase()
-        .replace('\'', "''");
-    let script = format!(
-        "$ErrorActionPreference='Stop'; \
-         $zip='{zip}'; $dest='{dir}'; $sha='{sha}'; \
-         if ($sha -ne '') {{ \
-           $actual=(Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant(); \
-           if ($actual -ne $sha) {{ throw \"SHA256 校验失败：期望 $sha，实际 $actual\" }} \
-         }}; \
-         Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force"
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map_err(|e| format!("无法启动 PowerShell：{e}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let detail = if stderr.is_empty() { stdout } else { stderr };
-    Err(if detail.is_empty() {
-        format!("PowerShell 退出码 {:?}", output.status.code())
-    } else {
-        detail
-    })
-}
 
 const HOTKEY_ROWS: [(HotkeyAction, &str, &str, &str); 3] = [
     (
@@ -294,9 +244,6 @@ enum SelectId {
     ElementDetection,
     ToolbarPosition,
     PanelPosition,
-    // 翻译页：默认服务与本地推理线程数。
-    DefaultTranslateService,
-    LocalThreads,
 }
 
 /// 截屏页的布尔开关，共用一套「取反后写回」逻辑。
@@ -608,12 +555,6 @@ pub struct SettingsView {
     /// Guards against spawning more than one history polling task. The task
     /// clears it when the History page (or the whole window) is left.
     history_poll_running: bool,
-    /// 本地模型下载在后台线程执行；此标志防止重复点击。
-    model_downloading: bool,
-    /// (服务 id, 下载进度快照)，由后台线程经 mpsc 回传，150 ms 轮询刷新。
-    model_download_progress: Option<(String, crate::net::DownloadProgress)>,
-    /// (服务 id, 失败原因)，保留到该服务下一次重新下载。
-    model_download_error: Option<(String, String)>,
     /// In-flight update check guards against double clicks.
     update_checking: bool,
     /// (version, url) of a newer release, when the last check found one.
@@ -1061,9 +1002,6 @@ impl SettingsView {
             )),
             history_revision_seen: crate::history::history_revision(),
             history_poll_running: false,
-            model_downloading: false,
-            model_download_progress: None,
-            model_download_error: None,
             update_checking: false,
             update_available: None,
             update_downloading: false,
@@ -1975,221 +1913,6 @@ impl SettingsView {
         } else {
             cx.notify();
         }
-    }
-
-    fn default_service_label(&self) -> SharedString {
-        let id = self.settings.translation.default_service.trim();
-        if id.is_empty() || id == "api" {
-            return "API 翻译（OpenAI 兼容）".into();
-        }
-        self.settings
-            .translation
-            .local_services
-            .iter()
-            .find(|service| service.id == id)
-            .map(|service| SharedString::from(service.name.clone()))
-            .unwrap_or_else(|| SharedString::from(id))
-    }
-
-    fn set_default_service(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.open_select = None;
-        if self.settings.translation.default_service != id {
-            self.settings.translation.default_service = id.to_string();
-            self.persist(cx);
-        } else {
-            cx.notify();
-        }
-    }
-
-    fn set_local_threads(&mut self, threads: u32, cx: &mut Context<Self>) {
-        self.open_select = None;
-        let threads = threads.clamp(1, 16);
-        if self.settings.translation.local_threads != threads {
-            self.settings.translation.local_threads = threads;
-            self.persist(cx);
-        } else {
-            cx.notify();
-        }
-    }
-
-    /// 自定义服务只给编辑入口，不在 UI 里写半个服务条目进 settings.json。
-    fn add_local_service(&mut self, cx: &mut Context<Self>) {
-        self.ok("自定义服务请编辑 settings.json 的 translation.localServices");
-        cx.notify();
-    }
-
-    /// 下载 CitePix 的 MNN 部署包 zip 并解压到 `models/translate/<id>/`。
-    /// 主源失败自动换备用源；下载 / 解压都在后台线程，进度经 mpsc 每 150 ms 刷新。
-    fn download_local_model(
-        &mut self,
-        service: crate::config::LocalTranslateService,
-        cx: &mut Context<Self>,
-    ) {
-        if self.model_downloading {
-            return;
-        }
-        let id = service.id.clone();
-        let primary = service.download_url.trim().to_string();
-        let fallback = service.fallback_url.trim().to_string();
-        if primary.is_empty() && fallback.is_empty() {
-            self.ok(format!(
-                "暂无下载地址，请手动将 MNN 部署包解压到 models/translate/{id}"
-            ));
-            cx.notify();
-            return;
-        }
-        let dir = match crate::translate::local_model_dir(&id) {
-            Ok(dir) => dir,
-            Err(e) => {
-                self.fail(format!("模型目录不可用：{e}"));
-                cx.notify();
-                return;
-            }
-        };
-        // GitHub / HuggingFace 的 URL 末段就是带版本号的 zip 名；下载器先写
-        // .part 再 rename，中断不会留下看起来已安装的文件。
-        let first = if primary.is_empty() {
-            &fallback
-        } else {
-            &primary
-        };
-        let dest = dir.join(crate::net::download_file_name(first));
-        let sha = service.archive_sha256.trim().to_string();
-        let archive_bytes = service.archive_bytes;
-
-        self.model_downloading = true;
-        self.model_download_progress = None;
-        self.model_download_error = None;
-        self.ok(format!("正在下载模型 {id}…"));
-        cx.notify();
-
-        let (tx, rx) = mpsc::channel::<ModelDownloadMsg>();
-        let finished = Arc::new(AtomicBool::new(false));
-        let flag = finished.clone();
-        let sources: Vec<(&'static str, String)> = [("GitHub", primary), ("HuggingFace", fallback)]
-            .into_iter()
-            .filter(|(_, url)| !url.is_empty())
-            .collect();
-        std::thread::spawn(move || {
-            let mut last_error = String::from("没有可用的下载地址");
-            let mut downloaded = false;
-            for (label, url) in sources {
-                match crate::net::download_url_to(&url, &dest, |progress| {
-                    let _ = tx.send(ModelDownloadMsg::Progress(progress));
-                }) {
-                    Ok(_) => {
-                        downloaded = true;
-                        break;
-                    }
-                    Err(e) => last_error = format!("{label} 下载失败：{e}"),
-                }
-            }
-            if !downloaded {
-                let _ = tx.send(ModelDownloadMsg::Done(Err(last_error)));
-                flag.store(true, Ordering::Release);
-                return;
-            }
-            if archive_bytes > 0 {
-                match std::fs::metadata(&dest) {
-                    Ok(meta) if meta.len() != archive_bytes => {
-                        let _ = tx.send(ModelDownloadMsg::Done(Err(format!(
-                            "部署包大小不符：期望 {archive_bytes} B，实际 {} B",
-                            meta.len()
-                        ))));
-                        flag.store(true, Ordering::Release);
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(ModelDownloadMsg::Done(Err(format!(
-                            "无法读取已下载的部署包：{e}"
-                        ))));
-                        flag.store(true, Ordering::Release);
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            match extract_model_archive(&dest, &dir, &sha) {
-                Ok(()) => {
-                    let _ = tx.send(ModelDownloadMsg::Done(Ok("MNN 部署包")));
-                }
-                Err(e) => {
-                    let _ = tx.send(ModelDownloadMsg::Done(Err(format!("部署包解压失败：{e}"))));
-                }
-            }
-            flag.store(true, Ordering::Release);
-        });
-
-        let active_id = id.clone();
-        cx.spawn(async move |this, cx: &mut AsyncApp| {
-            while !finished.load(Ordering::Acquire) {
-                while let Ok(msg) = rx.try_recv() {
-                    let _ = this.update(cx, |this, cx| {
-                        this.handle_model_download_msg(&active_id, msg, cx)
-                    });
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(150))
-                    .await;
-            }
-            // 线程先置完成标志再退出，最后取一次收尾消息。
-            while let Ok(msg) = rx.try_recv() {
-                let _ = this.update(cx, |this, cx| {
-                    this.handle_model_download_msg(&active_id, msg, cx)
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// 把后台消息落到 UI 状态并刷新卡片；失败原因留在原服务上直到下次下载。
-    fn handle_model_download_msg(
-        &mut self,
-        id: &str,
-        msg: ModelDownloadMsg,
-        cx: &mut Context<Self>,
-    ) {
-        match msg {
-            ModelDownloadMsg::Progress(p) => {
-                self.model_download_progress = Some((id.to_string(), p));
-            }
-            ModelDownloadMsg::Done(Ok(label)) => {
-                self.model_downloading = false;
-                self.model_download_progress = None;
-                self.model_download_error = None;
-                self.ok(format!("{label}已下载并解压到 models/translate/{id}"));
-            }
-            ModelDownloadMsg::Done(Err(e)) => {
-                self.model_downloading = false;
-                self.model_download_progress = None;
-                self.model_download_error = Some((id.to_string(), e.clone()));
-                self.fail(e.clone());
-            }
-        }
-        cx.notify();
-    }
-
-    /// 安装状态：包内 `llm.mnn.weight` 存在且大小接近声明值（1% 误差，至少 64 B）。
-    fn local_model_installed(&self, service: &crate::config::LocalTranslateService) -> bool {
-        let Ok(dir) = crate::translate::local_model_dir(&service.id) else {
-            return false;
-        };
-        let marker = if service.install_marker.trim().is_empty() {
-            crate::config::DEFAULT_LOCAL_SERVICE_INSTALL_MARKER
-        } else {
-            service.install_marker.trim()
-        };
-        let Ok(meta) = std::fs::metadata(dir.join(marker)) else {
-            return false;
-        };
-        if !meta.is_file() {
-            return false;
-        }
-        if service.install_marker_bytes == 0 {
-            return true;
-        }
-        meta.len().abs_diff(service.install_marker_bytes)
-            <= (service.install_marker_bytes / 100).max(64)
     }
 
     fn appearance_label(&self) -> SharedString {
@@ -4250,156 +3973,7 @@ impl SettingsView {
     }
 
     fn page_translate(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // 默认翻译服务：API + 每个本地服务；写入 default_service 并落盘。
-        let selected_service = self.settings.translation.default_service.clone();
-        let mut service_options: Vec<gpui::Stateful<gpui::Div>> = vec![widgets::select_option(
-            SharedString::from("default-service-api"),
-            "API 翻译（OpenAI 兼容）",
-            selected_service == "api",
-        )
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| this.set_default_service("api", cx)),
-        )];
-        for service in &self.settings.translation.local_services {
-            let id = service.id.clone();
-            let label = SharedString::from(service.name.clone());
-            let selected = selected_service == id;
-            service_options.push(
-                widgets::select_option(
-                    SharedString::from(format!("default-service-{id}")),
-                    label,
-                    selected,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.set_default_service(&id, cx)),
-                ),
-            );
-        }
-        let default_service = self.select_row(
-            cx,
-            SelectId::DefaultTranslateService,
-            "默认翻译服务",
-            "选择 API 翻译或本地服务；本地不可用时自动回退到 API。",
-            self.default_service_label(),
-            service_options,
-        );
-
-        // 我的服务：每张卡片显示元数据、安装状态与下载按钮。
-        let add_service = div().flex().flex_row().justify_end().mb(px(4.)).child(
-            widgets::button("add-translate-service", "添加服务").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.add_local_service(cx)),
-            ),
-        );
-        let mut cards: Vec<gpui::Div> = Vec::new();
-        for service in &self.settings.translation.local_services {
-            let installed = self.local_model_installed(service);
-            let marker = if service.install_marker.trim().is_empty() {
-                crate::config::DEFAULT_LOCAL_SERVICE_INSTALL_MARKER
-            } else {
-                service.install_marker.trim()
-            };
-            let mut status: SharedString = if installed {
-                format!("已安装（{marker}）").into()
-            } else if service.download_url.trim().is_empty()
-                && service.fallback_url.trim().is_empty()
-            {
-                "未安装 / 暂无下载地址".into()
-            } else {
-                "未安装".into()
-            };
-            if !installed {
-                if let Some((failed_id, error)) = &self.model_download_error {
-                    if failed_id == &service.id {
-                        status = error.clone().into();
-                    }
-                }
-                if let Some((active_id, progress)) = &self.model_download_progress {
-                    if active_id == &service.id {
-                        let pct = progress
-                            .percent()
-                            .map(|p| format!("{p}%"))
-                            .unwrap_or_else(|| "—".into());
-                        status = format!("下载中… {pct}").into();
-                    }
-                }
-            }
-            let download_label: SharedString = if self.model_downloading {
-                match &self.model_download_progress {
-                    Some((active_id, progress)) if active_id == &service.id => {
-                        match progress.percent() {
-                            Some(pct) => format!("下载中… {pct}%").into(),
-                            None => "下载中…".into(),
-                        }
-                    }
-                    _ => "下载中…".into(),
-                }
-            } else {
-                "下载".into()
-            };
-            let service_for_download = service.clone();
-            let download = widgets::button(
-                SharedString::from(format!("download-model-{}", service.id)),
-                download_label,
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.download_local_model(service_for_download.clone(), cx);
-                }),
-            );
-            let mut card_rows = vec![
-                widgets::row(service.name.clone(), service.description.clone()),
-                widgets::row(
-                    "支持语言",
-                    format!(
-                        "{} 种语言：{}",
-                        service.languages.len(),
-                        service.languages.join(" / ")
-                    ),
-                ),
-                widgets::row(
-                    "下载与占用",
-                    format!(
-                        "部署包约 {} MiB · 运行内存约 {} MiB",
-                        service.download_mib, service.memory_mib
-                    ),
-                ),
-                widgets::row("安装状态", status).child(widgets::control(download)),
-            ];
-            if service.download_url.trim().is_empty() && service.fallback_url.trim().is_empty() {
-                card_rows.push(widgets::row(
-                    "来源",
-                    format!(
-                        "暂无下载地址，请手动将 MNN 部署包解压到 models/translate/{}",
-                        service.id
-                    ),
-                ));
-            } else {
-                card_rows.push(widgets::row(
-                    "下载来源",
-                    "GitHub Release 主源，失败自动切换 HuggingFace 镜像；校验 SHA256 后解压到模型目录。",
-                ));
-            }
-            cards.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(widgets::rows(card_rows))
-                    .child(
-                        widgets::hint(
-                            "当前仅接入部署包下载与配置：本地推理尚未实现，会自动回退到 API 翻译。",
-                        )
-                        .px(px(20.))
-                        .pb(px(12.)),
-                    ),
-            );
-        }
-
-        // API 翻译设置：原有控件全部保留，只是收进自己的子分组。
+        // 翻译只用用户自己的 API：接口、模型、目标语言、提示词与超时。
         let current = self.settings.translation.target_language.clone();
         let language_options = LANGUAGES
             .map(|(code, name)| {
@@ -4451,7 +4025,7 @@ impl SettingsView {
                 )
             });
 
-        let mut api_rows: Vec<gpui::Div> = vec![
+        let mut rows: Vec<gpui::Div> = vec![
             widgets::stack(
                 "接口地址",
                 "OpenAI 兼容接口，例如 https://api.openai.com/v1；留空则翻译不可用。",
@@ -4481,7 +4055,7 @@ impl SettingsView {
             } else {
                 "我了解风险，仍要使用 HTTP"
             };
-            api_rows.insert(
+            rows.insert(
                 0,
                 widgets::row(
                     "明文 HTTP 警告",
@@ -4510,45 +4084,12 @@ impl SettingsView {
             );
         }
 
-        // 本地推理线程数：所有本地模型共用，下一次翻译生效。
-        let threads = self.settings.translation.local_threads.clamp(1, 16);
-        let thread_options: Vec<_> = [1u32, 2, 4, 8, 16]
-            .into_iter()
-            .map(|n| {
-                widgets::select_option(
-                    SharedString::from(format!("local-threads-{n}")),
-                    format!("{n} 线程"),
-                    n == threads,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.set_local_threads(n, cx)),
-                )
-            })
-            .collect();
-        let thread_row = self.select_row(
-            cx,
-            SelectId::LocalThreads,
-            "本地推理线程数",
-            "所有本地模型共用，下一次翻译生效。推荐 4 线程；增大线程数可能增加 CPU 占用，不一定更快。",
-            SharedString::from(format!("{threads} 线程")),
-            thread_options,
-        );
-
         div()
             .flex()
             .flex_col()
-            .child(widgets::group_header("默认翻译服务"))
-            .child(widgets::rows(vec![default_service]))
-            .child(widgets::group_header("我的服务"))
-            .child(add_service)
-            .children(cards)
-            .child(widgets::group_header("API 翻译设置"))
-            .child(widgets::rows(api_rows))
-            .child(widgets::group_header("本地推理"))
-            .child(widgets::rows(vec![thread_row]))
+            .child(widgets::rows(rows))
             .child(widgets::hint(
-                "本地翻译目前是下载 / 配置骨架：MNN 部署包下载解压到 models/translate/<id> 后仍不执行本地推理，会自动回退到 API 翻译。",
+                "翻译只用你自己的 API：没有本地翻译模型。接口地址留空时翻译不可用。",
             ))
     }
 

@@ -10,5 +10,6 @@ build.log
 .snow-shot-src/
 .npmcache/
 
-# Downloaded translation models (fetched at runtime, not shipped in git).
+# Downloaded translation models are runtime content, not source. Keep them out
+# of git even though the local translation feature was removed.
 models/translate/

@@ -98,69 +98,6 @@ pub struct Ocr {
     pub models_dir: Option<PathBuf>,
 }
 
-/// 设置页里的一张本地翻译服务卡片。下载的是 CitePix-Resources 发布的
-/// **MNN 部署包 zip**（原始模型来自 HuggingFace `DALabCommunity/Haidass-Translate-143M`，
-/// Apache-2.0），下载完成后解压到 `models/translate/<id>`。
-///
-/// `download_url` 为空表示暂无下载地址；`install_marker` 是包内用于判定安装
-/// 是否完成的文件（默认 `llm.mnn.weight`）。当前版本只接入下载 / 解压 / 配置，
-/// 真实推理管线尚未实现。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default, rename_all = "camelCase")]
-pub struct LocalTranslateService {
-    pub id: String,
-    pub name: String,
-    pub languages: Vec<String>,
-    /// GitHub 主下载源（zip 部署包）。
-    pub download_url: String,
-    /// HuggingFace 备用源；主源失败时自动重试。
-    pub fallback_url: String,
-    /// zip 包预期字节数；下载完成后与落盘大小对照，不符则报错。
-    pub archive_bytes: u64,
-    /// zip 包 sha256；非空时解压前校验（由 PowerShell `Get-FileHash` 完成）。
-    pub archive_sha256: String,
-    /// 解压后用于判定安装完成的包内文件名。
-    pub install_marker: String,
-    /// `install_marker` 的预期字节数；0 表示只检查存在。
-    pub install_marker_bytes: u64,
-    pub download_mib: u32,
-    pub memory_mib: u32,
-    pub description: String,
-}
-
-/// 内置服务 id / 名称的常量。`String`、`Vec` 无法在 `const` 里填入非空值，
-/// 完整的服务对象由 [`default_local_translate_service`] 构造。
-pub const DEFAULT_LOCAL_SERVICE_ID: &str = "haidass-143m-fp16";
-pub const DEFAULT_LOCAL_SERVICE_NAME: &str = "Haidass Translate 143M · FP16";
-
-/// CitePix-Resources 的 MNN 部署包：GitHub 主源 + HuggingFace 备用源。
-pub const DEFAULT_LOCAL_SERVICE_DOWNLOAD_URL: &str = "https://github.com/mosheng1/CitePix-Resources/releases/download/haidass-translate-143m-a06db229-fp16-v1/haidass-translate-143m-a06db229-fp16-v1.zip";
-pub const DEFAULT_LOCAL_SERVICE_FALLBACK_URL: &str = "https://huggingface.co/mosheng1/CitePix-Resources/resolve/main/haidass-translate-143m-a06db229-fp16-v1.zip";
-pub const DEFAULT_LOCAL_SERVICE_ARCHIVE_NAME: &str = "haidass-translate-143m-a06db229-fp16-v1.zip";
-pub const DEFAULT_LOCAL_SERVICE_ARCHIVE_BYTES: u64 = 224_593_262;
-pub const DEFAULT_LOCAL_SERVICE_ARCHIVE_SHA256: &str =
-    "f4df97883f1d4be5ff401e68d1ed26f8ecacdb93858caa63269aba6f9a971a6b";
-pub const DEFAULT_LOCAL_SERVICE_INSTALL_MARKER: &str = "llm.mnn.weight";
-pub const DEFAULT_LOCAL_SERVICE_MARKER_BYTES: u64 = 286_376_448;
-
-/// 目标图里的默认服务卡片：下载现成的 MNN 部署包，解压即用（推理仍占位）。
-pub fn default_local_translate_service() -> LocalTranslateService {
-    LocalTranslateService {
-        id: DEFAULT_LOCAL_SERVICE_ID.into(),
-        name: DEFAULT_LOCAL_SERVICE_NAME.into(),
-        languages: vec!["中文".into(), "英文".into()],
-        download_url: DEFAULT_LOCAL_SERVICE_DOWNLOAD_URL.into(),
-        fallback_url: DEFAULT_LOCAL_SERVICE_FALLBACK_URL.into(),
-        archive_bytes: DEFAULT_LOCAL_SERVICE_ARCHIVE_BYTES,
-        archive_sha256: DEFAULT_LOCAL_SERVICE_ARCHIVE_SHA256.into(),
-        install_marker: DEFAULT_LOCAL_SERVICE_INSTALL_MARKER.into(),
-        install_marker_bytes: DEFAULT_LOCAL_SERVICE_MARKER_BYTES,
-        download_mib: 214,
-        memory_mib: 275,
-        description: "MNN 部署包约 214 MiB，来自 HuggingFace DALabCommunity/Haidass-Translate-143M（Apache-2.0，经 CitePix-Resources 打包）；本地推理尚未实现，当前自动使用 API 翻译。".into(),
-    }
-}
-
 /// Defaults match the C# `AppConfig` so both builds behave the same when the
 /// file is missing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -175,15 +112,6 @@ pub struct Translation {
     /// plaintext HTTP. Confirmation is a two-click action in 设置 → 翻译; the
     /// runtime refuses to send a key over `http://` while this is false.
     pub allow_insecure_http: bool,
-    /// 本地模型根目录覆盖（仿 `ocr::models_dir`）。其下按 `translate/<服务 id>`
-    /// 分目录；`None` 时使用 exe 旁的 `models/translate`，再回退仓库副本。
-    pub local_models_dir: Option<PathBuf>,
-    /// 本地推理线程数。使用时按 `clamped_local_threads` 夹到 1..=16。
-    pub local_threads: u32,
-    /// `"api"` 走现有 API；其它值按 id 匹配 `local_services`。
-    pub default_service: String,
-    /// 设置页展示的本地服务；失败时一律回退到 API。
-    pub local_services: Vec<LocalTranslateService>,
 }
 
 impl Default for Translation {
@@ -195,19 +123,7 @@ impl Default for Translation {
             prompt: String::new(),
             timeout_seconds: 30,
             allow_insecure_http: false,
-            local_models_dir: None,
-            local_threads: 4,
-            default_service: "api".into(),
-            // 让用户能看到目标图那样的服务卡片；默认仍走 API。
-            local_services: vec![default_local_translate_service()],
         }
-    }
-}
-
-impl Translation {
-    /// 手改过的配置也不能把线程数推到区间外。
-    pub fn clamped_local_threads(&self) -> u32 {
-        self.local_threads.clamp(1, 16)
     }
 }
 
@@ -1472,99 +1388,60 @@ mod tests {
         assert_eq!(s.translation.timeout_seconds, 30);
     }
 
+    /// 旧版配置文件里残留的本地翻译字段是未知键：`#[serde(default)]` 负责
+    /// 补齐缺省值，serde 默认忽略未知键，`merge_typed` 也会把它们丢掉。
+    /// 用户手动升级设置文件时不能因为这些残留字段而丢失 API 配置。
     #[test]
-    fn local_translate_services_use_camel_case_and_roundtrip() {
-        let s = parse(
-            r#"{
-              "translation": {
-                "localModelsDir": "D:/models",
-                "localThreads": 8,
-                "defaultService": "haidass-143m-fp16",
-                "localServices": [{
-                  "id": "haidass-143m-fp16",
-                  "name": "Haidass Translate 143M · FP16",
-                  "languages": ["中文", "英文"],
-                  "downloadUrl": "https://github.com/mosheng1/CitePix-Resources/releases/download/haidass-translate-143m-a06db229-fp16-v1/haidass-translate-143m-a06db229-fp16-v1.zip",
-                  "fallbackUrl": "https://huggingface.co/mosheng1/CitePix-Resources/resolve/main/haidass-translate-143m-a06db229-fp16-v1.zip",
-                  "archiveBytes": 224593262,
-                  "archiveSha256": "f4df97883f1d4be5ff401e68d1ed26f8ecacdb93858caa63269aba6f9a971a6b",
-                  "installMarker": "llm.mnn.weight",
-                  "installMarkerBytes": 286376448,
-                  "downloadMib": 214,
-                  "memoryMib": 275,
-                  "description": "MNN 部署包约 214 MiB，来自 HuggingFace DALabCommunity/Haidass-Translate-143M（Apache-2.0，经 CitePix-Resources 打包）；本地推理尚未实现，当前自动使用 API 翻译。"
-                }]
-              }
-            }"#,
-        );
-        assert_eq!(
-            s.translation.local_models_dir.as_deref(),
-            Some(std::path::Path::new("D:/models"))
-        );
-        assert_eq!(s.translation.local_threads, 8);
-        assert_eq!(s.translation.default_service, "haidass-143m-fp16");
-        assert_eq!(
-            s.translation.local_services,
-            vec![default_local_translate_service()]
-        );
+    fn leftover_local_translate_fields_are_ignored() {
+        let text = r#"{
+          "translation": {
+            "baseUrl": "https://api.example.com/v1",
+            "localModelsDir": "D:/models",
+            "localThreads": 8,
+            "defaultService": "haidass-143m-fp16",
+            "localServices": [{
+              "id": "haidass-143m-fp16",
+              "name": "Haidass Translate 143M · FP16",
+              "downloadUrl": "https://example.com/model.zip",
+              "archiveBytes": 224593262
+            }]
+          }
+        }"#;
+        let expected = Translation {
+            base_url: "https://api.example.com/v1".into(),
+            ..Translation::default()
+        };
+        // parse 的容错路径（merge_typed）与直接反序列化都不能被未知键影响。
+        assert_eq!(parse(text).translation, expected);
+        let direct: Settings = serde_json::from_str(text).expect("unknown keys are ignored");
+        assert_eq!(direct.translation, expected);
 
-        let json = serde_json::to_string(&s.translation).expect("serializes");
+        // 未知键即使用户改成了奇怪的类型也一样被忽略。
+        let weird = r#"{"translation": {"localServices": "not-an-array", "localThreads": "8"}}"#;
+        assert_eq!(parse(weird).translation, Translation::default());
+        let direct: Settings =
+            serde_json::from_str(weird).expect("unknown keys of any JSON type are ignored");
+        assert_eq!(direct.translation, Translation::default());
+
+        // 同时存在坏字段时走 merge_typed 容错路径：未知键仍被丢弃，好字段保留。
+        let mixed = r#"{"translation": {
+          "baseUrl": "https://api.example.com/v1",
+          "timeoutSeconds": "30",
+          "defaultService": "haidass-143m-fp16",
+          "localServices": [{"id": "custom"}]
+        }}"#;
+        assert_eq!(parse(mixed).translation, expected);
+
+        // 再次写回时这些残留字段不会复活。
+        let json = serde_json::to_string(&parse(text).translation).expect("serializes");
         for key in [
             "localModelsDir",
             "localThreads",
             "defaultService",
             "localServices",
             "downloadUrl",
-            "fallbackUrl",
-            "archiveBytes",
-            "archiveSha256",
-            "installMarker",
-            "installMarkerBytes",
-            "downloadMib",
-            "memoryMib",
         ] {
-            assert!(
-                json.contains(&format!("\"{key}\"")),
-                "{key} missing in {json}"
-            );
-        }
-        let back = parse(&format!(r#"{{"translation": {json}}}"#));
-        assert_eq!(back.translation, s.translation);
-    }
-
-    #[test]
-    fn local_translate_service_points_at_the_mnn_deployment_archive() {
-        let s = default_local_translate_service();
-        assert!(s.download_url.ends_with(DEFAULT_LOCAL_SERVICE_ARCHIVE_NAME));
-        assert!(s.fallback_url.ends_with(DEFAULT_LOCAL_SERVICE_ARCHIVE_NAME));
-        assert_eq!(s.archive_bytes, 224_593_262);
-        assert_eq!(s.archive_sha256.len(), 64);
-        assert_eq!(s.install_marker, "llm.mnn.weight");
-        assert_eq!(s.install_marker_bytes, 286_376_448);
-        assert_eq!(s.download_mib as u64, s.archive_bytes / 1024 / 1024);
-        assert!(s.description.contains("Apache-2.0"));
-        assert!(s.description.contains("本地推理尚未实现"));
-    }
-
-    #[test]
-    fn legacy_service_without_archive_fields_still_parses() {
-        let s =
-            parse(r#"{"translation": {"localServices": [{"id": "custom", "name": "自定义"}]}}"#);
-        let service = &s.translation.local_services[0];
-        assert_eq!(service.id, "custom");
-        assert!(service.download_url.is_empty());
-        assert_eq!(service.archive_bytes, 0);
-        assert!(service.install_marker.is_empty());
-    }
-
-    #[test]
-    fn local_threads_are_clamped_when_applied() {
-        for (raw, expected) in [(0, 1), (3, 3), (4, 4), (16, 16), (99, 16)] {
-            let t = Translation {
-                local_threads: raw,
-                ..Default::default()
-            };
-            assert_eq!(t.clamped_local_threads(), expected);
+            assert!(!json.contains(key), "{key} survived in {json}");
         }
     }
 
@@ -1633,13 +1510,7 @@ mod tests {
         );
         // Fields absent from that old file fall back to the shipped defaults.
         assert_eq!(s.translation.model, "gpt-4o-mini");
-        assert_eq!(s.translation.default_service, "api");
-        assert_eq!(s.translation.local_threads, 4);
-        assert!(s.translation.local_models_dir.is_none());
-        assert_eq!(
-            s.translation.local_services,
-            vec![default_local_translate_service()]
-        );
+        assert!(s.translation.base_url.is_empty());
         assert!(s.ocr.models_dir.is_none());
         assert!(s.screenshot.hidden_toolbar_items.is_empty());
         assert_eq!(
@@ -1731,36 +1602,34 @@ mod tests {
         let mut before = Settings::default();
         before.translation.base_url = "https://x/v1".into();
         before.translation.prompt = "be terse".into();
-        before.translation.local_models_dir = Some(PathBuf::from("D:/models"));
-        before.translation.local_threads = 8;
-        before.translation.default_service = DEFAULT_LOCAL_SERVICE_ID.into();
+        before.translation.target_language = "ja".into();
+        before.translation.timeout_seconds = 60;
+        before.translation.allow_insecure_http = true;
         before.screenshot.hidden_toolbar_items = vec!["text".into()];
         before.ocr.models_dir = Some(PathBuf::from("D:/models/v6"));
 
         let json = serde_json::to_string_pretty(&before).expect("serializes");
-        // 新字段全部走 camelCase，和老字段保持同一套命名约定。
-        assert!(json.contains("\"localModelsDir\""), "{json}");
-        assert!(json.contains("\"localThreads\""), "{json}");
-        assert!(json.contains("\"defaultService\""), "{json}");
-        assert!(json.contains("\"localServices\""), "{json}");
+        // 翻译字段全部走 camelCase，和老字段保持同一套命名约定。
+        assert!(json.contains("\"baseUrl\""), "{json}");
+        assert!(json.contains("\"targetLanguage\""), "{json}");
+        assert!(json.contains("\"timeoutSeconds\""), "{json}");
+        assert!(json.contains("\"allowInsecureHttp\""), "{json}");
         let after = parse(&json);
 
         assert_eq!(after.translation.base_url, before.translation.base_url);
         assert_eq!(after.translation.prompt, before.translation.prompt);
         assert_eq!(after.translation.model, before.translation.model);
         assert_eq!(
-            after.translation.local_models_dir,
-            before.translation.local_models_dir
-        );
-        assert_eq!(after.translation.local_threads, 8);
-        assert_eq!(after.translation.default_service, DEFAULT_LOCAL_SERVICE_ID);
-        assert_eq!(
-            after.translation.local_services,
-            before.translation.local_services
+            after.translation.target_language,
+            before.translation.target_language
         );
         assert_eq!(
             after.translation.timeout_seconds,
             before.translation.timeout_seconds
+        );
+        assert_eq!(
+            after.translation.allow_insecure_http,
+            before.translation.allow_insecure_http
         );
         assert_eq!(
             after.screenshot.hidden_toolbar_items,

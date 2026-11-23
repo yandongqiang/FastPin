@@ -87,7 +87,7 @@ impl Page {
             Page::Pin => "贴图的默认行为与编辑工具栏。",
             Page::Appearance => "界面主题与标注外观。",
             Page::Hotkey => "全局快捷键，在任何界面都可以触发。",
-            Page::Translate => "管理本地模型、AI 接口与厂商翻译服务。",
+            Page::Translate => "翻译服务的接口、模型与目标语言。",
             Page::Resources => "本地 OCR 识别引擎与模型目录。",
             Page::Data => "数据目录、日志、存储占用与截图历史。",
             Page::About => "版本信息与更新检查。",
@@ -472,27 +472,7 @@ pub const ROWS: &[RowMeta] = &[
         title: "全屏截图",
         desc: "抓取当前显示器并保存 PNG。",
     },
-    // 翻译
-    RowMeta {
-        page: Page::Translate,
-        title: "默认翻译服务",
-        desc: "选择 API 翻译或本地服务；本地不可用时自动回退到 API。",
-    },
-    RowMeta {
-        page: Page::Translate,
-        title: "我的服务",
-        desc: "本地翻译服务卡片、MNN 部署包下载解压与安装状态。",
-    },
-    RowMeta {
-        page: Page::Translate,
-        title: "安装状态",
-        desc: "按包内 llm.mnn.weight 是否存在且大小正确判定模型已安装。",
-    },
-    RowMeta {
-        page: Page::Translate,
-        title: "本地推理线程数",
-        desc: "所有本地模型共用，下一次翻译生效；推荐 4 线程。",
-    },
+    // 翻译（只用用户自己的 API）
     RowMeta {
         page: Page::Translate,
         title: "接口地址",
@@ -753,11 +733,6 @@ mod tests {
         s.translation.prompt = "be terse".into();
         s.translation.timeout_seconds = 111;
         s.translation.allow_insecure_http = true;
-        // 翻译页新字段：全部偏离默认值，避免重置测试出现假阳性。
-        s.translation.local_models_dir = Some("D:/models".into());
-        s.translation.local_threads = 8;
-        s.translation.default_service = "custom-local".into();
-        s.translation.local_services = Vec::new();
         s.screenshot.hidden_toolbar_items = vec!["text".into(), "redo".into()];
         s.screenshot.save_dir = Some("D:/shots".into());
         s.screenshot.smart_selection = crate::config::SmartSelectionMode::Disabled;
@@ -962,11 +937,18 @@ mod tests {
         }
     }
 
-    /// 翻译页的新分组都要能被搜索到，并跳回「翻译」页。
+    /// 翻译页只保留 API 配置：这些行都要能被搜索到，并跳回「翻译」页。
     #[test]
-    fn local_translate_rows_are_searchable_on_translate_page() {
-        for title in ["默认翻译服务", "我的服务", "安装状态", "本地推理线程数"]
-        {
+    fn api_translate_rows_are_searchable_on_translate_page() {
+        for title in [
+            "接口地址",
+            "API Key",
+            "模型",
+            "目标语言",
+            "超时",
+            "提示词",
+            "明文 HTTP 警告",
+        ] {
             assert!(
                 search(title)
                     .iter()
@@ -975,10 +957,15 @@ mod tests {
             );
         }
         assert_eq!(Page::Translate.title(), "翻译");
-        assert_eq!(
-            Page::Translate.desc(),
-            "管理本地模型、AI 接口与厂商翻译服务。"
-        );
+        assert_eq!(Page::Translate.desc(), "翻译服务的接口、模型与目标语言。");
+        // 本地翻译的旧搜索词必须彻底消失，避免搜到不存在的控件。
+        for title in ["默认翻译服务", "我的服务", "安装状态", "本地推理线程数"]
+        {
+            assert!(
+                search(title).iter().all(|r| r.page != Page::Translate),
+                "stale local-translate row '{title}' on Page::Translate"
+            );
+        }
     }
 
     /// 自动保存 / 自动复制是两个独立开关，两行都要能被搜索到。
@@ -1125,15 +1112,12 @@ mod tests {
             Page::Hotkey => s.hotkeys.region == "Ctrl+Alt+A",
             Page::Appearance => s.appearance == crate::config::DEFAULT_APPEARANCE,
             Page::Translate => {
-                s.translation.model == "gpt-4o-mini"
+                s.translation.base_url.is_empty()
+                    && s.translation.model == "gpt-4o-mini"
+                    && s.translation.target_language == "zh-CN"
+                    && s.translation.prompt.is_empty()
+                    && s.translation.timeout_seconds == 30
                     && !s.translation.allow_insecure_http
-                    && s.translation.default_service == "api"
-                    && s.translation.local_threads == 4
-                    && s.translation.local_models_dir.is_none()
-                    && s.translation.local_services
-                        == crate::config::Settings::default()
-                            .translation
-                            .local_services
             }
             Page::Resources => s.ocr.models_dir.is_none(),
             Page::Data => {

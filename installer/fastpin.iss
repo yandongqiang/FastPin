@@ -1,9 +1,8 @@
 ; FastPin installer — build with:
 ;   "C:\Users\admin\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer\fastpin.iss
-; Payload mirrors the portable layout: FastPin.exe + DirectML.dll + models\v6,
-; models\translate (本地翻译模型的落盘位置) and themes\*, which is exactly what
-; ocr::models_dir / translate::local_model_dir / init_themes expect next to the
-; exe.
+; Payload mirrors the portable layout: FastPin.exe + DirectML.dll + models\v6
+; and themes\*, which is exactly what ocr::models_dir / init_themes expect next
+; to the exe.
 
 // release.yml injects /DAppVersion=<tag>; the fallback matches Cargo.toml.
 #ifndef AppVersion
@@ -42,16 +41,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "autostart"; Description: "开机自动启动"; GroupDescription: "其他选项:"; Flags: unchecked
 
-[Dirs]
-; 即使仓库里没有模型包也建好目录，用户可自行把模型放进 {app}\models\translate\<服务 id>。
-Name: "{app}\models\translate"
-
 [Files]
 Source: "..\target\release\FastPin.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\DirectML.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\models\v6\*"; DestDir: "{app}\models\v6"; Flags: ignoreversion recursesubdirs createallSubdirs
-; 可选：随包分发的本地翻译模型（通常为空；缺省时不让编译失败）。
-Source: "..\models\translate\*"; DestDir: "{app}\models\translate"; Flags: ignoreversion recursesubdirs createallSubdirs skipifsourcedoesntexist
 Source: "..\themes\*"; DestDir: "{app}\themes"; Flags: ignoreversion recursesubdirs createallSubdirs
 
 [Icons]

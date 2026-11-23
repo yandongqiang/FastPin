@@ -191,6 +191,14 @@ pub struct OverlayView {
     /// rewrite it while this view is alive, and the bar must not change shape
     /// underneath a capture the user is already working in.
     hidden_toolbar_items: Vec<String>,
+    /// 工具栏 / 面板的位置策略，同 `hidden_toolbar_items` 开场读一次，避免
+    /// Settings 在截屏途中改写配置让画面中途跳位。
+    toolbar_position: crate::config::ToolbarPosition,
+    panel_position: crate::config::PanelPosition,
+    /// 「记住位置」策略使用的已存左上角（截屏逻辑像素，未乘缩放）。
+    /// 为 `None` 时布局退回「跟随选区」。
+    toolbar_remember_pos: Option<(f32, f32)>,
+    panel_remember_pos: Option<(f32, f32)>,
     /// Copy-only capture: mouse-up on a fresh selection confirms immediately,
     /// skipping the toolbar — "框选后直接复制".
     copy_only: bool,
@@ -990,6 +998,10 @@ impl OverlayView {
             spotlight_cache: RefCell::new(None),
             panel: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
+            toolbar_position: screenshot.toolbar_position,
+            panel_position: screenshot.panel_position,
+            toolbar_remember_pos: screenshot.toolbar_remember_pos,
+            panel_remember_pos: screenshot.panel_remember_pos,
             copy_only: false,
             show_magnifier: screenshot.show_magnifier,
             show_info_bar: screenshot.show_info_bar,
@@ -1051,6 +1063,10 @@ impl OverlayView {
             spotlight_cache: RefCell::new(None),
             panel: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
+            toolbar_position: screenshot.toolbar_position,
+            panel_position: screenshot.panel_position,
+            toolbar_remember_pos: screenshot.toolbar_remember_pos,
+            panel_remember_pos: screenshot.panel_remember_pos,
             copy_only,
             show_magnifier: screenshot.show_magnifier,
             show_info_bar: screenshot.show_info_bar,
@@ -1100,6 +1116,10 @@ impl OverlayView {
         self.mask_cache = RefCell::new(None);
         self.panel = None;
         self.hidden_toolbar_items = crate::config::get().screenshot.hidden_toolbar_items;
+        self.toolbar_position = screenshot.toolbar_position;
+        self.panel_position = screenshot.panel_position;
+        self.toolbar_remember_pos = screenshot.toolbar_remember_pos;
+        self.panel_remember_pos = screenshot.panel_remember_pos;
         self.copy_only = copy_only;
         self.show_magnifier = screenshot.show_magnifier;
         self.show_info_bar = screenshot.show_info_bar;
@@ -2005,12 +2025,19 @@ impl OverlayView {
         let n = self.visible_items().len();
         let (w, h) = toolbar::bar_size(n);
         let s = scale as f64;
-        let pos = toolbar::place_toolbar(
+        // Remembered corners are persisted in logical capture pixels; the bar
+        // geometry (like the monitor rect) is in physical pixels.
+        let remembered = self
+            .toolbar_remember_pos
+            .map(|(x, y)| (x as f64 * s, y as f64 * s));
+        let pos = toolbar::place_toolbar_with_policy(
             self.selection,
             w * s,
             h * s,
             self.active_monitor_rect(),
             toolbar::ANCHOR_GAP * s,
+            self.toolbar_position,
+            remembered,
         );
         Some(Rect::new(pos.x, pos.y, w * s, h * s))
     }
@@ -3362,7 +3389,18 @@ impl OverlayView {
     fn long_bar_placement(&self, scale: f32, est_w: f64, mon: Rect) -> (Point, f64) {
         let s = scale.max(0.01) as f64;
         let h = toolbar::H * s;
-        let pos = toolbar::place_toolbar(self.selection, est_w, h, mon, toolbar::ANCHOR_GAP * s);
+        let remembered = self
+            .toolbar_remember_pos
+            .map(|(x, y)| (x as f64 * s, y as f64 * s));
+        let pos = toolbar::place_toolbar_with_policy(
+            self.selection,
+            est_w,
+            h,
+            mon,
+            toolbar::ANCHOR_GAP * s,
+            self.toolbar_position,
+            remembered,
+        );
         (pos, h)
     }
 
@@ -3806,7 +3844,7 @@ impl OverlayView {
         let sel = Rect::new(sel.x / s, sel.y / s, sel.width / s, sel.height / s);
         let mon = Rect::new(mon.x / s, mon.y / s, mon.width / s, mon.height / s);
         let chrome = (PANEL_CHROME + if copyable { PANEL_COPY_H } else { 0. }) as f64;
-        let place = toolbar::place_panel(
+        let place = toolbar::place_panel_with_policy(
             bar,
             sel,
             PANEL_W as f64,
@@ -3815,6 +3853,8 @@ impl OverlayView {
             mon,
             toolbar::ANCHOR_GAP,
             PANEL_MARGIN as f64,
+            self.panel_position,
+            self.panel_remember_pos.map(|(x, y)| (x as f64, y as f64)),
         );
         let el = div()
             .id("overlay-panel")

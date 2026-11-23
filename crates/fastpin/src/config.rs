@@ -160,6 +160,12 @@ pub struct Screenshot {
     pub toolbar_position: ToolbarPosition,
     /// 参数面板的位置策略。
     pub panel_position: PanelPosition,
+    /// 「记住位置」策略使用的工具栏左上角（截屏逻辑像素，未乘缩放）。
+    /// `None` 表示尚未记录，布局退回「跟随选区」。
+    pub toolbar_remember_pos: Option<(f32, f32)>,
+    /// 「记住位置」策略使用的参数面板左上角（截屏逻辑像素，未乘缩放）。
+    /// `None` 表示尚未记录，布局退回「跟随选区」。
+    pub panel_remember_pos: Option<(f32, f32)>,
     /// 是否在鼠标附近显示像素放大预览和当前颜色信息。
     pub show_magnifier: bool,
     /// 是否在选区附近显示尺寸、圆角和比例等信息。
@@ -196,6 +202,8 @@ impl Default for Screenshot {
             ],
             toolbar_position: ToolbarPosition::default(),
             panel_position: PanelPosition::default(),
+            toolbar_remember_pos: None,
+            panel_remember_pos: None,
             show_magnifier: true,
             show_info_bar: true,
             show_shortcut_hints: true,

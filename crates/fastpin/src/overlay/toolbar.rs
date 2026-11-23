@@ -1,5 +1,6 @@
 //! Overlay toolbar catalog and placement. Ported from C# OverlayToolbarCatalog / ToolbarAnchor.
 
+use crate::config::{PanelPosition, ToolbarPosition};
 use crate::geom::{Point, Rect};
 
 pub const COLOR: &str = "color";
@@ -438,22 +439,61 @@ pub fn place_toolbar(
     monitor: Rect,
     gap: f64,
 ) -> Point {
-    let mut x = selection.x + selection.width / 2.0 - toolbar_width / 2.0;
+    place_toolbar_with_policy(
+        selection,
+        toolbar_width,
+        toolbar_height,
+        monitor,
+        gap,
+        ToolbarPosition::FollowSelection,
+        None,
+    )
+}
+
+/// Position-policy aware toolbar placement. `remembered` is a stored top-left
+/// corner in the same coordinate space as the other arguments; it is only used
+/// by [`ToolbarPosition::Remember`] and ignored by every other policy.
+///
+/// `Top` / `Bottom` pin the bar to the monitor edge (with a small margin) while
+/// keeping the original x (centred on the selection, clamped). `Remember` uses
+/// the stored corner verbatim, clamped; with no stored corner it falls back to
+/// the original follow-selection rule.
+pub fn place_toolbar_with_policy(
+    selection: Rect,
+    toolbar_width: f64,
+    toolbar_height: f64,
+    monitor: Rect,
+    gap: f64,
+    policy: ToolbarPosition,
+    remembered: Option<(f64, f64)>,
+) -> Point {
+    let default_x = selection.x + selection.width / 2.0 - toolbar_width / 2.0;
     let below = selection.y + selection.height + gap;
     let above = selection.y - gap - toolbar_height;
-    let mut y = if below + toolbar_height <= monitor.y + monitor.height {
+    let default_y = if below + toolbar_height <= monitor.y + monitor.height {
         below
     } else {
         above
     };
+
+    let (x, y) = match policy {
+        ToolbarPosition::FollowSelection => (default_x, default_y),
+        // `gap` is the caller's scaled ANCHOR_GAP, so the edge margin follows
+        // the display scale instead of a hard-coded physical pixel count.
+        ToolbarPosition::Top => (default_x, monitor.y + gap),
+        ToolbarPosition::Bottom => (default_x, monitor.y + monitor.height - toolbar_height - gap),
+        ToolbarPosition::Remember => remembered.unwrap_or((default_x, default_y)),
+    };
     let max_x = (monitor.x + monitor.width - toolbar_width).max(monitor.x);
     let max_y = (monitor.y + monitor.height - toolbar_height).max(monitor.y);
-    x = x.clamp(monitor.x, max_x);
-    y = y.clamp(monitor.y, max_y);
-    Point { x, y }
+    Point {
+        x: x.clamp(monitor.x, max_x),
+        y: y.clamp(monitor.y, max_y),
+    }
 }
 
 /// Where the panel's vertical edge anchors.
+#[derive(Debug)]
 pub enum PanelY {
     /// Top edge at `bar.bottom + gap`.
     BelowBar,
@@ -479,7 +519,10 @@ pub struct PanelPlacement {
 /// shrinking max_h to fit loses no text.
 /// Eight loose parameters mirror the geometry this places against; bundling
 /// them into a struct would only rename the same fields at every call site.
+/// Kept as the default-policy baseline for the layout tests; production calls
+/// `place_panel_with_policy`.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn place_panel(
     bar: Rect,
     selection: Rect,
@@ -490,6 +533,39 @@ pub fn place_panel(
     gap: f64,
     margin: f64,
 ) -> PanelPlacement {
+    place_panel_with_policy(
+        bar,
+        selection,
+        panel_w,
+        chrome,
+        body_limit,
+        monitor,
+        gap,
+        margin,
+        PanelPosition::FollowSelection,
+        None,
+    )
+}
+
+/// Position-policy aware panel placement. `remembered` is a stored top-left
+/// corner in the same coordinate space as the other arguments; only
+/// [`PanelPosition::Remember`] reads it. `Left` / `Right` pin x to the monitor
+/// edge and anchor y near the bar / selection; `Remember` uses the stored
+/// corner; everything else (including Remember without a stored corner) keeps
+/// the original follow-selection rule. Every result is clamped into `monitor`.
+#[allow(clippy::too_many_arguments)]
+pub fn place_panel_with_policy(
+    bar: Rect,
+    selection: Rect,
+    panel_w: f64,
+    chrome: f64,
+    body_limit: (f64, f64),
+    monitor: Rect,
+    gap: f64,
+    margin: f64,
+    policy: PanelPosition,
+    remembered: Option<(f64, f64)>,
+) -> PanelPlacement {
     let (body_min, body_max) = body_limit;
     let mon_l = monitor.x + margin;
     let mon_t = monitor.y + margin;
@@ -497,6 +573,44 @@ pub fn place_panel(
     let mon_b = monitor.y + monitor.height - margin;
     let clamp_x = |x: f64| x.clamp(mon_l, (mon_r - panel_w).max(mon_l));
     let fit = |room: f64| (room - chrome).clamp(body_min, body_max);
+
+    // Remember: the stored corner wins. Keep at least the minimum body on screen
+    // by clamping y before deriving the body height from the remaining room.
+    if policy == PanelPosition::Remember {
+        if let Some((x, y)) = remembered {
+            let min_room = chrome + body_min;
+            let y = y.clamp(mon_t, (mon_b - min_room).max(mon_t));
+            return PanelPlacement {
+                x: clamp_x(x),
+                y: PanelY::Top(y),
+                body_max_h: fit(mon_b - y),
+            };
+        }
+    }
+
+    // Left / Right: fixed horizontal edge. y hugs the toolbar when it sits
+    // below the selection, otherwise the selection's top; clamped so the
+    // minimum body still fits inside the monitor.
+    if matches!(policy, PanelPosition::Left | PanelPosition::Right) {
+        let x = if policy == PanelPosition::Left {
+            mon_l
+        } else {
+            (mon_r - panel_w).max(mon_l)
+        };
+        let bar_below_sel = bar.y + bar.height / 2.0 >= selection.y + selection.height / 2.0;
+        let wanted_y = if bar_below_sel {
+            bar.y + bar.height + gap
+        } else {
+            selection.y.max(mon_t)
+        };
+        let min_room = chrome + body_min;
+        let y = wanted_y.clamp(mon_t, (mon_b - min_room).max(mon_t));
+        return PanelPlacement {
+            x: clamp_x(x),
+            y: PanelY::Top(y),
+            body_max_h: fit(mon_b - y),
+        };
+    }
 
     let room_below = mon_b - (bar.y + bar.height + gap);
     let room_above = bar.y - gap - mon_t;
@@ -706,6 +820,41 @@ mod tests {
     }
 
     #[test]
+    fn toolbar_policy_top_and_bottom_pin_to_monitor_edges() {
+        let mon = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let sel = Rect::new(1500.0, 500.0, 200.0, 100.0);
+        let top = place_toolbar_with_policy(sel, 400.0, 40.0, mon, 8.0, ToolbarPosition::Top, None);
+        assert_eq!(top.y, ANCHOR_GAP);
+        assert_eq!(top.x, 1500.0 + 100.0 - 200.0);
+        let bottom =
+            place_toolbar_with_policy(sel, 400.0, 40.0, mon, 8.0, ToolbarPosition::Bottom, None);
+        assert_eq!(bottom.y, 1080.0 - 40.0 - ANCHOR_GAP);
+        assert_eq!(bottom.x, top.x);
+    }
+
+    #[test]
+    fn toolbar_policy_remember_uses_stored_corner_and_clamps() {
+        let mon = Rect::new(100.0, 50.0, 500.0, 300.0);
+        let sel = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let pos = place_toolbar_with_policy(
+            sel,
+            400.0,
+            40.0,
+            mon,
+            8.0,
+            ToolbarPosition::Remember,
+            Some((-1000.0, 900.0)),
+        );
+        assert_eq!(pos.x, mon.x);
+        assert_eq!(pos.y, mon.y + mon.height - 40.0);
+        // No stored corner: Remember falls back to the original follow rule.
+        let fallback =
+            place_toolbar_with_policy(sel, 400.0, 40.0, mon, 8.0, ToolbarPosition::Remember, None);
+        let original = place_toolbar(sel, 400.0, 40.0, mon, 8.0);
+        assert_eq!((fallback.x, fallback.y), (original.x, original.y));
+    }
+
+    #[test]
     fn panel_prefers_below_toolbar() {
         let p = place_panel(
             Rect::new(100.0, 208.0, 538.0, 44.0),
@@ -832,6 +981,85 @@ mod tests {
         assert_eq!(p.x, 976.0);
         assert!(p.x >= 804.0);
         assert!(p.x + 320.0 <= 1296.0);
+    }
+
+    #[test]
+    fn panel_policy_left_and_right_pin_to_monitor_edges() {
+        let mon = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let bar = Rect::new(100.0, 208.0, 538.0, 44.0);
+        let sel = Rect::new(100.0, 80.0, 200.0, 120.0);
+        let left = place_panel_with_policy(
+            bar,
+            sel,
+            320.0,
+            80.0,
+            (48.0, 260.0),
+            mon,
+            8.0,
+            4.0,
+            PanelPosition::Left,
+            None,
+        );
+        assert_eq!(left.x, 4.0);
+        assert!(matches!(left.y, PanelY::Top(_)));
+        let right = place_panel_with_policy(
+            bar,
+            sel,
+            320.0,
+            80.0,
+            (48.0, 260.0),
+            mon,
+            8.0,
+            4.0,
+            PanelPosition::Right,
+            None,
+        );
+        assert_eq!(right.x, 1920.0 - 4.0 - 320.0);
+        assert_eq!(left.body_max_h, right.body_max_h);
+
+        // A panel wider than its monitor still clamps to the left margin.
+        let narrow = Rect::new(0.0, 0.0, 400.0, 1080.0);
+        let cramped = place_panel_with_policy(
+            bar,
+            sel,
+            600.0,
+            80.0,
+            (48.0, 260.0),
+            narrow,
+            8.0,
+            4.0,
+            PanelPosition::Right,
+            None,
+        );
+        assert_eq!(cramped.x, 4.0);
+    }
+
+    #[test]
+    fn panel_policy_remember_uses_stored_corner_and_clamps() {
+        let mon = Rect::new(100.0, 50.0, 500.0, 300.0);
+        let bar = Rect::new(0.0, 0.0, 100.0, 40.0);
+        let sel = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let p = place_panel_with_policy(
+            bar,
+            sel,
+            320.0,
+            80.0,
+            (48.0, 260.0),
+            mon,
+            8.0,
+            4.0,
+            PanelPosition::Remember,
+            Some((-1000.0, 900.0)),
+        );
+        assert_eq!(p.x, 104.0);
+        let y = match p.y {
+            PanelY::Top(y) => y,
+            other => panic!("remembered corner is a top edge, got {other:?}"),
+        };
+        // mon bottom 346; leave room for chrome + min body (128) above it.
+        assert_eq!(y, 218.0);
+        assert!(p.body_max_h >= 48.0);
+        assert!(p.x + 320.0 <= 100.0 + 500.0 - 4.0);
     }
 
     #[test]

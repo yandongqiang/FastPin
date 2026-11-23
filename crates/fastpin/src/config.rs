@@ -98,17 +98,31 @@ pub struct Ocr {
     pub models_dir: Option<PathBuf>,
 }
 
-/// 设置页里的一张本地翻译服务卡片。`download_url` 为空表示暂无下载地址，
-/// UI 会提示用户手动把模型放进 `models/translate/<id>`。
+/// 设置页里的一张本地翻译服务卡片。下载的是 CitePix-Resources 发布的
+/// **MNN 部署包 zip**（原始模型来自 HuggingFace `DALabCommunity/Haidass-Translate-143M`，
+/// Apache-2.0），下载完成后解压到 `models/translate/<id>`。
 ///
-/// 当前版本只把服务信息、模型目录和下载入口落成骨架；真实推理管线尚未实现。
+/// `download_url` 为空表示暂无下载地址；`install_marker` 是包内用于判定安装
+/// 是否完成的文件（默认 `llm.mnn.weight`）。当前版本只接入下载 / 解压 / 配置，
+/// 真实推理管线尚未实现。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LocalTranslateService {
     pub id: String,
     pub name: String,
     pub languages: Vec<String>,
+    /// GitHub 主下载源（zip 部署包）。
     pub download_url: String,
+    /// HuggingFace 备用源；主源失败时自动重试。
+    pub fallback_url: String,
+    /// zip 包预期字节数；下载完成后与落盘大小对照，不符则报错。
+    pub archive_bytes: u64,
+    /// zip 包 sha256；非空时解压前校验（由 PowerShell `Get-FileHash` 完成）。
+    pub archive_sha256: String,
+    /// 解压后用于判定安装完成的包内文件名。
+    pub install_marker: String,
+    /// `install_marker` 的预期字节数；0 表示只检查存在。
+    pub install_marker_bytes: u64,
     pub download_mib: u32,
     pub memory_mib: u32,
     pub description: String,
@@ -119,16 +133,31 @@ pub struct LocalTranslateService {
 pub const DEFAULT_LOCAL_SERVICE_ID: &str = "haidass-143m-fp16";
 pub const DEFAULT_LOCAL_SERVICE_NAME: &str = "Haidass Translate 143M · FP16";
 
-/// 目标图里的默认服务卡片。下载地址留空：仓库里没有模型包，也不假装能提供。
+/// CitePix-Resources 的 MNN 部署包：GitHub 主源 + HuggingFace 备用源。
+pub const DEFAULT_LOCAL_SERVICE_DOWNLOAD_URL: &str = "https://github.com/mosheng1/CitePix-Resources/releases/download/haidass-translate-143m-a06db229-fp16-v1/haidass-translate-143m-a06db229-fp16-v1.zip";
+pub const DEFAULT_LOCAL_SERVICE_FALLBACK_URL: &str = "https://huggingface.co/mosheng1/CitePix-Resources/resolve/main/haidass-translate-143m-a06db229-fp16-v1.zip";
+pub const DEFAULT_LOCAL_SERVICE_ARCHIVE_NAME: &str = "haidass-translate-143m-a06db229-fp16-v1.zip";
+pub const DEFAULT_LOCAL_SERVICE_ARCHIVE_BYTES: u64 = 224_593_262;
+pub const DEFAULT_LOCAL_SERVICE_ARCHIVE_SHA256: &str =
+    "f4df97883f1d4be5ff401e68d1ed26f8ecacdb93858caa63269aba6f9a971a6b";
+pub const DEFAULT_LOCAL_SERVICE_INSTALL_MARKER: &str = "llm.mnn.weight";
+pub const DEFAULT_LOCAL_SERVICE_MARKER_BYTES: u64 = 286_376_448;
+
+/// 目标图里的默认服务卡片：下载现成的 MNN 部署包，解压即用（推理仍占位）。
 pub fn default_local_translate_service() -> LocalTranslateService {
     LocalTranslateService {
         id: DEFAULT_LOCAL_SERVICE_ID.into(),
         name: DEFAULT_LOCAL_SERVICE_NAME.into(),
         languages: vec!["中文".into(), "英文".into()],
-        download_url: String::new(),
-        download_mib: 275,
+        download_url: DEFAULT_LOCAL_SERVICE_DOWNLOAD_URL.into(),
+        fallback_url: DEFAULT_LOCAL_SERVICE_FALLBACK_URL.into(),
+        archive_bytes: DEFAULT_LOCAL_SERVICE_ARCHIVE_BYTES,
+        archive_sha256: DEFAULT_LOCAL_SERVICE_ARCHIVE_SHA256.into(),
+        install_marker: DEFAULT_LOCAL_SERVICE_INSTALL_MARKER.into(),
+        install_marker_bytes: DEFAULT_LOCAL_SERVICE_MARKER_BYTES,
+        download_mib: 214,
         memory_mib: 275,
-        description: "轻量中英互译模型，适合日常截图。".into(),
+        description: "MNN 部署包约 214 MiB，来自 HuggingFace DALabCommunity/Haidass-Translate-143M（Apache-2.0，经 CitePix-Resources 打包）；本地推理尚未实现，当前自动使用 API 翻译。".into(),
     }
 }
 
@@ -1455,10 +1484,15 @@ mod tests {
                   "id": "haidass-143m-fp16",
                   "name": "Haidass Translate 143M · FP16",
                   "languages": ["中文", "英文"],
-                  "downloadUrl": "",
-                  "downloadMib": 275,
+                  "downloadUrl": "https://github.com/mosheng1/CitePix-Resources/releases/download/haidass-translate-143m-a06db229-fp16-v1/haidass-translate-143m-a06db229-fp16-v1.zip",
+                  "fallbackUrl": "https://huggingface.co/mosheng1/CitePix-Resources/resolve/main/haidass-translate-143m-a06db229-fp16-v1.zip",
+                  "archiveBytes": 224593262,
+                  "archiveSha256": "f4df97883f1d4be5ff401e68d1ed26f8ecacdb93858caa63269aba6f9a971a6b",
+                  "installMarker": "llm.mnn.weight",
+                  "installMarkerBytes": 286376448,
+                  "downloadMib": 214,
                   "memoryMib": 275,
-                  "description": "轻量中英互译模型，适合日常截图。"
+                  "description": "MNN 部署包约 214 MiB，来自 HuggingFace DALabCommunity/Haidass-Translate-143M（Apache-2.0，经 CitePix-Resources 打包）；本地推理尚未实现，当前自动使用 API 翻译。"
                 }]
               }
             }"#,
@@ -1481,6 +1515,11 @@ mod tests {
             "defaultService",
             "localServices",
             "downloadUrl",
+            "fallbackUrl",
+            "archiveBytes",
+            "archiveSha256",
+            "installMarker",
+            "installMarkerBytes",
             "downloadMib",
             "memoryMib",
         ] {
@@ -1491,6 +1530,31 @@ mod tests {
         }
         let back = parse(&format!(r#"{{"translation": {json}}}"#));
         assert_eq!(back.translation, s.translation);
+    }
+
+    #[test]
+    fn local_translate_service_points_at_the_mnn_deployment_archive() {
+        let s = default_local_translate_service();
+        assert!(s.download_url.ends_with(DEFAULT_LOCAL_SERVICE_ARCHIVE_NAME));
+        assert!(s.fallback_url.ends_with(DEFAULT_LOCAL_SERVICE_ARCHIVE_NAME));
+        assert_eq!(s.archive_bytes, 224_593_262);
+        assert_eq!(s.archive_sha256.len(), 64);
+        assert_eq!(s.install_marker, "llm.mnn.weight");
+        assert_eq!(s.install_marker_bytes, 286_376_448);
+        assert_eq!(s.download_mib as u64, s.archive_bytes / 1024 / 1024);
+        assert!(s.description.contains("Apache-2.0"));
+        assert!(s.description.contains("本地推理尚未实现"));
+    }
+
+    #[test]
+    fn legacy_service_without_archive_fields_still_parses() {
+        let s =
+            parse(r#"{"translation": {"localServices": [{"id": "custom", "name": "自定义"}]}}"#);
+        let service = &s.translation.local_services[0];
+        assert_eq!(service.id, "custom");
+        assert!(service.download_url.is_empty());
+        assert_eq!(service.archive_bytes, 0);
+        assert!(service.install_marker.is_empty());
     }
 
     #[test]

@@ -27,7 +27,8 @@ const VAULT_ACCOUNT: &str = "apiKey";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a translator. Output only the translation. Keep paragraph structure. Do not explain. Do not translate URLs, file paths, or code. Keep numbers and units.";
 
 /// 本地模型缺失 / 推理管线未实现时的固定文案。设置页用同一句话提示用户。
-const LOCAL_NOT_INSTALLED: &str = "本地翻译模型未安装：请将模型放入 models/translate 后使用";
+const LOCAL_NOT_INSTALLED: &str =
+    "本地翻译模型未安装：请在 设置 → 翻译 下载 MNN 部署包，或解压到 models/translate/<id>";
 const LOCAL_NOT_IMPLEMENTED: &str = "本地翻译推理管线尚未实现";
 
 /// 本地服务的模型目录，按与 `ocr::resolve_models_dir` 相同的优先级解析：
@@ -62,12 +63,13 @@ pub fn local_model_dir(service_id: &str) -> Result<PathBuf> {
 
 /// 本地翻译入口（骨架）。
 ///
-/// 仓库里没有任何本地翻译模型，也没有 tokenizer / seq2seq 推理管线，所以
-/// 这里**从不返回译文**：模型不存在时报「未安装」，文件存在时报「管线尚未
-/// 实现」。`translate()` 捕获错误后回退到现有 API 路径，绝不假装本地可用。
+/// 本地服务的模型来自 CitePix-Resources 的 MNN 部署包，解压后以
+/// `llm.mnn.weight` 作为安装标记；仓库里没有 tokenizer / MNN 推理管线，所以
+/// 这里**从不返回译文**：标记不存在时报「未安装」，存在时报「管线尚未实现」。
+/// `translate()` 捕获错误后回退到现有 API 路径，绝不假装本地可用。
 pub fn infer_local(_text: &str, service_id: &str) -> Result<String> {
-    let model = local_model_dir(service_id)?.join("model.onnx");
-    if !model.is_file() {
+    let marker = local_model_dir(service_id)?.join(config::DEFAULT_LOCAL_SERVICE_INSTALL_MARKER);
+    if !marker.is_file() {
         return Err(Error::new(LOCAL_NOT_INSTALLED));
     }
     Err(Error::new(LOCAL_NOT_IMPLEMENTED))
@@ -447,7 +449,8 @@ mod tests {
 
     #[test]
     fn infer_local_reports_missing_model_honestly() {
-        // 这个 id 在任何候选目录里都不存在，因此必然命中「未安装」分支。
+        // 这个 id 在任何候选目录里都不存在，因此必然命中 llm.mnn.weight
+        // 「未安装」分支（原来检查的 model.onnx 已随 MNN 部署包调整）。
         let err = infer_local("你好", "__fastpin_test_missing_model__")
             .expect_err("骨架不能假装翻译成功");
         assert_eq!(err.to_string(), LOCAL_NOT_INSTALLED);

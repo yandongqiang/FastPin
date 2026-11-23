@@ -13,7 +13,8 @@ pub mod widgets;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
@@ -54,6 +55,55 @@ const INLINE_FIELD_W: f32 = 220.;
 const DROPDOWN_TOP: f32 = widgets::ROW_MIN_H + 4.;
 
 const LANGUAGES: [(&str, &str); 3] = [("zh-CN", "简体中文"), ("en", "English"), ("ja", "日本語")];
+
+/// 本地 MNN 部署包下载 / 解压的跨线程消息。后台线程发送，UI 任务每 150 ms 取一次。
+enum ModelDownloadMsg {
+    Progress(crate::net::DownloadProgress),
+    /// Ok(来源说明)，Err(明确的失败原因)。
+    Done(std::result::Result<&'static str, String>),
+}
+
+/// 用 Windows 自带的 PowerShell 解压 zip：标准库没有 zip 解码器，不必为一次
+/// 安装引入 `zip` 依赖。给出 sha256 时先用 `Get-FileHash` 校验，避免把损坏或
+/// 被替换的包解压进模型目录。
+fn extract_model_archive(
+    zip: &Path,
+    dir: &Path,
+    expected_sha256: &str,
+) -> std::result::Result<(), String> {
+    // PowerShell 单引号字符串里用两个单引号表示一个单引号，避免路径注入。
+    let ps = |p: &Path| p.to_string_lossy().replace('\'', "''");
+    let zip = ps(zip);
+    let dir = ps(dir);
+    let sha = expected_sha256
+        .trim()
+        .to_ascii_lowercase()
+        .replace('\'', "''");
+    let script = format!(
+        "$ErrorActionPreference='Stop'; \
+         $zip='{zip}'; $dest='{dir}'; $sha='{sha}'; \
+         if ($sha -ne '') {{ \
+           $actual=(Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant(); \
+           if ($actual -ne $sha) {{ throw \"SHA256 校验失败：期望 $sha，实际 $actual\" }} \
+         }}; \
+         Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force"
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| format!("无法启动 PowerShell：{e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    Err(if detail.is_empty() {
+        format!("PowerShell 退出码 {:?}", output.status.code())
+    } else {
+        detail
+    })
+}
 
 const HOTKEY_ROWS: [(HotkeyAction, &str, &str, &str); 3] = [
     (
@@ -560,6 +610,10 @@ pub struct SettingsView {
     history_poll_running: bool,
     /// 本地模型下载在后台线程执行；此标志防止重复点击。
     model_downloading: bool,
+    /// (服务 id, 下载进度快照)，由后台线程经 mpsc 回传，150 ms 轮询刷新。
+    model_download_progress: Option<(String, crate::net::DownloadProgress)>,
+    /// (服务 id, 失败原因)，保留到该服务下一次重新下载。
+    model_download_error: Option<(String, String)>,
     /// In-flight update check guards against double clicks.
     update_checking: bool,
     /// (version, url) of a newer release, when the last check found one.
@@ -1008,6 +1062,8 @@ impl SettingsView {
             history_revision_seen: crate::history::history_revision(),
             history_poll_running: false,
             model_downloading: false,
+            model_download_progress: None,
+            model_download_error: None,
             update_checking: false,
             update_available: None,
             update_downloading: false,
@@ -1962,17 +2018,24 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// 把模型包下载到 `models/translate/<id>/`。默认服务没有下载地址，
-    /// 只提示手动放置，不发起网络请求；真正的下载在后台线程流式写入。
-    fn download_local_model(&mut self, id: String, url: String, cx: &mut Context<Self>) {
-        if url.trim().is_empty() {
-            self.ok(format!(
-                "暂无下载地址，请手动将模型放入 models/translate/{id}"
-            ));
-            cx.notify();
+    /// 下载 CitePix 的 MNN 部署包 zip 并解压到 `models/translate/<id>/`。
+    /// 主源失败自动换备用源；下载 / 解压都在后台线程，进度经 mpsc 每 150 ms 刷新。
+    fn download_local_model(
+        &mut self,
+        service: crate::config::LocalTranslateService,
+        cx: &mut Context<Self>,
+    ) {
+        if self.model_downloading {
             return;
         }
-        if self.model_downloading {
+        let id = service.id.clone();
+        let primary = service.download_url.trim().to_string();
+        let fallback = service.fallback_url.trim().to_string();
+        if primary.is_empty() && fallback.is_empty() {
+            self.ok(format!(
+                "暂无下载地址，请手动将 MNN 部署包解压到 models/translate/{id}"
+            ));
+            cx.notify();
             return;
         }
         let dir = match crate::translate::local_model_dir(&id) {
@@ -1983,40 +2046,150 @@ impl SettingsView {
                 return;
             }
         };
-        let dest = dir.join(crate::net::download_file_name(&url));
+        // GitHub / HuggingFace 的 URL 末段就是带版本号的 zip 名；下载器先写
+        // .part 再 rename，中断不会留下看起来已安装的文件。
+        let first = if primary.is_empty() {
+            &fallback
+        } else {
+            &primary
+        };
+        let dest = dir.join(crate::net::download_file_name(first));
+        let sha = service.archive_sha256.trim().to_string();
+        let archive_bytes = service.archive_bytes;
+
         self.model_downloading = true;
+        self.model_download_progress = None;
+        self.model_download_error = None;
         self.ok(format!("正在下载模型 {id}…"));
         cx.notify();
 
-        enum Msg {
-            Done(std::result::Result<PathBuf, String>),
-        }
-        let (tx, rx) = mpsc::channel::<Msg>();
+        let (tx, rx) = mpsc::channel::<ModelDownloadMsg>();
         let finished = Arc::new(AtomicBool::new(false));
         let flag = finished.clone();
+        let sources: Vec<(&'static str, String)> = [("GitHub", primary), ("HuggingFace", fallback)]
+            .into_iter()
+            .filter(|(_, url)| !url.is_empty())
+            .collect();
         std::thread::spawn(move || {
-            let outcome = crate::net::download_url_to(&url, &dest, |_| {});
-            let _ = tx.send(Msg::Done(outcome.map_err(|e| e.to_string())));
+            let mut last_error = String::from("没有可用的下载地址");
+            let mut downloaded = false;
+            for (label, url) in sources {
+                match crate::net::download_url_to(&url, &dest, |progress| {
+                    let _ = tx.send(ModelDownloadMsg::Progress(progress));
+                }) {
+                    Ok(_) => {
+                        downloaded = true;
+                        break;
+                    }
+                    Err(e) => last_error = format!("{label} 下载失败：{e}"),
+                }
+            }
+            if !downloaded {
+                let _ = tx.send(ModelDownloadMsg::Done(Err(last_error)));
+                flag.store(true, Ordering::Release);
+                return;
+            }
+            if archive_bytes > 0 {
+                match std::fs::metadata(&dest) {
+                    Ok(meta) if meta.len() != archive_bytes => {
+                        let _ = tx.send(ModelDownloadMsg::Done(Err(format!(
+                            "部署包大小不符：期望 {archive_bytes} B，实际 {} B",
+                            meta.len()
+                        ))));
+                        flag.store(true, Ordering::Release);
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ModelDownloadMsg::Done(Err(format!(
+                            "无法读取已下载的部署包：{e}"
+                        ))));
+                        flag.store(true, Ordering::Release);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            match extract_model_archive(&dest, &dir, &sha) {
+                Ok(()) => {
+                    let _ = tx.send(ModelDownloadMsg::Done(Ok("MNN 部署包")));
+                }
+                Err(e) => {
+                    let _ = tx.send(ModelDownloadMsg::Done(Err(format!("部署包解压失败：{e}"))));
+                }
+            }
             flag.store(true, Ordering::Release);
         });
+
+        let active_id = id.clone();
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             while !finished.load(Ordering::Acquire) {
+                while let Ok(msg) = rx.try_recv() {
+                    let _ = this.update(cx, |this, cx| {
+                        this.handle_model_download_msg(&active_id, msg, cx)
+                    });
+                }
                 cx.background_executor()
                     .timer(Duration::from_millis(150))
                     .await;
             }
+            // 线程先置完成标志再退出，最后取一次收尾消息。
             while let Ok(msg) = rx.try_recv() {
                 let _ = this.update(cx, |this, cx| {
-                    this.model_downloading = false;
-                    match msg {
-                        Msg::Done(Ok(path)) => this.ok(format!("模型已下载：{}", path.display())),
-                        Msg::Done(Err(e)) => this.fail(format!("模型下载失败：{e}")),
-                    }
-                    cx.notify();
+                    this.handle_model_download_msg(&active_id, msg, cx)
                 });
             }
         })
         .detach();
+    }
+
+    /// 把后台消息落到 UI 状态并刷新卡片；失败原因留在原服务上直到下次下载。
+    fn handle_model_download_msg(
+        &mut self,
+        id: &str,
+        msg: ModelDownloadMsg,
+        cx: &mut Context<Self>,
+    ) {
+        match msg {
+            ModelDownloadMsg::Progress(p) => {
+                self.model_download_progress = Some((id.to_string(), p));
+            }
+            ModelDownloadMsg::Done(Ok(label)) => {
+                self.model_downloading = false;
+                self.model_download_progress = None;
+                self.model_download_error = None;
+                self.ok(format!("{label}已下载并解压到 models/translate/{id}"));
+            }
+            ModelDownloadMsg::Done(Err(e)) => {
+                self.model_downloading = false;
+                self.model_download_progress = None;
+                self.model_download_error = Some((id.to_string(), e.clone()));
+                self.fail(e.clone());
+            }
+        }
+        cx.notify();
+    }
+
+    /// 安装状态：包内 `llm.mnn.weight` 存在且大小接近声明值（1% 误差，至少 64 B）。
+    fn local_model_installed(&self, service: &crate::config::LocalTranslateService) -> bool {
+        let Ok(dir) = crate::translate::local_model_dir(&service.id) else {
+            return false;
+        };
+        let marker = if service.install_marker.trim().is_empty() {
+            crate::config::DEFAULT_LOCAL_SERVICE_INSTALL_MARKER
+        } else {
+            service.install_marker.trim()
+        };
+        let Ok(meta) = std::fs::metadata(dir.join(marker)) else {
+            return false;
+        };
+        if !meta.is_file() {
+            return false;
+        }
+        if service.install_marker_bytes == 0 {
+            return true;
+        }
+        meta.len().abs_diff(service.install_marker_bytes)
+            <= (service.install_marker_bytes / 100).max(64)
     }
 
     fn appearance_label(&self) -> SharedString {
@@ -4122,30 +4295,59 @@ impl SettingsView {
         );
         let mut cards: Vec<gpui::Div> = Vec::new();
         for service in &self.settings.translation.local_services {
-            let installed = crate::translate::local_model_dir(&service.id)
-                .map(|dir| dir.join("model.onnx").is_file())
-                .unwrap_or(false);
-            let status: SharedString = if installed {
-                "已安装（model.onnx）".into()
-            } else if service.download_url.trim().is_empty() {
+            let installed = self.local_model_installed(service);
+            let marker = if service.install_marker.trim().is_empty() {
+                crate::config::DEFAULT_LOCAL_SERVICE_INSTALL_MARKER
+            } else {
+                service.install_marker.trim()
+            };
+            let mut status: SharedString = if installed {
+                format!("已安装（{marker}）").into()
+            } else if service.download_url.trim().is_empty()
+                && service.fallback_url.trim().is_empty()
+            {
                 "未安装 / 暂无下载地址".into()
             } else {
                 "未安装".into()
             };
-            let id = service.id.clone();
-            let url = service.download_url.clone();
+            if !installed {
+                if let Some((failed_id, error)) = &self.model_download_error {
+                    if failed_id == &service.id {
+                        status = error.clone().into();
+                    }
+                }
+                if let Some((active_id, progress)) = &self.model_download_progress {
+                    if active_id == &service.id {
+                        let pct = progress
+                            .percent()
+                            .map(|p| format!("{p}%"))
+                            .unwrap_or_else(|| "—".into());
+                        status = format!("下载中… {pct}").into();
+                    }
+                }
+            }
+            let download_label: SharedString = if self.model_downloading {
+                match &self.model_download_progress {
+                    Some((active_id, progress)) if active_id == &service.id => {
+                        match progress.percent() {
+                            Some(pct) => format!("下载中… {pct}%").into(),
+                            None => "下载中…".into(),
+                        }
+                    }
+                    _ => "下载中…".into(),
+                }
+            } else {
+                "下载".into()
+            };
+            let service_for_download = service.clone();
             let download = widgets::button(
                 SharedString::from(format!("download-model-{}", service.id)),
-                if self.model_downloading {
-                    "下载中…"
-                } else {
-                    "下载"
-                },
+                download_label,
             )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    this.download_local_model(id.clone(), url.clone(), cx);
+                    this.download_local_model(service_for_download.clone(), cx);
                 }),
             );
             let mut card_rows = vec![
@@ -4161,19 +4363,24 @@ impl SettingsView {
                 widgets::row(
                     "下载与占用",
                     format!(
-                        "下载约 {} MiB · 运行内存约 {} MiB",
+                        "部署包约 {} MiB · 运行内存约 {} MiB",
                         service.download_mib, service.memory_mib
                     ),
                 ),
                 widgets::row("安装状态", status).child(widgets::control(download)),
             ];
-            if service.download_url.trim().is_empty() && !installed {
+            if service.download_url.trim().is_empty() && service.fallback_url.trim().is_empty() {
                 card_rows.push(widgets::row(
                     "来源",
                     format!(
-                        "暂无下载地址，请手动将模型放入 models/translate/{}",
+                        "暂无下载地址，请手动将 MNN 部署包解压到 models/translate/{}",
                         service.id
                     ),
+                ));
+            } else {
+                card_rows.push(widgets::row(
+                    "下载来源",
+                    "GitHub Release 主源，失败自动切换 HuggingFace 镜像；校验 SHA256 后解压到模型目录。",
                 ));
             }
             cards.push(
@@ -4183,9 +4390,11 @@ impl SettingsView {
                     .gap(px(6.))
                     .child(widgets::rows(card_rows))
                     .child(
-                        widgets::hint("使用所选模型离线翻译；任务结束后释放模型内存。")
-                            .px(px(20.))
-                            .pb(px(12.)),
+                        widgets::hint(
+                            "当前仅接入部署包下载与配置：本地推理尚未实现，会自动回退到 API 翻译。",
+                        )
+                        .px(px(20.))
+                        .pb(px(12.)),
                     ),
             );
         }
@@ -4339,7 +4548,7 @@ impl SettingsView {
             .child(widgets::group_header("本地推理"))
             .child(widgets::rows(vec![thread_row]))
             .child(widgets::hint(
-                "本地翻译目前是骨架：模型未安装或推理管线未实现时，会自动回退到 API 翻译。",
+                "本地翻译目前是下载 / 配置骨架：MNN 部署包下载解压到 models/translate/<id> 后仍不执行本地推理，会自动回退到 API 翻译。",
             ))
     }
 

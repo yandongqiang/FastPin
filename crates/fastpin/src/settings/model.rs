@@ -481,7 +481,12 @@ pub const ROWS: &[RowMeta] = &[
     RowMeta {
         page: Page::Translate,
         title: "我的服务",
-        desc: "本地翻译服务卡片、安装状态与模型下载入口。",
+        desc: "本地翻译服务卡片、MNN 部署包下载解压与安装状态。",
+    },
+    RowMeta {
+        page: Page::Translate,
+        title: "安装状态",
+        desc: "按包内 llm.mnn.weight 是否存在且大小正确判定模型已安装。",
     },
     RowMeta {
         page: Page::Translate,
@@ -960,7 +965,8 @@ mod tests {
     /// 翻译页的新分组都要能被搜索到，并跳回「翻译」页。
     #[test]
     fn local_translate_rows_are_searchable_on_translate_page() {
-        for title in ["默认翻译服务", "我的服务", "本地推理线程数"] {
+        for title in ["默认翻译服务", "我的服务", "安装状态", "本地推理线程数"]
+        {
             assert!(
                 search(title)
                     .iter()

@@ -58,6 +58,9 @@ impl AssetSource for ToolbarAssets {
             "toolbar/spotlight.svg" => Some(Cow::Borrowed(include_bytes!(
                 "../../../../assets/toolbar/spotlight.svg"
             ))),
+            "toolbar/spotlightCircle.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/toolbar/spotlightCircle.svg"
+            ))),
             "toolbar/eraser.svg" => Some(Cow::Borrowed(include_bytes!(
                 "../../../../assets/toolbar/eraser.svg"
             ))),

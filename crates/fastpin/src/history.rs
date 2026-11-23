@@ -28,6 +28,17 @@ const RECORDS_DIR: &str = "records";
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Revision of the history index. Bumped by `HistoryStore::add()` right after
+/// the index is rewritten, so open UI views can notice a new capture without
+/// the bare export thread ever needing a GPUI context.
+pub static HISTORY_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Current history revision. Views poll this cheap atomic and reload when it
+/// changes; a single counter keeps the record path independent of GPUI.
+pub fn history_revision() -> u64 {
+    HISTORY_REVISION.load(Ordering::Acquire)
+}
+
 /// Serializes all index read-modify-write cycles. Several export threads can
 /// finish at once; without this, two `add` calls could read the same index and
 /// the later write would drop the earlier record.
@@ -278,6 +289,10 @@ impl HistoryStore {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(e);
         }
+        // Publish the new record to open views. `add` still holds the store
+        // lock here, so the bump cannot interleave with another writer's
+        // index rewrite.
+        HISTORY_REVISION.fetch_add(1, Ordering::Release);
         Ok(record)
     }
 

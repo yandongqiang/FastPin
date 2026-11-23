@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     actions, div, img, prelude::*, px, size, App, AsyncApp, Bounds, Context, CursorStyle,
@@ -45,6 +46,18 @@ const THUMB_SIZE: u32 = 200;
 const CARD_W: f32 = 240.0;
 /// Padding inside each card.
 const CARD_PAD: f32 = 12.0;
+
+/// 缩略图显示宽度固定（THUMB_SIZE - 2 * CARD_PAD），高度按原图宽高比计算。
+/// 极端比例做 clamp，避免网格等高行被撑得失衡。
+fn thumb_height(width: u32, height: u32) -> f32 {
+    const THUMB_W: f32 = THUMB_SIZE as f32 - 2.0 * CARD_PAD; // 176
+    const MIN_H: f32 = 48.0;
+    const MAX_H: f32 = THUMB_W * 2.0;
+    if width == 0 || height == 0 {
+        return THUMB_W;
+    }
+    (THUMB_W * height as f32 / width as f32).clamp(MIN_H, MAX_H)
+}
 
 thread_local! {
     /// Open windows, kept so GPUI does not drop the handles (and the windows).
@@ -108,6 +121,9 @@ pub fn show_history_window(cx: &mut App) {
                 cx.refresh_windows();
                 true
             });
+            // New captures are recorded on a bare export thread, so the open
+            // gallery has to poll the revision to see them without F5.
+            view.start_revision_poll(cx);
         })
         .is_err()
     {
@@ -189,6 +205,10 @@ pub struct HistoryWindowView {
     thumb_seq: u64,
     selected: Option<String>,
     status: SharedString,
+    /// Last history index revision this window loaded. A 400ms poll compares
+    /// it with `history_revision()` so a capture saved elsewhere shows up
+    /// without the user pressing 刷新.
+    revision_seen: u64,
 }
 
 impl HistoryWindowView {
@@ -202,6 +222,7 @@ impl HistoryWindowView {
             thumb_seq: 0,
             selected: None,
             status: SharedString::default(),
+            revision_seen: crate::history::history_revision(),
         };
         this.load_thumbs_async(cx);
         this
@@ -282,6 +303,32 @@ impl HistoryWindowView {
         }
         self.load_thumbs_async(cx);
         cx.notify();
+    }
+
+    /// Polls the global history revision every 400ms so a copy made while the
+    /// gallery is open appears without a manual refresh. At most one reload per
+    /// tick even when several captures landed in between; the loop exits on its
+    /// own once the view is gone (`this.update` then fails).
+    fn start_revision_poll(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx: &mut AsyncApp| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            let keep_polling = this
+                .update(cx, |this, cx| {
+                    let revision = crate::history::history_revision();
+                    if revision != this.revision_seen {
+                        this.revision_seen = revision;
+                        this.reload(cx);
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !keep_polling {
+                break;
+            }
+        })
+        .detach();
     }
 
     fn selected_record(&self) -> Option<&HistoryRecord> {
@@ -422,6 +469,7 @@ impl HistoryWindowView {
     ) -> impl IntoElement {
         let selected = self.selected.as_ref() == Some(&record.id);
         let id = record.id.clone();
+        let thumb_h = thumb_height(record.width, record.height);
         div()
             .id(("history-card", index))
             .flex_none()
@@ -452,11 +500,11 @@ impl HistoryWindowView {
                     cx.notify();
                 }),
             )
+            // 缩略图宽度固定，高度按原图比例（record.width/height）计算。
             .child(
-                // Thumbnail area — square.
                 div()
                     .w(px(THUMB_SIZE as f32 - 2. * CARD_PAD))
-                    .h(px(THUMB_SIZE as f32 - 2. * CARD_PAD))
+                    .h(px(thumb_h))
                     .rounded(px(6.))
                     .bg(theme::muted())
                     .flex()
@@ -465,12 +513,13 @@ impl HistoryWindowView {
                     .child(match self.thumbs.get(&record.id).and_then(|t| t.clone()) {
                         Some(image) => img(ImageSource::Render(image))
                             .w(px(THUMB_SIZE as f32 - 2. * CARD_PAD))
-                            .h(px(THUMB_SIZE as f32 - 2. * CARD_PAD))
+                            .h(px(thumb_h))
+                            .object_fit(gpui::ObjectFit::Contain)
                             .rounded(px(6.))
                             .into_any_element(),
                         None => div()
                             .w(px(THUMB_SIZE as f32 - 2. * CARD_PAD))
-                            .h(px(THUMB_SIZE as f32 - 2. * CARD_PAD))
+                            .h(px(thumb_h))
                             .rounded(px(6.))
                             .bg(theme::muted())
                             .flex()
@@ -673,6 +722,20 @@ fn hist_button(id: &'static str, label: &'static str, danger: bool) -> gpui::Sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumb_height_follows_aspect_ratio_with_clamp() {
+        // 16:9 → 176 * 9 / 16 = 99
+        assert_eq!(thumb_height(1920, 1080), 99.0);
+        // 1:1 → 176
+        assert_eq!(thumb_height(1000, 1000), 176.0);
+        // 极宽图 → 下限 48
+        assert_eq!(thumb_height(10000, 100), 48.0);
+        // 极高图 → 上限 176 * 2 = 352
+        assert_eq!(thumb_height(100, 10000), 352.0);
+        // 尺寸缺失时回退方形
+        assert_eq!(thumb_height(0, 0), 176.0);
+    }
 
     /// Guards the whole "show a past image" path: a real PNG on disk must turn
     /// into a GPUI thumbnail, including the B/R swap the atlas expects.

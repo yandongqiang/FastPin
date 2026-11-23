@@ -530,6 +530,13 @@ pub struct SettingsView {
     history_confirm_clear: bool,
     /// Source filter for the embedded gallery ("all" / a record source string).
     history_filter: String,
+    /// Last history index revision this view loaded. A 400ms poll compares it
+    /// with `history_revision()` so a capture copied on the bare export thread
+    /// appears without the user pressing 刷新.
+    history_revision_seen: u64,
+    /// Guards against spawning more than one history polling task. The task
+    /// clears it when the History page (or the whole window) is left.
+    history_poll_running: bool,
     /// In-flight update check guards against double clicks.
     update_checking: bool,
     /// (version, url) of a newer release, when the last check found one.
@@ -967,6 +974,8 @@ impl SettingsView {
             history_confirm_delete: false,
             history_confirm_clear: false,
             history_filter: "all".to_string(),
+            history_revision_seen: crate::history::history_revision(),
+            history_poll_running: false,
             update_checking: false,
             update_available: None,
             update_downloading: false,
@@ -1115,6 +1124,9 @@ impl SettingsView {
             // Load records + decode thumbnails on entry so the grid is never a
             // blank page. Refreshing again is harmless (sequence-guarded).
             self.reload_history(cx);
+            // Keep the grid in sync with captures saved elsewhere while the
+            // page stays open; the task stops itself when we leave the page.
+            self.start_history_poll(cx);
         }
         if self.page == Page::Resources {
             // Model files may have changed since the window opened; sample once
@@ -1476,6 +1488,48 @@ impl SettingsView {
         }
         self.load_history_thumbs_async(cx);
         cx.notify();
+    }
+
+    /// Starts the single 400ms revision poll for the embedded history page.
+    /// `add()` bumps the global revision from a bare export thread, so polling
+    /// is the only way the view can notice a new capture. Each tick does at
+    /// most one reload even if several captures landed in between. The loop
+    /// ends itself when the view is dropped or the page is left; the running
+    /// flag prevents duplicate loops when the page is re-entered.
+    fn start_history_poll(&mut self, cx: &mut Context<Self>) {
+        if self.history_poll_running {
+            return;
+        }
+        self.history_poll_running = true;
+        // Anything saved before this point is already covered by the reload
+        // performed on page entry.
+        self.history_revision_seen = crate::history::history_revision();
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+                // `this.update` fails once the window is gone — exit promptly.
+                let keep_polling = this
+                    .update(cx, |this, cx| {
+                        if this.page != Page::History {
+                            this.history_poll_running = false;
+                            return false;
+                        }
+                        let revision = crate::history::history_revision();
+                        if revision != this.history_revision_seen {
+                            this.history_revision_seen = revision;
+                            this.reload_history(cx);
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_polling {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Decode thumbnails off the UI thread, reusing the gallery window's
@@ -4263,6 +4317,7 @@ impl SettingsView {
                 let selected = self.history_selected.as_ref() == Some(&record.id);
                 let id = record.id.clone();
                 let thumb = self.history_thumbs.get(&record.id).and_then(|t| t.clone());
+                let thumb_h = thumb_height(record.width, record.height);
                 grid = grid.child(
                     div()
                         .id(("settings-history-card", i))
@@ -4294,10 +4349,11 @@ impl SettingsView {
                                 cx.notify();
                             }),
                         )
+                        // 缩略图宽度固定，高度按原图比例（record.width/height）计算。
                         .child(
                             div()
                                 .w(px(THUMB - 2.0 * PAD))
-                                .h(px(THUMB - 2.0 * PAD))
+                                .h(px(thumb_h))
                                 .rounded(px(6.))
                                 .bg(theme::muted())
                                 .flex()
@@ -4306,12 +4362,18 @@ impl SettingsView {
                                 .child(match thumb {
                                     Some(image) => img(ImageSource::Render(image))
                                         .w(px(THUMB - 2.0 * PAD))
-                                        .h(px(THUMB - 2.0 * PAD))
+                                        .h(px(thumb_h))
+                                        .object_fit(gpui::ObjectFit::Contain)
                                         .rounded(px(6.))
                                         .into_any_element(),
                                     None => div()
-                                        .text_size(px(11.))
-                                        .text_color(theme::secondary_fg())
+                                        .w(px(THUMB - 2.0 * PAD))
+                                        .h(px(thumb_h))
+                                        .rounded(px(6.))
+                                        .bg(theme::muted())
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .child("无预览")
                                         .into_any_element(),
                                 }),
@@ -4572,6 +4634,18 @@ fn history_matches_filter(source: &str, filter: &str) -> bool {
     filter == "all" || source == filter
 }
 
+/// 缩略图显示宽度固定（THUMB - 2 * PAD），高度按原图宽高比计算。
+/// 极端比例做 clamp，避免过高/过宽的图片把等高行撑得失衡。
+fn thumb_height(width: u32, height: u32) -> f32 {
+    const THUMB_W: f32 = 176.0; // THUMB(200) - 2 * PAD(12)
+    const MIN_H: f32 = 48.0;
+    const MAX_H: f32 = THUMB_W * 2.0;
+    if width == 0 || height == 0 {
+        return THUMB_W;
+    }
+    (THUMB_W * height as f32 / width as f32).clamp(MIN_H, MAX_H)
+}
+
 /// Modification time of a history image in unix millis, used to decide whether
 /// a cached thumbnail is still valid. `None` means the file could not be
 /// inspected and forces a fresh decode.
@@ -4672,6 +4746,20 @@ mod tests {
         let snapshot = EngineStatusSnapshot::from(missing);
         assert!(!snapshot.available);
         assert_eq!(&*snapshot.dir, "未找到");
+    }
+
+    #[test]
+    fn history_thumb_height_follows_aspect_ratio_with_clamp() {
+        // 16:9 → 176 * 9 / 16 = 99
+        assert_eq!(thumb_height(1920, 1080), 99.0);
+        // 1:1 → 176
+        assert_eq!(thumb_height(1000, 1000), 176.0);
+        // 极宽图 → 下限 48
+        assert_eq!(thumb_height(10000, 100), 48.0);
+        // 极高图 → 上限 176 * 2 = 352
+        assert_eq!(thumb_height(100, 10000), 352.0);
+        // 尺寸缺失时回退方形
+        assert_eq!(thumb_height(0, 0), 176.0);
     }
 
     #[test]

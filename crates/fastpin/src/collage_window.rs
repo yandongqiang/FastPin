@@ -583,15 +583,24 @@ impl CollageWindowView {
         this
     }
 
-    /// Mirrors the window's local settings back into `settings.json` so the
-    /// next open starts where this one left off.
-    fn persist_settings(&mut self) {
+    /// 对最新配置应用一次增量修改并立即落盘，再把落盘后的值回写本地副本。
+    ///
+    /// 旧实现把整份本地 collage / pdf 覆盖回配置，窗口开启期间其它界面保存的、
+    /// 本窗口没有改动的字段会被这份陈旧副本回滚。现在每次调用都从 `config::get()`
+    /// 的最新值出发，闭包只修改本次涉及的那个字段，其余字段原样保留；保存成功
+    /// （或尝试保存）后再回写本地副本，使它不再陈旧。11 处调用点语义保持不变。
+    fn persist_settings(&mut self, edit: impl FnOnce(&mut CollageSettings, &mut PdfSettings)) {
         let mut settings = crate::config::get();
-        settings.screenshot.collage = (&self.collage_settings).into();
-        settings.screenshot.pdf = (&self.pdf_settings).into();
+        let mut collage: CollageSettings = (&settings.screenshot.collage).into();
+        let mut pdf: PdfSettings = (&settings.screenshot.pdf).into();
+        edit(&mut collage, &mut pdf);
+        settings.screenshot.collage = (&collage).into();
+        settings.screenshot.pdf = (&pdf).into();
         if let Err(e) = crate::config::save(&settings) {
             self.status = format!("设置保存失败：{e}").into();
         }
+        self.collage_settings = collage;
+        self.pdf_settings = pdf;
     }
 
     fn add_image(&mut self, pixels: Arc<Vec<u8>>, width: u32, height: u32, name: &str) {
@@ -1058,87 +1067,92 @@ impl CollageWindowView {
     }
 
     fn cycle_collage_direction(&mut self, _: &CycleCollageDirection, cx: &mut Context<Self>) {
-        self.collage_settings.direction = match self.collage_settings.direction {
-            Direction::Vertical => Direction::Horizontal,
-            Direction::Horizontal => Direction::Custom,
-            Direction::Custom => Direction::Vertical,
-        };
-        self.persist_settings();
+        self.persist_settings(|collage, _| {
+            collage.direction = match collage.direction {
+                Direction::Vertical => Direction::Horizontal,
+                Direction::Horizontal => Direction::Custom,
+                Direction::Custom => Direction::Vertical,
+            };
+        });
         self.recalc_all(cx);
     }
 
     fn cycle_collage_sizing(&mut self, _: &CycleCollageSizing, cx: &mut Context<Self>) {
-        self.collage_settings.sizing = match self.collage_settings.sizing {
-            Sizing::Original => Sizing::Uniform,
-            Sizing::Uniform => Sizing::Original,
-        };
-        self.persist_settings();
+        self.persist_settings(|collage, _| {
+            collage.sizing = match collage.sizing {
+                Sizing::Original => Sizing::Uniform,
+                Sizing::Uniform => Sizing::Original,
+            };
+        });
         self.recalc_all(cx);
     }
 
     fn step_collage_spacing(&mut self, _: &StepCollageSpacing, cx: &mut Context<Self>) {
-        self.collage_settings.spacing =
-            (self.collage_settings.spacing as i32 + 1).clamp(0, 100) as u32;
-        self.persist_settings();
+        self.persist_settings(|collage, _| {
+            collage.spacing = (collage.spacing as i32 + 1).clamp(0, 100) as u32;
+        });
         self.recalc_all(cx);
     }
 
     fn step_collage_border(&mut self, _: &StepCollageBorder, cx: &mut Context<Self>) {
-        self.collage_settings.border =
-            (self.collage_settings.border as i32 + 1).clamp(0, 100) as u32;
-        self.persist_settings();
+        self.persist_settings(|collage, _| {
+            collage.border = (collage.border as i32 + 1).clamp(0, 100) as u32;
+        });
         self.recalc_all(cx);
     }
 
     fn step_collage_rows(&mut self, _: &StepCollageRows, cx: &mut Context<Self>) {
         if self.collage_settings.direction == Direction::Custom {
-            self.collage_settings.rows =
-                (self.collage_settings.rows as i32 + 1).clamp(1, 10) as u32;
-            self.persist_settings();
+            self.persist_settings(|collage, _| {
+                collage.rows = (collage.rows as i32 + 1).clamp(1, 10) as u32;
+            });
             self.recalc_all(cx);
         }
     }
 
     fn step_collage_columns(&mut self, _: &StepCollageColumns, cx: &mut Context<Self>) {
         if self.collage_settings.direction == Direction::Custom {
-            self.collage_settings.columns =
-                (self.collage_settings.columns as i32 + 1).clamp(1, 10) as u32;
-            self.persist_settings();
+            self.persist_settings(|collage, _| {
+                collage.columns = (collage.columns as i32 + 1).clamp(1, 10) as u32;
+            });
             self.recalc_all(cx);
         }
     }
 
     fn cycle_pdf_method(&mut self, _: &CyclePdfMethod, cx: &mut Context<Self>) {
-        self.pdf_settings.stitching_method = match self.pdf_settings.stitching_method {
-            StitchingMethod::PageBased => StitchingMethod::TemplateBased,
-            StitchingMethod::TemplateBased => StitchingMethod::PageBased,
-        };
-        self.persist_settings();
+        self.persist_settings(|_, pdf| {
+            pdf.stitching_method = match pdf.stitching_method {
+                StitchingMethod::PageBased => StitchingMethod::TemplateBased,
+                StitchingMethod::TemplateBased => StitchingMethod::PageBased,
+            };
+        });
         self.recalc_all(cx);
     }
 
     fn cycle_pdf_template(&mut self, _: &CyclePdfTemplate, cx: &mut Context<Self>) {
-        self.pdf_settings.template_type = match self.pdf_settings.template_type {
-            TemplateType::TwoImages => TemplateType::ThreeImages,
-            TemplateType::ThreeImages => TemplateType::FourImages,
-            TemplateType::FourImages => TemplateType::SixImages,
-            TemplateType::SixImages => TemplateType::NineImages,
-            TemplateType::NineImages => TemplateType::TwoImages,
-        };
-        self.persist_settings();
+        self.persist_settings(|_, pdf| {
+            pdf.template_type = match pdf.template_type {
+                TemplateType::TwoImages => TemplateType::ThreeImages,
+                TemplateType::ThreeImages => TemplateType::FourImages,
+                TemplateType::FourImages => TemplateType::SixImages,
+                TemplateType::SixImages => TemplateType::NineImages,
+                TemplateType::NineImages => TemplateType::TwoImages,
+            };
+        });
         self.recalc_all(cx);
     }
 
     fn step_pdf_spacing(&mut self, _: &StepPdfSpacing, cx: &mut Context<Self>) {
-        self.pdf_settings.spacing_mm = (self.pdf_settings.spacing_mm + 1.0).clamp(0.0, 50.0);
-        self.persist_settings();
+        self.persist_settings(|_, pdf| {
+            pdf.spacing_mm = (pdf.spacing_mm + 1.0).clamp(0.0, 50.0);
+        });
         self.recalc_all(cx);
     }
 
     fn step_pdf_quality(&mut self, _: &StepPdfQuality, cx: &mut Context<Self>) {
-        self.pdf_settings.image_quality =
-            (self.pdf_settings.image_quality as i32 + 1).clamp(1, 100) as u8;
-        self.persist_settings();
+        self.persist_settings(|_, pdf| {
+            pdf.image_quality = (pdf.image_quality as i32 + 1).clamp(1, 100) as u8;
+        });
         cx.notify();
     }
 
@@ -1172,8 +1186,9 @@ impl CollageWindowView {
     }
 
     fn step_pdf_spacing_dec_click(&mut self, cx: &mut Context<Self>) {
-        self.pdf_settings.spacing_mm = (self.pdf_settings.spacing_mm - 1.0).clamp(0.0, 50.0);
-        self.persist_settings();
+        self.persist_settings(|_, pdf| {
+            pdf.spacing_mm = (pdf.spacing_mm - 1.0).clamp(0.0, 50.0);
+        });
         self.recalc_all(cx);
     }
 

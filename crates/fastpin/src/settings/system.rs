@@ -55,14 +55,26 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
     let key = wide(RUN_KEY);
     let name = wide(RUN_VALUE);
     if !enabled {
-        // Absent already is the desired state, not a failure.
-        let _ = unsafe {
+        // Absent already is the desired state; a real delete failure must be
+        // reported instead of letting the UI claim success while the checkbox
+        // keeps showing enabled after a re-read.
+        let status = unsafe {
             RegDeleteKeyValueW(
                 HKEY_CURRENT_USER,
                 PCWSTR(key.as_ptr()),
                 PCWSTR(name.as_ptr()),
             )
         };
+        // WIN32_ERROR is a plain newtype: 0 means success, ERROR_FILE_NOT_FOUND
+        // means already absent. Any other code is a real failure to report.
+        if status != windows::Win32::Foundation::ERROR_SUCCESS
+            && status != windows::Win32::Foundation::ERROR_FILE_NOT_FOUND
+        {
+            return Err(crate::error::Error::new(format!(
+                "关闭开机启动失败：{}",
+                status.0
+            )));
+        }
         return Ok(());
     }
     let exe = std::env::current_exe()?;

@@ -136,6 +136,10 @@ pub struct Screenshot {
     pub collage: CollageSettings,
     /// PDF export settings (paper size, margins, template, stitching method).
     pub pdf: PdfSettings,
+    /// 图片切图设置（方向、类型、单位、数量 / 网格、精确尺寸与重叠）。
+    /// 与 collage / pdf 不同，这里直接复用可序列化的 `imagesplit::SplitSettings`，
+    /// 由图片切图窗口的 setter 逐项写回。
+    pub split: crate::imagesplit::SplitSettings,
 }
 
 /// Long-capture auto-scroll cadence, persisted so the settings page can honour
@@ -843,8 +847,6 @@ pub struct Watermark {
     pub tiled: bool,
     /// Prepend the capture time (UTC `YYYY-MM-DD HH:MM:SS`).
     pub timestamp: bool,
-    /// Reserved for a user `strftime`-style pattern; ignored today.
-    pub timestamp_format: String,
     /// Optional image watermark path. Only used when it is an existing file.
     pub image_path: Option<PathBuf>,
 }
@@ -858,7 +860,6 @@ impl Default for Watermark {
             scale: 1.0,
             tiled: false,
             timestamp: false,
-            timestamp_format: String::new(),
             image_path: None,
         }
     }

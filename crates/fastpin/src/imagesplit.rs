@@ -28,8 +28,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 /// Which axis (or both) the image is cut along.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SplitDirection {
     Vertical,
     Horizontal,
@@ -37,7 +40,8 @@ pub enum SplitDirection {
 }
 
 /// How cut positions are chosen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SplitType {
     /// Equal-sized tiles (`count` pieces along the axis).
     Equal,
@@ -48,14 +52,18 @@ pub enum SplitType {
 }
 
 /// Unit used by the Precise type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SplitUnit {
     Pixels,
     Percentage,
 }
 
 /// All user-tunable split parameters. Mirrors snow-shot `ImageSplitSettings`.
-#[derive(Clone, Debug, PartialEq)]
+/// 直接作为 `settings.json` 的 `screenshot.split` 持久化：camelCase 键，
+/// 缺字段时由下面的 `Default` 补齐，旧配置文件无需迁移。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct SplitSettings {
     pub direction: SplitDirection,
     pub split_type: SplitType,

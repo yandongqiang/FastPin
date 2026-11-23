@@ -277,6 +277,108 @@ pub const ROWS: &[RowMeta] = &[
         title: "拼图工具",
         desc: "把多张图片排成版式，导出 PNG 或多页 PDF。",
     },
+    // 输出 → 拼图默认设置
+    RowMeta {
+        page: Page::Output,
+        title: "拼图方向",
+        desc: "多张图片的排列方向：垂直、水平或网格。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "尺寸模式",
+        desc: "图片按原始尺寸排布，或统一缩放到相同尺寸。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "拼图间距",
+        desc: "图片之间的间隔，单位像素，0 到 100。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "拼图边框",
+        desc: "整张拼图外围的边框宽度，单位像素，0 到 100。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "网格行数",
+        desc: "网格方向布局的行数，1 到 10。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "网格列数",
+        desc: "网格方向布局的列数，1 到 10。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "背景颜色",
+        desc: "拼图背景色，支持 #RRGGBB 或 #RRGGBBAA。",
+    },
+    // 输出 → PDF 默认设置
+    RowMeta {
+        page: Page::Output,
+        title: "PDF 拼接方式",
+        desc: "按页自动拼接，或使用固定模板拼版。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "PDF 拼版模板",
+        desc: "模板每页容纳的图片数量：2、3、4、6 或 9 张。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "PDF 分页模式",
+        desc: "合并为一个 PDF，或每页单独导出一个文件。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "纸张大小",
+        desc: "A3、A4、A5、B5、Letter、Legal、自定义或图片尺寸。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "页面方向",
+        desc: "PDF 页面使用纵向还是横向。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "PDF 图片间距",
+        desc: "同一页图片之间的间距，单位毫米，不小于 0。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "自定义纸张宽度",
+        desc: "纸张大小选择自定义时的页宽，单位毫米，大于 0。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "自定义纸张高度",
+        desc: "纸张大小选择自定义时的页高，单位毫米，大于 0。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "上边距",
+        desc: "PDF 页面上边缘留白，单位毫米，不小于 0。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "下边距",
+        desc: "PDF 页面下边缘留白，单位毫米，不小于 0。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "左边距",
+        desc: "PDF 页面左边缘留白，单位毫米，不小于 0。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "右边距",
+        desc: "PDF 页面右边缘留白，单位毫米，不小于 0。",
+    },
+    RowMeta {
+        page: Page::Output,
+        title: "PDF 图片质量",
+        desc: "导出 JPG / WebP 页面时的编码质量，1 到 100。",
+    },
     // 贴图
     RowMeta {
         page: Page::Pin,
@@ -489,6 +591,10 @@ pub fn reset_page(settings: &mut Settings, page: Page) -> bool {
             settings.screenshot.save_dir = default.screenshot.save_dir.clone();
             settings.screenshot.watermark = default.screenshot.watermark.clone();
             settings.screenshot.export = default.screenshot.export.clone();
+            // 本页现在也承载拼图与 PDF 的默认设置，一并重置。
+            settings.screenshot.collage = default.screenshot.collage.clone();
+            settings.screenshot.pdf = default.screenshot.pdf.clone();
+            settings.screenshot.split = default.screenshot.split.clone();
             true
         }
         // History settings live on the Data page now; resetting that page must
@@ -550,10 +656,15 @@ mod tests {
         s.translation.target_language = "ja".into();
         s.translation.prompt = "be terse".into();
         s.translation.timeout_seconds = 111;
+        s.translation.allow_insecure_http = true;
         s.screenshot.hidden_toolbar_items = vec!["text".into(), "redo".into()];
         s.screenshot.save_dir = Some("D:/shots".into());
+        s.screenshot.smart_selection = crate::config::SmartSelectionMode::Disabled;
         s.screenshot.export.auto_save = true;
         s.screenshot.export.auto_copy = false;
+        s.screenshot.export.format = crate::config::ImageFormat::Jpeg;
+        s.screenshot.export.quality = 60;
+        s.screenshot.export.filename_template = "shot_{date}".into();
         s.screenshot.annotation.stroke_width = 9.0;
         s.screenshot.annotation.stroke_color = "#123456".into();
         s.screenshot.annotation.mosaic_block = 32;
@@ -566,6 +677,31 @@ mod tests {
         s.screenshot.watermark.tiled = true;
         s.screenshot.watermark.timestamp = true;
         s.screenshot.watermark.image_path = Some("D:/wm.png".into());
+        // 拼图默认值：全部偏离 CollageSettings::default()。
+        s.screenshot.collage.direction = crate::config::Direction::Horizontal;
+        s.screenshot.collage.sizing = crate::config::Sizing::Original;
+        s.screenshot.collage.border = 5;
+        s.screenshot.collage.spacing = 12;
+        s.screenshot.collage.background_rgba = [1, 2, 3, 255];
+        s.screenshot.collage.rows = 3;
+        s.screenshot.collage.columns = 4;
+        // PDF 默认值：全部偏离 PdfSettings::default()。
+        s.screenshot.pdf.stitching_method = crate::config::StitchingMethod::TemplateBased;
+        s.screenshot.pdf.template_type = crate::config::TemplateType::FourImages;
+        s.screenshot.pdf.spacing_mm = 7.5;
+        s.screenshot.pdf.paper_size = crate::config::PaperSize::Letter;
+        s.screenshot.pdf.orientation = crate::config::Orientation::Landscape;
+        s.screenshot.pdf.custom_width_mm = 123.0;
+        s.screenshot.pdf.custom_height_mm = 234.0;
+        s.screenshot.pdf.margin_top_mm = 11.0;
+        s.screenshot.pdf.margin_bottom_mm = 12.0;
+        s.screenshot.pdf.margin_left_mm = 13.0;
+        s.screenshot.pdf.margin_right_mm = 14.0;
+        s.screenshot.pdf.export_mode = crate::config::ExportMode::PerPage;
+        s.screenshot.pdf.image_quality = 77;
+        // 切图默认值：偏离 SplitSettings::default()。
+        s.screenshot.split.count = 7;
+        s.screenshot.split.overlap_width = 6;
         s.hotkeys.region = "Ctrl+Shift+1".into();
         s.hotkeys.copy_only = "Ctrl+Shift+2".into();
         s.hotkeys.fullscreen = "Ctrl+Shift+3".into();
@@ -646,6 +782,40 @@ mod tests {
         }
     }
 
+    /// 输出页新增的拼图 / PDF 默认设置必须能被搜索到，并能跳回来源页面。
+    #[test]
+    fn collage_and_pdf_rows_are_searchable_on_output_page() {
+        for title in [
+            "拼图方向",
+            "尺寸模式",
+            "拼图间距",
+            "拼图边框",
+            "网格行数",
+            "网格列数",
+            "背景颜色",
+            "PDF 拼接方式",
+            "PDF 拼版模板",
+            "PDF 分页模式",
+            "纸张大小",
+            "页面方向",
+            "PDF 图片间距",
+            "自定义纸张宽度",
+            "自定义纸张高度",
+            "上边距",
+            "下边距",
+            "左边距",
+            "右边距",
+            "PDF 图片质量",
+        ] {
+            assert!(
+                search(title)
+                    .iter()
+                    .any(|r| r.title == title && r.page == Page::Output),
+                "search lost '{title}' on Page::Output"
+            );
+        }
+    }
+
     /// 自动保存 / 自动复制是两个独立开关，两行都要能被搜索到。
     #[test]
     fn auto_export_rows_are_searchable_on_output_page() {
@@ -721,16 +891,47 @@ mod tests {
                     && s.screenshot.annotation.stroke_color == "#FA3C3C"
                     && s.screenshot.auto_scroll.interval_ms == 600
                     && s.screenshot.auto_scroll.notches == 1
+                    && s.screenshot.smart_selection
+                        == crate::config::SmartSelectionMode::WindowSubElement
             }
             Page::Output => {
                 s.screenshot.save_dir.is_none()
                     && s.screenshot.watermark.text.is_empty()
                     && !s.screenshot.export.auto_save
                     && s.screenshot.export.auto_copy
+                    && s.screenshot.export.format == crate::config::ImageFormat::Png
+                    && s.screenshot.export.quality == 90
+                    && s.screenshot.export.filename_template
+                        == crate::config::DEFAULT_FILENAME_TEMPLATE
+                    && s.screenshot.collage.direction == crate::config::Direction::Vertical
+                    && s.screenshot.collage.sizing == crate::config::Sizing::Uniform
+                    && s.screenshot.collage.border == 0
+                    && s.screenshot.collage.spacing == 0
+                    && s.screenshot.collage.background_rgba == [255, 255, 255, 255]
+                    && s.screenshot.collage.rows == 1
+                    && s.screenshot.collage.columns == 1
+                    && s.screenshot.pdf.stitching_method
+                        == crate::config::StitchingMethod::PageBased
+                    && s.screenshot.pdf.template_type == crate::config::TemplateType::TwoImages
+                    && s.screenshot.pdf.spacing_mm == 5.0
+                    && s.screenshot.pdf.paper_size == crate::config::PaperSize::A4
+                    && s.screenshot.pdf.orientation == crate::config::Orientation::Portrait
+                    && s.screenshot.pdf.custom_width_mm == 210.0
+                    && s.screenshot.pdf.custom_height_mm == 297.0
+                    && s.screenshot.pdf.margin_top_mm == 10.0
+                    && s.screenshot.pdf.margin_bottom_mm == 10.0
+                    && s.screenshot.pdf.margin_left_mm == 10.0
+                    && s.screenshot.pdf.margin_right_mm == 10.0
+                    && s.screenshot.pdf.export_mode == crate::config::ExportMode::Combined
+                    && s.screenshot.pdf.image_quality == 90
+                    && s.screenshot.split.count == 2
+                    && s.screenshot.split.overlap_width == 0
             }
             Page::Hotkey => s.hotkeys.region == "Ctrl+Alt+A",
             Page::Appearance => s.appearance == "light",
-            Page::Translate => s.translation.model == "gpt-4o-mini",
+            Page::Translate => {
+                s.translation.model == "gpt-4o-mini" && !s.translation.allow_insecure_http
+            }
             Page::Resources => s.ocr.models_dir.is_none(),
             Page::Data => {
                 s.history.enabled

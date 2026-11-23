@@ -163,7 +163,9 @@ pub struct SplitWindowView {
 
 impl SplitWindowView {
     fn new(cx: &mut Context<Self>, initial: Option<(Arc<Vec<u8>>, u32, u32, String)>) -> Self {
-        let export = crate::config::get().screenshot.export.clone();
+        let config = crate::config::get();
+        let split = config.screenshot.split.clone();
+        let export = config.screenshot.export.clone();
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             pixels: Arc::new(Vec::new()),
@@ -172,8 +174,8 @@ impl SplitWindowView {
             image: placeholder_image(),
             permit: None,
             image_name: "split".to_string(),
-            settings: SplitSettings::default(),
-            layout: calculate_layout(0, 0, &SplitSettings::default()),
+            settings: split.clone(),
+            layout: calculate_layout(0, 0, &split),
             format: export.format,
             quality: export.clamped_quality(),
             export_result: None,
@@ -208,6 +210,26 @@ impl SplitWindowView {
     fn recalc(&mut self) {
         self.layout = calculate_layout(self.width, self.height, &self.settings);
         self.export_result = None;
+    }
+
+    /// 切图参数落盘。每次都从最新配置出发，只覆盖本窗口管辖的 `split` 字段，
+    /// 这样设置页或其它窗口在这期间保存的修改不会被本地副本整体冲掉。
+    fn persist_split(&mut self) {
+        let mut config = crate::config::get();
+        config.screenshot.split = self.settings.clone();
+        if let Err(e) = crate::config::save(&config) {
+            self.status = format!("设置保存失败：{e}").into();
+        }
+    }
+
+    /// 格式 / 质量属于 `screenshot.export`，与 split 分开写回，但同样基于最新配置。
+    fn persist_export(&mut self) {
+        let mut config = crate::config::get();
+        config.screenshot.export.format = self.format;
+        config.screenshot.export.quality = self.quality;
+        if let Err(e) = crate::config::save(&config) {
+            self.status = format!("设置保存失败：{e}").into();
+        }
     }
 
     fn has_image(&self) -> bool {
@@ -313,6 +335,7 @@ impl SplitWindowView {
             SplitDirection::Grid => SplitDirection::Vertical,
         };
         self.recalc();
+        self.persist_split();
     }
 
     fn cycle_type(&mut self) {
@@ -322,6 +345,7 @@ impl SplitWindowView {
             SplitType::Smart => SplitType::Equal,
         };
         self.recalc();
+        self.persist_split();
     }
 
     fn cycle_unit(&mut self) {
@@ -330,6 +354,7 @@ impl SplitWindowView {
             SplitUnit::Percentage => SplitUnit::Pixels,
         };
         self.recalc();
+        self.persist_split();
     }
 
     fn cycle_format(&mut self) {
@@ -349,6 +374,8 @@ impl SplitWindowView {
         }
         self.format = crate::codec::effective_format(self.format);
         self.recalc();
+        // 格式 / 质量归属 export，只更新这两个字段，不影响其它配置。
+        self.persist_export();
     }
 
     fn step_u32(field: &mut u32, delta: i32, min: u32, max: u32) {
@@ -359,21 +386,25 @@ impl SplitWindowView {
     fn step_count(&mut self, delta: i32) {
         Self::step_u32(&mut self.settings.count, delta, 1, 20);
         self.recalc();
+        self.persist_split();
     }
 
     fn step_rows(&mut self, delta: i32) {
         Self::step_u32(&mut self.settings.rows, delta, 1, 20);
         self.recalc();
+        self.persist_split();
     }
 
     fn step_columns(&mut self, delta: i32) {
         Self::step_u32(&mut self.settings.columns, delta, 1, 20);
         self.recalc();
+        self.persist_split();
     }
 
     fn step_pixels(&mut self, delta: i32) {
         Self::step_u32(&mut self.settings.pixels, delta, 16, 4096);
         self.recalc();
+        self.persist_split();
     }
 
     fn step_percentage(&mut self, delta: i32) {
@@ -381,17 +412,20 @@ impl SplitWindowView {
         let next = (value + delta * 5).clamp(5, 95);
         self.settings.percentage = next.to_string();
         self.recalc();
+        self.persist_split();
     }
 
     fn step_overlap(&mut self, delta: i32) {
         Self::step_u32(&mut self.settings.overlap_width, delta, 0, 256);
         self.recalc();
+        self.persist_split();
     }
 
     fn step_quality(&mut self, delta: i32) {
         let next = self.quality as i32 + delta * 5;
         self.quality = next.clamp(1, 100) as u8;
         self.recalc();
+        self.persist_export();
     }
 
     // ---- rendering -------------------------------------------------------

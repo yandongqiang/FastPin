@@ -14,7 +14,7 @@ pub mod widgets;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,12 @@ thread_local! {
     static SETTINGS_WINDOW: RefCell<Option<WindowHandle<SettingsView>>> = const { RefCell::new(None) };
     static KEYS_BOUND: Cell<bool> = const { Cell::new(false) };
 }
+
+/// Generation of the hotkey-recording session. There is no window-close handler
+/// to stop a recorder, so the timeout must be able to check its own validity
+/// even after the view that armed it is gone — hence a shared counter rather
+/// than the view field alone. `SettingsView::recording_seq` mirrors it.
+static RECORDING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Long enough to press any combo, short enough that a recorder left running by
 /// a closed window cannot keep swallowing keys. See `hook::record_proc`.
@@ -218,6 +224,14 @@ enum SelectId {
     HistoryDisk,
     Appearance,
     HistoryFilter,
+    // 输出页的拼图 / PDF 默认设置。
+    CollageDirection,
+    CollageSizing,
+    PdfStitching,
+    PdfTemplate,
+    PdfExportMode,
+    PdfPaperSize,
+    PdfOrientation,
 }
 
 /// (label, position key) presets for the watermark 9-grid.
@@ -281,6 +295,100 @@ const SCROLL_INTERVALS: [(&str, u32); 4] = [
 /// (label, notches) presets; same reasoning as [`SCROLL_INTERVALS`].
 const SCROLL_NOTCHES: [(&str, u32); 4] = [("1 格", 1), ("2 格", 2), ("4 格", 4), ("8 格", 8)];
 
+// ---- 拼图 / PDF 默认值：解析与中文标签 -------------------------------------
+// 数字框沿用「解析失败保留上次有效值」的规则，避免把用户正在输入的半截
+// 数字直接写回配置文件；范围与 collage.rs 的校验保持一致。
+
+fn parse_u32_clamped(raw: &str, min: u32, max: u32) -> Option<u32> {
+    raw.trim().parse::<u32>().ok().map(|v| v.clamp(min, max))
+}
+
+fn parse_f32_clamped(raw: &str, min: f32, max: f32) -> Option<f32> {
+    raw.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(min, max))
+}
+
+/// `#RRGGBB` / `#RRGGBBAA`（不带 # 亦可）转成配置里的 RGBA。
+fn parse_rgba(raw: &str) -> Option<[u8; 4]> {
+    let s = raw.trim().trim_start_matches('#');
+    if !s.is_ascii() || (s.len() != 6 && s.len() != 8) {
+        return None;
+    }
+    let channel = |range: std::ops::Range<usize>| u8::from_str_radix(&s[range], 16).ok();
+    let r = channel(0..2)?;
+    let g = channel(2..4)?;
+    let b = channel(4..6)?;
+    let a = if s.len() == 8 { channel(6..8)? } else { 255 };
+    Some([r, g, b, a])
+}
+
+fn rgba_hex(rgba: [u8; 4]) -> String {
+    let [r, g, b, a] = rgba;
+    format!("#{r:02X}{g:02X}{b:02X}{a:02X}")
+}
+
+fn collage_direction_label(d: crate::config::Direction) -> &'static str {
+    match d {
+        crate::config::Direction::Vertical => "垂直",
+        crate::config::Direction::Horizontal => "水平",
+        crate::config::Direction::Custom => "网格",
+    }
+}
+
+fn collage_sizing_label(v: crate::config::Sizing) -> &'static str {
+    match v {
+        crate::config::Sizing::Original => "原始",
+        crate::config::Sizing::Uniform => "统一",
+    }
+}
+
+fn pdf_stitching_label(v: crate::config::StitchingMethod) -> &'static str {
+    match v {
+        crate::config::StitchingMethod::PageBased => "按页拼接",
+        crate::config::StitchingMethod::TemplateBased => "按模板拼版",
+    }
+}
+
+fn pdf_template_label(v: crate::config::TemplateType) -> &'static str {
+    match v {
+        crate::config::TemplateType::TwoImages => "2 张",
+        crate::config::TemplateType::ThreeImages => "3 张",
+        crate::config::TemplateType::FourImages => "4 张",
+        crate::config::TemplateType::SixImages => "6 张",
+        crate::config::TemplateType::NineImages => "9 张",
+    }
+}
+
+fn pdf_export_mode_label(v: crate::config::ExportMode) -> &'static str {
+    match v {
+        crate::config::ExportMode::Combined => "合并为一个 PDF",
+        crate::config::ExportMode::PerPage => "每页单独导出",
+    }
+}
+
+fn pdf_paper_label(v: crate::config::PaperSize) -> &'static str {
+    match v {
+        crate::config::PaperSize::A3 => "A3",
+        crate::config::PaperSize::A4 => "A4",
+        crate::config::PaperSize::A5 => "A5",
+        crate::config::PaperSize::B5 => "B5",
+        crate::config::PaperSize::Letter => "Letter",
+        crate::config::PaperSize::Legal => "Legal",
+        crate::config::PaperSize::Custom => "自定义",
+        crate::config::PaperSize::ImageSize => "图片尺寸",
+    }
+}
+
+fn pdf_orientation_label(v: crate::config::Orientation) -> &'static str {
+    match v {
+        crate::config::Orientation::Portrait => "纵向",
+        crate::config::Orientation::Landscape => "横向",
+    }
+}
+
 /// Render-ready snapshot of the OCR engine status. `crate::ocr::engine_status()`
 /// clones the whole Settings and walks the filesystem (exe path + three
 /// `metadata()` calls), so the view samples it once and reuses the snapshot
@@ -323,6 +431,9 @@ pub struct SettingsView {
     /// Which action is being bound, if any. The recording hook is live for
     /// exactly as long as this is `Some`.
     recording: Option<HotkeyAction>,
+    /// Generation of the active recording session, paired with every write to
+    /// `recording` so an old timeout cannot kill a newer recording.
+    recording_seq: u64,
     autostart: bool,
     /// What is currently in the credential vault, so blurring the field without
     /// touching it does not rewrite the entry on every focus change.
@@ -336,6 +447,20 @@ pub struct SettingsView {
     /// Export file-name template. Persists as typed; a blank field falls back
     /// to `config::DEFAULT_FILENAME_TEMPLATE` when a file is actually named.
     export_name: Entity<TextInput>,
+    // 输出页的拼图 / PDF 默认设置。数字框解析失败时保留上次有效值。
+    collage_spacing: Entity<TextInput>,
+    collage_border: Entity<TextInput>,
+    collage_rows: Entity<TextInput>,
+    collage_columns: Entity<TextInput>,
+    collage_bg: Entity<TextInput>,
+    pdf_spacing: Entity<TextInput>,
+    pdf_width: Entity<TextInput>,
+    pdf_height: Entity<TextInput>,
+    pdf_margin_top: Entity<TextInput>,
+    pdf_margin_bottom: Entity<TextInput>,
+    pdf_margin_left: Entity<TextInput>,
+    pdf_margin_right: Entity<TextInput>,
+    pdf_quality: Entity<TextInput>,
     search: Entity<TextInput>,
     /// The global reset asks for a second click; a single stray press must not
     /// wipe every setting.
@@ -385,6 +510,29 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
+    /// A numeric/colour text field whose observer parses and clamps the typed
+    /// value, then persists only when the stored setting actually changed.
+    /// `apply` returns whether it changed anything.
+    fn number_field<F>(
+        cx: &mut Context<Self>,
+        subscriptions: &mut Vec<Subscription>,
+        value: String,
+        placeholder: &'static str,
+        apply: F,
+    ) -> Entity<TextInput>
+    where
+        F: Fn(&mut Settings, &str) -> bool + 'static,
+    {
+        let input = cx.new(|cx| TextInput::new(cx, value, placeholder, false));
+        subscriptions.push(cx.observe(&input, move |this, input, cx| {
+            let raw = input.read(cx).text().to_string();
+            if apply(&mut this.settings, &raw) {
+                this.persist(cx);
+            }
+        }));
+        input
+    }
+
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = crate::config::get();
         let t = settings.translation.clone();
@@ -416,6 +564,246 @@ impl SettingsView {
         });
 
         let mut subscriptions = Vec::new();
+
+        // 拼图默认设置。间距 / 边框 0..100，行数 / 列数 1..10，颜色 #RRGGBB(AA)。
+        let collage = &settings.screenshot.collage;
+        let collage_spacing = Self::number_field(
+            cx,
+            &mut subscriptions,
+            collage.spacing.to_string(),
+            "0",
+            |s, raw| {
+                let Some(v) = parse_u32_clamped(raw, 0, 100) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.collage.spacing;
+                if *slot != v {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let collage_border = Self::number_field(
+            cx,
+            &mut subscriptions,
+            collage.border.to_string(),
+            "0",
+            |s, raw| {
+                let Some(v) = parse_u32_clamped(raw, 0, 100) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.collage.border;
+                if *slot != v {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let collage_rows = Self::number_field(
+            cx,
+            &mut subscriptions,
+            collage.rows.to_string(),
+            "1",
+            |s, raw| {
+                let Some(v) = parse_u32_clamped(raw, 1, 10) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.collage.rows;
+                if *slot != v {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let collage_columns = Self::number_field(
+            cx,
+            &mut subscriptions,
+            collage.columns.to_string(),
+            "1",
+            |s, raw| {
+                let Some(v) = parse_u32_clamped(raw, 1, 10) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.collage.columns;
+                if *slot != v {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let collage_bg = Self::number_field(
+            cx,
+            &mut subscriptions,
+            rgba_hex(collage.background_rgba),
+            "#FFFFFFFF",
+            |s, raw| {
+                let Some(v) = parse_rgba(raw) else {
+                    return false;
+                };
+                if s.screenshot.collage.background_rgba != v {
+                    s.screenshot.collage.background_rgba = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
+        // PDF 默认设置。间距 / 边距不小于 0，自定义宽高大于 0，质量 1..100。
+        let pdf = &settings.screenshot.pdf;
+        let pdf_spacing = Self::number_field(
+            cx,
+            &mut subscriptions,
+            pdf.spacing_mm.to_string(),
+            "5",
+            |s, raw| {
+                let Some(v) = parse_f32_clamped(raw, 0.0, 1000.0) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.pdf.spacing_mm;
+                if (*slot - v).abs() > f32::EPSILON {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let pdf_width = Self::number_field(
+            cx,
+            &mut subscriptions,
+            pdf.custom_width_mm.to_string(),
+            "210",
+            |s, raw| {
+                let Some(v) = parse_f32_clamped(raw, 1.0, 10_000.0) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.pdf.custom_width_mm;
+                if (*slot - v).abs() > f32::EPSILON {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let pdf_height = Self::number_field(
+            cx,
+            &mut subscriptions,
+            pdf.custom_height_mm.to_string(),
+            "297",
+            |s, raw| {
+                let Some(v) = parse_f32_clamped(raw, 1.0, 10_000.0) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.pdf.custom_height_mm;
+                if (*slot - v).abs() > f32::EPSILON {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let pdf_margin_top = Self::number_field(
+            cx,
+            &mut subscriptions,
+            pdf.margin_top_mm.to_string(),
+            "10",
+            |s, raw| {
+                let Some(v) = parse_f32_clamped(raw, 0.0, 1000.0) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.pdf.margin_top_mm;
+                if (*slot - v).abs() > f32::EPSILON {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let pdf_margin_bottom = Self::number_field(
+            cx,
+            &mut subscriptions,
+            pdf.margin_bottom_mm.to_string(),
+            "10",
+            |s, raw| {
+                let Some(v) = parse_f32_clamped(raw, 0.0, 1000.0) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.pdf.margin_bottom_mm;
+                if (*slot - v).abs() > f32::EPSILON {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let pdf_margin_left = Self::number_field(
+            cx,
+            &mut subscriptions,
+            pdf.margin_left_mm.to_string(),
+            "10",
+            |s, raw| {
+                let Some(v) = parse_f32_clamped(raw, 0.0, 1000.0) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.pdf.margin_left_mm;
+                if (*slot - v).abs() > f32::EPSILON {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let pdf_margin_right = Self::number_field(
+            cx,
+            &mut subscriptions,
+            pdf.margin_right_mm.to_string(),
+            "10",
+            |s, raw| {
+                let Some(v) = parse_f32_clamped(raw, 0.0, 1000.0) else {
+                    return false;
+                };
+                let slot = &mut s.screenshot.pdf.margin_right_mm;
+                if (*slot - v).abs() > f32::EPSILON {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let pdf_quality = Self::number_field(
+            cx,
+            &mut subscriptions,
+            pdf.image_quality.to_string(),
+            "90",
+            |s, raw| {
+                let Some(v) = parse_u32_clamped(raw, 1, 100) else {
+                    return false;
+                };
+                let v = v as u8;
+                let slot = &mut s.screenshot.pdf.image_quality;
+                if *slot != v {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
 
         // Every field compares before storing: the inputs notify on cursor moves
         // too, and writing the file on a click would be pure churn.
@@ -506,6 +894,7 @@ impl SettingsView {
             open_select: None,
             prompt_open: false,
             recording: None,
+            recording_seq: 0,
             autostart: system::autostart_enabled(),
             saved_api_key,
             base_url,
@@ -515,6 +904,19 @@ impl SettingsView {
             prompt,
             wm_text,
             export_name,
+            collage_spacing,
+            collage_border,
+            collage_rows,
+            collage_columns,
+            collage_bg,
+            pdf_spacing,
+            pdf_width,
+            pdf_height,
+            pdf_margin_top,
+            pdf_margin_bottom,
+            pdf_margin_left,
+            pdf_margin_right,
+            pdf_quality,
             search,
             confirm_reset_all: false,
             http_warn_confirm: false,
@@ -559,6 +961,21 @@ impl SettingsView {
     fn fail(&mut self, text: impl Into<SharedString>) {
         self.status = text.into();
         self.status_error = true;
+    }
+
+    /// The LL hook and the RegisterHotKey fallback each hold their own copy of
+    /// the bindings; push every reset/recording change to both so it takes
+    /// effect without a restart.
+    fn reapply_hotkeys(&self) {
+        crate::platform::apply_bindings(HotkeyBindings::from_settings(&self.settings.hotkeys));
+    }
+
+    /// Opens a new recording generation and returns its token. Timers from an
+    /// earlier generation become no-ops once the counter moves on.
+    fn next_recording_seq(&mut self) -> u64 {
+        let seq = RECORDING_SEQ.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        self.recording_seq = seq;
+        seq
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
@@ -611,6 +1028,43 @@ impl SettingsView {
         self.prompt
             .update(cx, |input, cx| input.set_text(t.prompt, cx));
         self.wm_text.update(cx, |input, cx| input.set_text(wm, cx));
+        // 重置本页 / 全部设置后，拼图与 PDF 的输入框也要跟着配置回退。
+        let c = &self.settings.screenshot.collage;
+        let p = &self.settings.screenshot.pdf;
+        self.collage_spacing
+            .update(cx, |input, cx| input.set_text(c.spacing.to_string(), cx));
+        self.collage_border
+            .update(cx, |input, cx| input.set_text(c.border.to_string(), cx));
+        self.collage_rows
+            .update(cx, |input, cx| input.set_text(c.rows.to_string(), cx));
+        self.collage_columns
+            .update(cx, |input, cx| input.set_text(c.columns.to_string(), cx));
+        self.collage_bg.update(cx, |input, cx| {
+            input.set_text(rgba_hex(c.background_rgba), cx)
+        });
+        self.pdf_spacing
+            .update(cx, |input, cx| input.set_text(p.spacing_mm.to_string(), cx));
+        self.pdf_width.update(cx, |input, cx| {
+            input.set_text(p.custom_width_mm.to_string(), cx)
+        });
+        self.pdf_height.update(cx, |input, cx| {
+            input.set_text(p.custom_height_mm.to_string(), cx)
+        });
+        self.pdf_margin_top.update(cx, |input, cx| {
+            input.set_text(p.margin_top_mm.to_string(), cx)
+        });
+        self.pdf_margin_bottom.update(cx, |input, cx| {
+            input.set_text(p.margin_bottom_mm.to_string(), cx)
+        });
+        self.pdf_margin_left.update(cx, |input, cx| {
+            input.set_text(p.margin_left_mm.to_string(), cx)
+        });
+        self.pdf_margin_right.update(cx, |input, cx| {
+            input.set_text(p.margin_right_mm.to_string(), cx)
+        });
+        self.pdf_quality.update(cx, |input, cx| {
+            input.set_text(p.image_quality.to_string(), cx)
+        });
         self.http_warn_confirm = false;
     }
 
@@ -682,6 +1136,9 @@ impl SettingsView {
             // step without a second click.
             theme::set_dark(cx, self.settings.dark());
             self.sync_inputs(cx);
+            if self.page == Page::Hotkey {
+                self.reapply_hotkeys();
+            }
             self.persist(cx);
             self.ok(format!("已重置「{}」", self.page.title()));
         } else {
@@ -695,13 +1152,17 @@ impl SettingsView {
         // Resetting everything includes the API Key stored in the vault.
         let _ = crate::translate::set_api_key("");
         self.saved_api_key.clear();
-        let _ = system::set_autostart(false);
+        let autostart_error = system::set_autostart(false).err();
         theme::set_dark(cx, self.settings.dark());
         self.autostart = system::autostart_enabled();
         self.sync_inputs(cx);
+        self.reapply_hotkeys();
         self.confirm_reset_all = false;
         self.persist(cx);
-        self.ok("所有设置已恢复默认");
+        match autostart_error {
+            Some(e) => self.fail(format!("所有设置已恢复默认，但关闭开机启动失败：{e}")),
+            None => self.ok("所有设置已恢复默认"),
+        }
         cx.notify();
     }
 
@@ -754,6 +1215,85 @@ impl SettingsView {
         self.open_select = None;
         if export.quality != quality {
             export.quality = quality;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    // ---- 输出页：拼图 / PDF 默认设置的下拉写回 ------------------------------
+
+    fn set_collage_direction(&mut self, v: crate::config::Direction, cx: &mut Context<Self>) {
+        self.open_select = None;
+        let slot = &mut self.settings.screenshot.collage.direction;
+        if *slot != v {
+            *slot = v;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_collage_sizing(&mut self, v: crate::config::Sizing, cx: &mut Context<Self>) {
+        self.open_select = None;
+        let slot = &mut self.settings.screenshot.collage.sizing;
+        if *slot != v {
+            *slot = v;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_pdf_stitching(&mut self, v: crate::config::StitchingMethod, cx: &mut Context<Self>) {
+        self.open_select = None;
+        let slot = &mut self.settings.screenshot.pdf.stitching_method;
+        if *slot != v {
+            *slot = v;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_pdf_template(&mut self, v: crate::config::TemplateType, cx: &mut Context<Self>) {
+        self.open_select = None;
+        let slot = &mut self.settings.screenshot.pdf.template_type;
+        if *slot != v {
+            *slot = v;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_pdf_export_mode(&mut self, v: crate::config::ExportMode, cx: &mut Context<Self>) {
+        self.open_select = None;
+        let slot = &mut self.settings.screenshot.pdf.export_mode;
+        if *slot != v {
+            *slot = v;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_pdf_paper(&mut self, v: crate::config::PaperSize, cx: &mut Context<Self>) {
+        self.open_select = None;
+        let slot = &mut self.settings.screenshot.pdf.paper_size;
+        if *slot != v {
+            *slot = v;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_pdf_orientation(&mut self, v: crate::config::Orientation, cx: &mut Context<Self>) {
+        self.open_select = None;
+        let slot = &mut self.settings.screenshot.pdf.orientation;
+        if *slot != v {
+            *slot = v;
             self.persist(cx);
         } else {
             cx.notify();
@@ -1309,7 +1849,9 @@ impl SettingsView {
         };
         match hotkey::parse(stored) {
             Some(h) => hotkey::format(h).into(),
-            None => "未设置".into(),
+            // Show the raw (bad) string so a hand-edited config can be spotted
+            // and corrected here instead of masquerading as "未设置".
+            None => stored.clone().into(),
         }
     }
 
@@ -1319,6 +1861,7 @@ impl SettingsView {
             self.cancel_recording(cx);
             return;
         }
+        let seq = self.next_recording_seq();
         self.recording = Some(action);
         self.ok("按下新的组合键");
         crate::platform::start_recording();
@@ -1327,13 +1870,20 @@ impl SettingsView {
         // bindable keys while it runs, so it must never outlive a stuck UI.
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RECORDING_TIMEOUT).await;
+            // A superseded timer must not tear down a newer recording — not
+            // even when the view that armed it has been dropped in the meantime.
+            if RECORDING_SEQ.load(Ordering::SeqCst) != seq {
+                return;
+            }
             crate::platform::stop_recording();
             let _ = this.update(cx, |view, cx| {
-                if view.recording == Some(action) {
-                    view.recording = None;
-                    view.fail("录制超时，快捷键未改动");
-                    cx.notify();
+                if view.recording_seq != seq || view.recording != Some(action) {
+                    return;
                 }
+                view.recording = None;
+                view.next_recording_seq();
+                view.fail("录制超时，快捷键未改动");
+                cx.notify();
             });
         })
         .detach();
@@ -1343,6 +1893,7 @@ impl SettingsView {
     fn cancel_recording(&mut self, cx: &mut Context<Self>) {
         crate::platform::stop_recording();
         self.recording = None;
+        self.next_recording_seq();
         self.status = SharedString::default();
         self.status_error = false;
         cx.notify();
@@ -1351,20 +1902,25 @@ impl SettingsView {
     fn hotkey_recorded(&mut self, pressed: Hotkey, cx: &mut Context<Self>) {
         let Some(action) = self.recording.take() else {
             crate::platform::stop_recording();
+            self.next_recording_seq();
             return;
         };
         crate::platform::stop_recording();
+        self.next_recording_seq();
 
         let text = hotkey::format(pressed);
         // Two actions on one combo means one of them silently never fires.
+        // Compare the effective bindings, not the raw strings: a bad string
+        // falls back to its default in `from_settings`, and that default can
+        // still clash with the combo just recorded.
+        let bindings = HotkeyBindings::from_settings(&self.settings.hotkeys);
         let clash = [
-            (HotkeyAction::Region, &self.settings.hotkeys.region),
-            (HotkeyAction::CopyOnly, &self.settings.hotkeys.copy_only),
-            (HotkeyAction::Fullscreen, &self.settings.hotkeys.fullscreen),
+            HotkeyAction::Region,
+            HotkeyAction::CopyOnly,
+            HotkeyAction::Fullscreen,
         ]
         .into_iter()
-        .find(|(other, stored)| *other != action && hotkey::parse(stored) == Some(pressed))
-        .map(|(other, _)| other);
+        .find(|other| *other != action && bindings.binding_for(*other) == pressed);
 
         if let Some(other) = clash {
             let name = HOTKEY_ROWS
@@ -1383,9 +1939,7 @@ impl SettingsView {
             HotkeyAction::Fullscreen => self.settings.hotkeys.fullscreen = text.clone(),
         }
         self.persist(cx);
-        // Takes effect now; both the LL hook and the RegisterHotKey fallback
-        // hold their own copy of the bindings.
-        crate::platform::apply_bindings(HotkeyBindings::from_settings(&self.settings.hotkeys));
+        self.reapply_hotkeys();
         if self.status.is_empty() {
             self.ok(format!("已设为 {text}"));
         }
@@ -2219,6 +2773,359 @@ impl SettingsView {
         ]
     }
 
+    /// A short numeric field beside its label, as the 超时 row does.
+    fn number_row(
+        &self,
+        title: &'static str,
+        desc: &'static str,
+        input: &Entity<TextInput>,
+        width: f32,
+    ) -> gpui::Div {
+        widgets::row(title, desc)
+            .child(widgets::control(div().w(px(width)).child((*input).clone())))
+    }
+
+    /// 输出页的「拼图默认设置」分组：保存后对新打开的拼图窗口生效。
+    fn collage_controls(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let c = &self.settings.screenshot.collage;
+        let directions = [
+            (crate::config::Direction::Vertical, "垂直"),
+            (crate::config::Direction::Horizontal, "水平"),
+            (crate::config::Direction::Custom, "网格"),
+        ];
+        let direction_rows = directions
+            .into_iter()
+            .map(|(v, label)| {
+                widgets::select_option(
+                    SharedString::from(format!("collage-dir-{v:?}")),
+                    label,
+                    c.direction == v,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_collage_direction(v, cx)),
+                )
+            })
+            .collect();
+        let direction = self.select_row(
+            cx,
+            SelectId::CollageDirection,
+            "拼图方向",
+            "多张图片的排列方向：垂直、水平或网格。",
+            collage_direction_label(c.direction).into(),
+            direction_rows,
+        );
+
+        let sizings = [
+            (crate::config::Sizing::Original, "原始"),
+            (crate::config::Sizing::Uniform, "统一"),
+        ];
+        let sizing_rows = sizings
+            .into_iter()
+            .map(|(v, label)| {
+                widgets::select_option(
+                    SharedString::from(format!("collage-sizing-{v:?}")),
+                    label,
+                    c.sizing == v,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_collage_sizing(v, cx)),
+                )
+            })
+            .collect();
+        let sizing = self.select_row(
+            cx,
+            SelectId::CollageSizing,
+            "尺寸模式",
+            "图片按原始尺寸排布，或统一缩放到相同尺寸。",
+            collage_sizing_label(c.sizing).into(),
+            sizing_rows,
+        );
+
+        // 背景色：输入框（#RRGGBB / #RRGGBBAA）+ 常用预设。
+        let swatches = [
+            ("#FFFFFFFF", "白"),
+            ("#000000FF", "黑"),
+            ("#FF0000FF", "红"),
+            ("#87CEEBFF", "天蓝"),
+        ]
+        .into_iter()
+        .map(|(hex, _label)| {
+            let [r, g, b, _] = parse_rgba(hex).unwrap_or([255; 4]);
+            let rgb = gpui::rgb(((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
+            div()
+                .id(SharedString::from(format!("collage-bg-{hex}")))
+                .flex_none()
+                .w(px(18.))
+                .h(px(18.))
+                .rounded_full()
+                .bg(rgb)
+                .border_1()
+                .border_color(theme::border())
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        let Some(rgba) = parse_rgba(hex) else {
+                            return;
+                        };
+                        if this.settings.screenshot.collage.background_rgba == rgba {
+                            return;
+                        }
+                        this.settings.screenshot.collage.background_rgba = rgba;
+                        this.collage_bg
+                            .update(cx, |input, cx| input.set_text(hex, cx));
+                        this.persist(cx);
+                    }),
+                )
+        });
+        let background =
+            widgets::stack("背景颜色", "支持 #RRGGBB 或 #RRGGBBAA；也可点选下方预设。").child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .children(swatches)
+                    .child(div().w(px(110.)).child(self.collage_bg.clone())),
+            );
+
+        widgets::rows(vec![
+            direction,
+            sizing,
+            self.number_row(
+                "拼图间距",
+                "图片之间的间隔，像素，0 到 100。",
+                &self.collage_spacing,
+                90.,
+            ),
+            self.number_row(
+                "拼图边框",
+                "整张拼图外围的边框宽度，像素，0 到 100。",
+                &self.collage_border,
+                90.,
+            ),
+            self.number_row(
+                "网格行数",
+                "网格方向布局的行数，1 到 10。",
+                &self.collage_rows,
+                90.,
+            ),
+            self.number_row(
+                "网格列数",
+                "网格方向布局的列数，1 到 10。",
+                &self.collage_columns,
+                90.,
+            ),
+            background,
+        ])
+    }
+
+    /// 输出页的「PDF 默认设置」分组。
+    fn pdf_controls(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = &self.settings.screenshot.pdf;
+        let stitchings = [
+            (crate::config::StitchingMethod::PageBased, "按页拼接"),
+            (crate::config::StitchingMethod::TemplateBased, "按模板拼版"),
+        ];
+        let stitching_rows = stitchings
+            .into_iter()
+            .map(|(v, label)| {
+                widgets::select_option(
+                    SharedString::from(format!("pdf-stitching-{v:?}")),
+                    label,
+                    p.stitching_method == v,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_pdf_stitching(v, cx)),
+                )
+            })
+            .collect();
+        let stitching = self.select_row(
+            cx,
+            SelectId::PdfStitching,
+            "PDF 拼接方式",
+            "按页自动拼接，或使用固定模板拼版。",
+            pdf_stitching_label(p.stitching_method).into(),
+            stitching_rows,
+        );
+
+        let templates = [
+            (crate::config::TemplateType::TwoImages, "2 张"),
+            (crate::config::TemplateType::ThreeImages, "3 张"),
+            (crate::config::TemplateType::FourImages, "4 张"),
+            (crate::config::TemplateType::SixImages, "6 张"),
+            (crate::config::TemplateType::NineImages, "9 张"),
+        ];
+        let template_rows = templates
+            .into_iter()
+            .map(|(v, label)| {
+                widgets::select_option(
+                    SharedString::from(format!("pdf-template-{v:?}")),
+                    label,
+                    p.template_type == v,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_pdf_template(v, cx)),
+                )
+            })
+            .collect();
+        let template = self.select_row(
+            cx,
+            SelectId::PdfTemplate,
+            "PDF 拼版模板",
+            "模板每页容纳的图片数量：2、3、4、6 或 9 张。",
+            pdf_template_label(p.template_type).into(),
+            template_rows,
+        );
+
+        let modes = [
+            (crate::config::ExportMode::Combined, "合并为一个 PDF"),
+            (crate::config::ExportMode::PerPage, "每页单独导出"),
+        ];
+        let mode_rows = modes
+            .into_iter()
+            .map(|(v, label)| {
+                widgets::select_option(
+                    SharedString::from(format!("pdf-mode-{v:?}")),
+                    label,
+                    p.export_mode == v,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_pdf_export_mode(v, cx)),
+                )
+            })
+            .collect();
+        let mode = self.select_row(
+            cx,
+            SelectId::PdfExportMode,
+            "PDF 分页模式",
+            "合并为一个 PDF，或每页单独导出一个文件。",
+            pdf_export_mode_label(p.export_mode).into(),
+            mode_rows,
+        );
+
+        let papers = [
+            (crate::config::PaperSize::A3, "A3"),
+            (crate::config::PaperSize::A4, "A4"),
+            (crate::config::PaperSize::A5, "A5"),
+            (crate::config::PaperSize::B5, "B5"),
+            (crate::config::PaperSize::Letter, "Letter"),
+            (crate::config::PaperSize::Legal, "Legal"),
+            (crate::config::PaperSize::Custom, "自定义"),
+            (crate::config::PaperSize::ImageSize, "图片尺寸"),
+        ];
+        let paper_rows = papers
+            .into_iter()
+            .map(|(v, label)| {
+                widgets::select_option(
+                    SharedString::from(format!("pdf-paper-{v:?}")),
+                    label,
+                    p.paper_size == v,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_pdf_paper(v, cx)),
+                )
+            })
+            .collect();
+        let paper = self.select_row(
+            cx,
+            SelectId::PdfPaperSize,
+            "纸张大小",
+            "A3、A4、A5、B5、Letter、Legal、自定义或图片尺寸。",
+            pdf_paper_label(p.paper_size).into(),
+            paper_rows,
+        );
+
+        let orientations = [
+            (crate::config::Orientation::Portrait, "纵向"),
+            (crate::config::Orientation::Landscape, "横向"),
+        ];
+        let orientation_rows = orientations
+            .into_iter()
+            .map(|(v, label)| {
+                widgets::select_option(
+                    SharedString::from(format!("pdf-orientation-{v:?}")),
+                    label,
+                    p.orientation == v,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_pdf_orientation(v, cx)),
+                )
+            })
+            .collect();
+        let orientation = self.select_row(
+            cx,
+            SelectId::PdfOrientation,
+            "页面方向",
+            "PDF 页面使用纵向还是横向。",
+            pdf_orientation_label(p.orientation).into(),
+            orientation_rows,
+        );
+
+        widgets::rows(vec![
+            stitching,
+            template,
+            mode,
+            paper,
+            orientation,
+            self.number_row(
+                "PDF 图片间距",
+                "同一页图片之间的间距，毫米，不小于 0。",
+                &self.pdf_spacing,
+                90.,
+            ),
+            self.number_row(
+                "自定义纸张宽度",
+                "纸张大小选择自定义时生效，毫米，大于 0。",
+                &self.pdf_width,
+                90.,
+            ),
+            self.number_row(
+                "自定义纸张高度",
+                "纸张大小选择自定义时生效，毫米，大于 0。",
+                &self.pdf_height,
+                90.,
+            ),
+            self.number_row(
+                "上边距",
+                "页面上边缘留白，毫米，不小于 0。",
+                &self.pdf_margin_top,
+                90.,
+            ),
+            self.number_row(
+                "下边距",
+                "页面下边缘留白，毫米，不小于 0。",
+                &self.pdf_margin_bottom,
+                90.,
+            ),
+            self.number_row(
+                "左边距",
+                "页面左边缘留白，毫米，不小于 0。",
+                &self.pdf_margin_left,
+                90.,
+            ),
+            self.number_row(
+                "右边距",
+                "页面右边缘留白，毫米，不小于 0。",
+                &self.pdf_margin_right,
+                90.,
+            ),
+            self.number_row(
+                "PDF 图片质量",
+                "导出 JPG / WebP 页面的编码质量，1 到 100。",
+                &self.pdf_quality,
+                90.,
+            ),
+        ])
+    }
+
     fn page_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let save_dir: SharedString = match crate::config::screenshot_dir() {
             Ok(p) => p.display().to_string().into(),
@@ -2323,26 +3230,6 @@ impl SettingsView {
                 self.watermark_opacity_row(cx),
                 self.watermark_scale_row(cx),
                 image,
-                widgets::stack(
-                    "图片切图",
-                    "把一张图片切成等分/精确的网格，逐块导出，适合分页打印长截图。",
-                )
-                .child(
-                    widgets::button("split-open-window", "打开切图工具").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| this.open_image_split(window, cx)),
-                    ),
-                ),
-                widgets::stack(
-                    "拼图工具",
-                    "把多张图片拼成一张，支持垂直/水平/网格布局，可导出 PNG 或多页 PDF。",
-                )
-                .child(
-                    widgets::button("collage-open-window", "打开拼图工具").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| this.open_collage(window, cx)),
-                    ),
-                ),
                 widgets::row(
                     "添加拍摄时间",
                     "在文字前附加 UTC 时间，格式 YYYY-MM-DD HH:MM:SS。",
@@ -2366,8 +3253,34 @@ impl SettingsView {
                         ),
                 )),
             ]))
+            .child(widgets::group_header("拼图默认设置"))
+            .child(self.collage_controls(cx))
+            .child(widgets::group_header("PDF 默认设置"))
+            .child(self.pdf_controls(cx))
+            .child(widgets::rows(vec![
+                widgets::stack(
+                    "图片切图",
+                    "把一张图片切成等分/精确的网格，逐块导出，适合分页打印长截图。",
+                )
+                .child(
+                    widgets::button("split-open-window", "打开切图工具").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.open_image_split(window, cx)),
+                    ),
+                ),
+                widgets::stack(
+                    "拼图工具",
+                    "把多张图片拼成一张，支持垂直/水平/网格布局，可导出 PNG 或多页 PDF。",
+                )
+                .child(
+                    widgets::button("collage-open-window", "打开拼图工具").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.open_collage(window, cx)),
+                    ),
+                ),
+            ]))
             .child(widgets::hint(
-                "水印随导出一并烧录到图片，不写入原图；留空且未设图片时不添加任何水印。",
+                "水印随导出一并烧录到图片，不写入原图；留空且未设图片时不添加任何水印。拼图与 PDF 的默认值保存后，对之后打开的工具生效。",
             ))
     }
 

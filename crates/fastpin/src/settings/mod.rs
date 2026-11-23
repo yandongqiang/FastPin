@@ -465,7 +465,7 @@ enum HistoryViewMode {
 pub struct SettingsView {
     page: Page,
     settings: Settings,
-    /// 外观下拉的全部选项（内置主题 + 磁盘上的主题族），开窗时取样一次。
+    /// 外观下拉的全部选项（themes 目录里每个主题族的全部变体），开窗时取样一次。
     theme_options: Vec<(String, String)>,
     status: SharedString,
     status_error: bool,
@@ -1203,9 +1203,8 @@ impl SettingsView {
                 let _ = crate::translate::set_api_key("");
                 self.saved_api_key.clear();
             }
-            // The appearance page resets to light; re-projecting the (possibly
-            // unchanged) theme here keeps the chrome and every other window in
-            // step without a second click.
+            // 外观页重置回默认主题变体；重新应用（即使值没变）可让工具栏、
+            // 弹层和本窗口一起刷新，无需再点一次。
             theme::set_appearance(cx, &self.settings.appearance);
             self.sync_inputs(cx);
             if self.page == Page::Hotkey {
@@ -1921,14 +1920,15 @@ impl SettingsView {
         self.theme_options
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(id))
-            .map(|(_, label)| SharedString::from(label.clone()))
-            // 手工编辑的设置值没有对应选项时，沿用内置标签的浅色回退。
-            .unwrap_or_else(|| crate::config::appearance_label(id).into())
+            .map(|(_, label)| label.clone())
+            // 手工编辑的设置值没有对应选项时，原样显示，方便发现拼写错误。
+            .unwrap_or_else(|| id.to_string())
+            .into()
     }
 
     /// Appearance switch: save first, then push the theme into gpui-kit and
     /// refresh every window so the toolbar and this window repaint together.
-    /// `name` 可以是内置 id，也可以是磁盘主题族的 id / 变体名。
+    /// `name` 是 themes 目录里变体的注册名；历史配置文件里的族 id 仍可解析。
     fn set_appearance(&mut self, name: &str, cx: &mut Context<Self>) {
         self.open_select = None;
         if !self.settings.appearance.eq_ignore_ascii_case(name) {
@@ -3929,7 +3929,7 @@ impl SettingsView {
             cx,
             SelectId::Appearance,
             "外观模式",
-            "切换界面主题，立即生效并保存。",
+            "选择界面主题（来自 themes 目录），立即生效并保存。",
             self.appearance_label(),
             rows,
         );

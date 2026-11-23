@@ -126,11 +126,12 @@ pub fn apply_theme(theme: &Theme) {
     *guard = Some(palette);
 }
 
-/// 磁盘上的一个 gpui-kit 主题族。族名写进设置文件（深色变体加 `-dark`），
-/// light/dark key 是族内变体在 gpui-kit registry 里的注册名。
+/// 磁盘上的一个 gpui-kit 主题族。设置文件现在直接写变体在 registry 里的
+/// 注册名；light/dark key 只用于兼容历史配置文件里的族 id / `-dark` 写法。
 #[derive(Clone, Debug)]
 struct ThemeFamily {
-    /// 族名，如 "CitePix" / "Catppuccin"。
+    /// 族名，如 "CitePix" / "Catppuccin"。保留用于诊断输出。
+    #[allow(dead_code)]
     name: String,
     /// 设置文件里的稳定 id，目前就是族名。
     id: String,
@@ -211,7 +212,7 @@ fn theme_dirs() -> Vec<std::path::PathBuf> {
 }
 
 /// 扫描主题目录，把每个族的所有变体注册进 gpui-kit 并记下族映射。
-/// 目录缺失、文件损坏或注册失败都静默降级到内置主题，绝不影响启动。
+/// 目录缺失、文件损坏或注册失败都静默降级到 gpui-kit 默认主题，绝不影响启动。
 pub fn init_themes(cx: &mut gpui::App) {
     // 正常由 init() 在 gpui_kit::init 之后调用；单独调用时不 panic，静默跳过。
     if !cx.has_global::<ThemeRegistry>() {
@@ -300,31 +301,36 @@ fn family_theme_key(name: &str) -> Option<String> {
     family_key_in(&guard, name)
 }
 
-/// 设置页下拉用的 (id, 标签)：内置 10 项在前，随后是磁盘上发现的每个主题族。
-/// 族名直接作为标签；深色变体以 `-dark` 结尾并在标签后注明「深色」。
-pub fn available_themes() -> Vec<(String, String)> {
-    let mut options: Vec<(String, String)> = crate::config::APPEARANCES
+/// 设置页下拉用的 (id, 标签)：完全来自 themes 目录，按文件 / 族顺序列出每个
+/// 主题族的全部变体。id 与标签都是变体在 gpui-kit registry 里的注册名，
+/// 直接作为 `appearance` 写进设置文件。
+///
+/// 极端情况（目录缺失、全部文件损坏）下一个变体都没有时，回退到 gpui-kit
+/// 默认注册的两项，保证下拉不为空。
+fn theme_options_from(families: &[ThemeFamily]) -> Vec<(String, String)> {
+    let options: Vec<(String, String)> = families
         .iter()
-        .map(|&id| {
-            (
-                id.to_string(),
-                crate::config::appearance_label(id).to_string(),
-            )
-        })
+        .flat_map(|family| family.variants.iter().map(|key| (key.clone(), key.clone())))
         .collect();
-    let guard = families().read().unwrap_or_else(|e| e.into_inner());
-    for family in guard.iter() {
-        if family.light_key.is_some() {
-            options.push((family.id.clone(), family.name.clone()));
-        }
-        if family.dark_key.is_some() {
-            options.push((
-                format!("{}-dark", family.id),
-                format!("{}（深色）", family.name),
-            ));
-        }
+    if options.is_empty() {
+        return vec![
+            (
+                crate::config::DEFAULT_APPEARANCE.to_string(),
+                crate::config::DEFAULT_APPEARANCE.to_string(),
+            ),
+            (
+                crate::config::DEFAULT_DARK_APPEARANCE.to_string(),
+                crate::config::DEFAULT_DARK_APPEARANCE.to_string(),
+            ),
+        ];
     }
     options
+}
+
+/// 设置页下拉内容；变体列表在 `init_themes` 后不再变化，开窗时取一次即可。
+pub fn available_themes() -> Vec<(String, String)> {
+    let guard = families().read().unwrap_or_else(|e| e.into_inner());
+    theme_options_from(&guard)
 }
 
 /// Initializes gpui-kit (GPUI base, components and their globals), loads the
@@ -336,92 +342,36 @@ pub fn init(cx: &mut gpui::App) {
     set_appearance(cx, &crate::config::get().appearance);
 }
 
-/// Component palette for a named appearance.
-///
-/// Tinted variants only replace the primary / accent / selection tokens: the
-/// surface, foreground, border and input tokens stay at the mode defaults so
-/// body text keeps its light/dark contrast. For plain `light` / `dark` (or any
-/// unknown value) the untouched default palette is returned.
-fn themed_colors(name: &str) -> ThemeColor {
-    let dark = crate::config::appearance_dark(name);
-    let mut colors = if dark {
-        *ThemeColor::dark()
-    } else {
-        *ThemeColor::light()
-    };
-    let hex = match name.trim().to_ascii_lowercase().as_str() {
-        crate::config::APPEARANCE_BLUE | crate::config::APPEARANCE_BLUE_DARK => 0x3B82F6,
-        crate::config::APPEARANCE_GREEN | crate::config::APPEARANCE_GREEN_DARK => 0x22B14C,
-        crate::config::APPEARANCE_PURPLE | crate::config::APPEARANCE_PURPLE_DARK => 0xA855F7,
-        crate::config::APPEARANCE_ORANGE | crate::config::APPEARANCE_ORANGE_DARK => 0xFF8C00,
-        _ => return colors,
-    };
-    let base = Hsla::from(rgb(hex));
-    let shift = |delta: f32| hsla(base.h, base.s, (base.l + delta).clamp(0.0, 1.0), base.a);
-    colors.primary = base;
-    colors.primary_hover = shift(0.08);
-    colors.primary_active = shift(-0.08);
-    // 纯白或纯黑，保证按钮文字压在主题色上时始终可读。
-    colors.primary_foreground = if base.l > 0.55 {
-        hsla(0.0, 0.0, 0.0, 1.0)
-    } else {
-        hsla(0.0, 0.0, 1.0, 1.0)
-    };
-    colors.accent = base;
-    colors.accent_foreground = colors.primary_foreground;
-    // selection 仍作半透明选中底色，不用不透明的主题色盖住文字。
-    colors.selection = base.opacity(0.20);
-    colors
-}
-
 /// Switches appearance at runtime through the component theme, refreshes the
 /// snapshot, and asks every window (settings included) to repaint.
 ///
-/// A loaded theme family is applied with `Theme::apply_config`: it sets mode,
-/// colours and tokens in one step, so no built-in tint may be layered on top.
-/// Built-in appearances keep the old `Theme::change` + accent-edit path; the
-/// accent edit has to happen in a second `Theme::update` or it would be
-/// overwritten. `Theme::change`'s second argument is an unused
-/// `Option<&mut Window>`, not a colour.
+/// `name` 是 themes 目录里变体的注册名（下拉直接写这个名字）；历史配置文件里
+/// 的族 id（`Catppuccin` / `Catppuccin-dark`）仍由 `family_theme_key` 解析到
+/// 族内变体。明暗与颜色一概取自 registry 里的 `ThemeConfig`，不再叠加任何
+/// 人造 tint。找不到的名字回退到 gpui-kit 默认浅色变体，绝不 panic。
 pub fn set_appearance(cx: &mut gpui::App, name: &str) {
-    if let Some(key) = family_theme_key(name) {
-        let cfg = ThemeRegistry::global(cx)
+    let cfg = {
+        let registry = ThemeRegistry::global(cx);
+        let key = family_theme_key(name).unwrap_or_else(|| name.trim().to_string());
+        registry
             .themes()
             .get(&SharedString::from(key))
-            .cloned();
-        if let Some(cfg) = cfg {
-            Theme::update(cx, |t| t.apply_config(&cfg));
-            let theme = Theme::global(cx).clone();
-            apply_theme(&theme);
-            cx.refresh_windows();
-            return;
-        }
+            .cloned()
+            .or_else(|| {
+                registry
+                    .themes()
+                    .get(&SharedString::from(crate::config::DEFAULT_APPEARANCE))
+                    .cloned()
+            })
+            .or_else(|| registry.default_themes().get(&ThemeMode::Light).cloned())
+            .or_else(|| registry.themes().values().next().cloned())
+    };
+    if let Some(cfg) = cfg {
+        Theme::update(cx, |t| t.apply_config(&cfg));
+        let theme = Theme::global(cx).clone();
+        apply_theme(&theme);
+        cx.refresh_windows();
     }
-
-    let mode = if crate::config::appearance_dark(name) {
-        ThemeMode::Dark
-    } else {
-        ThemeMode::Light
-    };
-    // 从主题族切回内置主题时先清掉族写入的 light/dark 配置，否则
-    // Theme::change 会按当前 mode 再把上一次的族主题加载回来。
-    let (light, dark) = {
-        let registry = ThemeRegistry::global(cx);
-        (
-            registry.default_light_theme().clone(),
-            registry.default_dark_theme().clone(),
-        )
-    };
-    Theme::update(cx, |t| {
-        t.light_theme = light;
-        t.dark_theme = dark;
-    });
-    Theme::change(mode, None, cx);
-    let colors = themed_colors(name);
-    Theme::update(cx, |t| t.colors = colors);
-    let theme = Theme::global(cx).clone();
-    apply_theme(&theme);
-    cx.refresh_windows();
 }
 
 /// Historical light/dark entry point, kept for callers that only have a bool.
@@ -430,9 +380,9 @@ pub fn set_dark(cx: &mut gpui::App, dark: bool) {
     set_appearance(
         cx,
         if dark {
-            crate::config::APPEARANCE_DARK
+            crate::config::DEFAULT_DARK_APPEARANCE
         } else {
-            crate::config::APPEARANCE_LIGHT
+            crate::config::DEFAULT_APPEARANCE
         },
     );
 }
@@ -591,16 +541,6 @@ mod tests {
         palette_from(&theme)
     }
 
-    fn themed_palette(name: &str) -> Palette {
-        let mut theme = Theme::from(&themed_colors(name));
-        theme.mode = if crate::config::appearance_dark(name) {
-            ThemeMode::Dark
-        } else {
-            ThemeMode::Light
-        };
-        palette_from(&theme)
-    }
-
     #[test]
     fn light_and_dark_resolve_different_readable_palettes() {
         let light = light();
@@ -634,55 +574,32 @@ mod tests {
         assert!(dark.shadow.l < 0.2);
     }
 
+    /// 变体配置的应用逻辑：明暗、圆角和主色都来自 `ThemeConfig`，
+    /// 这正是 `set_appearance` 通过 `Theme::apply_config` 走的路径。
     #[test]
-    fn tinted_themes_recolour_only_the_accents() {
-        use crate::config::{
-            APPEARANCE_BLUE, APPEARANCE_BLUE_DARK, APPEARANCE_GREEN, APPEARANCE_GREEN_DARK,
-            APPEARANCE_ORANGE, APPEARANCE_ORANGE_DARK, APPEARANCE_PURPLE, APPEARANCE_PURPLE_DARK,
-        };
+    fn applying_a_variant_config_sets_mode_and_tokens() {
+        use std::rc::Rc;
 
-        let light = light();
-        let dark = dark();
-        let pairs = [
-            (APPEARANCE_BLUE, APPEARANCE_BLUE_DARK),
-            (APPEARANCE_GREEN, APPEARANCE_GREEN_DARK),
-            (APPEARANCE_ORANGE, APPEARANCE_ORANGE_DARK),
-            (APPEARANCE_PURPLE, APPEARANCE_PURPLE_DARK),
-        ];
-        let mut primaries = Vec::new();
-        for &(light_name, dark_name) in &pairs {
-            let tinted = themed_palette(light_name);
-            let tinted_dark = themed_palette(dark_name);
-            // 四种主题色的 primary 两两不同，且与默认色不同。
-            assert!(!primaries.contains(&rgb_of(tinted.primary)), "{light_name}");
-            primaries.push(rgb_of(tinted.primary));
-            assert_ne!(rgb_of(tinted.primary), rgb_of(light.primary));
-            assert_ne!(rgb_of(tinted_dark.primary), rgb_of(dark.primary));
-            // 同一主题色的浅/深变体共享 primary，只换底色。
-            assert_eq!(rgb_of(tinted.primary), rgb_of(tinted_dark.primary));
-            // 控件填充上的文字始终有对比，selection 保持半透明。
-            assert!((tinted.primary.l - tinted.primary_foreground.l).abs() > 0.4);
-            assert!((tinted_dark.primary.l - tinted_dark.primary_foreground.l).abs() > 0.4);
-            assert!(tinted.selection.a < 1.0);
-            assert!(tinted_dark.selection.a < 1.0);
-            // 背景与正文仍取自对应模式，可读性不因换主题色而回退。
-            assert_eq!(rgb_of(tinted.surface), rgb_of(light.surface));
-            assert_eq!(rgb_of(tinted.foreground), rgb_of(light.foreground));
-            assert_eq!(rgb_of(tinted.input), rgb_of(light.input));
-            assert_eq!(rgb_of(tinted_dark.surface), rgb_of(dark.surface));
-            assert_eq!(rgb_of(tinted_dark.foreground), rgb_of(dark.foreground));
-            assert_eq!(rgb_of(tinted_dark.input), rgb_of(dark.input));
-            // 底色依旧一浅一深。
-            assert!(tinted.surface.l > 0.9, "{light_name}");
-            assert!(tinted_dark.surface.l < 0.2, "{dark_name}");
-        }
-        assert_eq!(primaries.len(), 4);
-        // 普通 light/dark 不引入自定义色。
-        assert_eq!(
-            rgb_of(themed_palette("light").primary),
-            rgb_of(light.primary)
-        );
-        assert_eq!(rgb_of(themed_palette("dark").primary), rgb_of(dark.primary));
+        use gpui_kit::component::ThemeConfig;
+
+        let config: ThemeConfig = serde_json::from_value(serde_json::json!({
+            "name": "Catppuccin Mocha",
+            "mode": "dark",
+            "radius": 12,
+            "colors": { "primary.background": "#A6E3A1", "background": "#1E1E2E" }
+        }))
+        .expect("parses variant config");
+        let config = Rc::new(config);
+        let mut theme = light_theme();
+        assert!(!theme.is_dark());
+
+        theme.apply_config(&config);
+        assert!(theme.is_dark());
+        assert_eq!(theme.radius, gpui::px(12.));
+        let palette = palette_from(&theme);
+        assert!(palette.dark);
+        assert_eq!(rgb_of(palette.primary), rgb_of(Hsla::from(rgb(0xA6E3A1))));
+        assert_eq!(rgb_of(palette.surface), rgb_of(Hsla::from(rgb(0x1E1E2E))));
     }
 
     #[test]
@@ -699,14 +616,14 @@ mod tests {
         apply_theme(&t);
         assert_eq!(once, current());
 
-        // 带主题色的快照同样可重复应用：set_appearance 连续调用不会漂移。
-        let mut tinted = Theme::from(&themed_colors(crate::config::APPEARANCE_PURPLE));
-        tinted.mode = ThemeMode::Light;
-        apply_theme(&tinted);
-        let colored = current();
-        apply_theme(&tinted);
-        assert_eq!(colored, current());
-        assert_ne!(colored.primary, once.primary);
+        // 切换变体后再重复应用同样不漂移。
+        let mut other = Theme::from(&*ThemeColor::light());
+        other.mode = ThemeMode::Light;
+        apply_theme(&other);
+        let light = current();
+        apply_theme(&other);
+        assert_eq!(light, current());
+        assert_ne!(light.primary, once.primary);
     }
 
     #[test]
@@ -788,6 +705,52 @@ mod tests {
         assert!(parse_family("not json").is_none());
     }
 
+    /// 下拉只列 themes 目录的真实变体，id / 标签都是注册名；空目录回退默认两项。
+    #[test]
+    fn available_themes_list_every_variant_in_family_order() {
+        let option = |name: &str| (name.to_string(), name.to_string());
+        let families = vec![
+            parse_family(
+                r#"{
+                    "name": "Catppuccin",
+                    "themes": [
+                        {"name": "Catppuccin Latte", "mode": "light"},
+                        {"name": "Catppuccin Frappe", "mode": "dark"},
+                        {"name": "Catppuccin Mocha", "mode": "dark"}
+                    ]
+                }"#,
+            )
+            .unwrap(),
+            parse_family(
+                r#"{
+                    "name": "CitePix",
+                    "themes": [
+                        {"name": "CitePix Light", "mode": "light"},
+                        {"name": "CitePix Dark", "mode": "dark"}
+                    ]
+                }"#,
+            )
+            .unwrap(),
+        ];
+        assert_eq!(
+            theme_options_from(&families),
+            vec![
+                option("Catppuccin Latte"),
+                option("Catppuccin Frappe"),
+                option("Catppuccin Mocha"),
+                option("CitePix Light"),
+                option("CitePix Dark"),
+            ]
+        );
+        assert_eq!(
+            theme_options_from(&[]),
+            vec![
+                option(crate::config::DEFAULT_APPEARANCE),
+                option(crate::config::DEFAULT_DARK_APPEARANCE),
+            ]
+        );
+    }
+
     #[test]
     fn family_ids_and_variant_names_resolve_to_registry_keys() {
         let families = vec![
@@ -831,8 +794,11 @@ mod tests {
             family_key_in(&families, " Adventure ").as_deref(),
             Some("Adventure")
         );
-        // 内置 id 不能误命中主题族。
-        assert_eq!(family_key_in(&families, "light"), None);
+        // 默认主题名等非主题族值不能误命中主题族。
+        assert_eq!(
+            family_key_in(&families, crate::config::DEFAULT_APPEARANCE),
+            None
+        );
         assert_eq!(family_key_in(&families, ""), None);
     }
 }

@@ -454,7 +454,7 @@ pub const ROWS: &[RowMeta] = &[
     RowMeta {
         page: Page::Appearance,
         title: "外观模式",
-        desc: "切换界面主题，立即生效并保存。",
+        desc: "选择界面主题（来自 themes 目录），立即生效并保存。",
     },
     // 快捷键
     RowMeta {
@@ -795,7 +795,7 @@ mod tests {
         s.hotkeys.region = "Ctrl+Shift+1".into();
         s.hotkeys.copy_only = "Ctrl+Shift+2".into();
         s.hotkeys.fullscreen = "Ctrl+Shift+3".into();
-        s.appearance = crate::config::APPEARANCE_PURPLE.into();
+        s.appearance = "Catppuccin Latte".into();
         s.history.enabled = false;
         s.history.dir = Some("D:/history".into());
         s.history.retention_days = 30;
@@ -969,18 +969,18 @@ mod tests {
         assert_eq!(search("OPENAI").len(), by_desc.len());
     }
 
-    /// 外观行的描述已改为「切换界面主题」，搜索与重置测试都要覆盖新文案。
+    /// 外观行的描述指向 themes 目录，搜索与重置测试都要覆盖新文案。
     #[test]
     fn appearance_row_search_and_reset_use_the_new_wording() {
-        let hits = search("切换界面主题");
+        let hits = search("来自 themes 目录");
         assert!(hits
             .iter()
             .any(|r| r.page == Page::Appearance && r.title == "外观模式"));
 
         let mut s = all_non_default();
-        assert_eq!(s.appearance, crate::config::APPEARANCE_PURPLE);
+        assert_eq!(s.appearance, "Catppuccin Latte");
         assert!(reset_page(&mut s, Page::Appearance));
-        assert_eq!(s.appearance, crate::config::APPEARANCE_LIGHT);
+        assert_eq!(s.appearance, crate::config::DEFAULT_APPEARANCE);
     }
 
     /// The pre-lowered cache must give exactly the same answers as lowering
@@ -1079,7 +1079,7 @@ mod tests {
                     && s.screenshot.split.overlap_width == 0
             }
             Page::Hotkey => s.hotkeys.region == "Ctrl+Alt+A",
-            Page::Appearance => s.appearance == crate::config::APPEARANCE_LIGHT,
+            Page::Appearance => s.appearance == crate::config::DEFAULT_APPEARANCE,
             Page::Translate => {
                 s.translation.model == "gpt-4o-mini" && !s.translation.allow_insecure_http
             }

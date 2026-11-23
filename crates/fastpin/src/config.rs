@@ -21,66 +21,28 @@ pub struct Settings {
     pub screenshot: Screenshot,
     pub history: History,
     pub hotkeys: Hotkeys,
-    /// UI appearance: `"light"` (default), `"dark"`, a tinted variant such as
-    /// `"blue"` / `"blue-dark"`, or a loaded theme family such as
-    /// `"Catppuccin"` / `"Catppuccin-dark"`. A plain string keeps the file
-    /// hand-editable, same rationale as the hotkey strings; an unknown value
-    /// falls back to light instead of failing the whole file.
+    /// UI 外观：themes 目录里主题变体的注册名（如 `"Catppuccin Latte"`、
+    /// `"CitePix Dark"`），默认 `"Default Light"`（gpui-kit 自带变体）。
+    /// 纯字符串保持配置文件可手改；未知值在启动时回退到默认浅色主题，
+    /// 不会让整个配置文件失效。
     pub appearance: String,
 }
 
-/// Stored values of `Settings::appearance`. Tinted variants keep the light or
-/// dark surface of their base mode and only recolour the chrome accents.
-pub const APPEARANCE_LIGHT: &str = "light";
-pub const APPEARANCE_DARK: &str = "dark";
-pub const APPEARANCE_BLUE: &str = "blue";
-pub const APPEARANCE_GREEN: &str = "green";
-pub const APPEARANCE_PURPLE: &str = "purple";
-pub const APPEARANCE_ORANGE: &str = "orange";
-pub const APPEARANCE_BLUE_DARK: &str = "blue-dark";
-pub const APPEARANCE_GREEN_DARK: &str = "green-dark";
-pub const APPEARANCE_PURPLE_DARK: &str = "purple-dark";
-pub const APPEARANCE_ORANGE_DARK: &str = "orange-dark";
+/// gpui-kit 默认浅色变体在 `ThemeRegistry` 里的注册名，也是 `appearance` 的默认值。
+pub const DEFAULT_APPEARANCE: &str = "Default Light";
+/// gpui-kit 默认深色变体的注册名，仅供 light/dark 布尔入口与下拉回退使用。
+pub const DEFAULT_DARK_APPEARANCE: &str = "Default Dark";
 
-/// Built-in values of [`Settings::appearance`], in display order. Theme
-/// families discovered on disk are appended by `overlay::theme::available_themes`.
-pub const APPEARANCES: [&str; 10] = [
-    APPEARANCE_LIGHT,
-    APPEARANCE_DARK,
-    APPEARANCE_BLUE,
-    APPEARANCE_GREEN,
-    APPEARANCE_PURPLE,
-    APPEARANCE_ORANGE,
-    APPEARANCE_BLUE_DARK,
-    APPEARANCE_GREEN_DARK,
-    APPEARANCE_PURPLE_DARK,
-    APPEARANCE_ORANGE_DARK,
-];
-
-/// Whether a stored appearance uses the dark base palette. Every tinted variant
-/// and every loaded theme family carries a `-dark` suffix; anything else
-/// (including an empty or hand-edited value) reads as light.
+/// 旧版 `dark()` 的明暗启发式：真实变体的明暗由 `ThemeConfig.mode` 决定，
+/// 这里只按名字猜测，供纯逻辑调用方与测试兼容，UI 不再依赖。
 pub fn appearance_dark(name: &str) -> bool {
-    let name = name.trim();
-    name.eq_ignore_ascii_case(APPEARANCE_DARK) || name.to_ascii_lowercase().ends_with("-dark")
+    name.trim().to_ascii_lowercase().contains("dark")
 }
 
-/// Chinese label shown in the settings dropdown. Unknown values read as light,
-/// matching [`Settings::dark`].
-pub fn appearance_label(name: &str) -> &'static str {
-    let name = name.trim().to_ascii_lowercase();
-    match name.as_str() {
-        APPEARANCE_DARK => "深色",
-        APPEARANCE_BLUE => "蓝色",
-        APPEARANCE_GREEN => "绿色",
-        APPEARANCE_PURPLE => "紫色",
-        APPEARANCE_ORANGE => "橙色",
-        APPEARANCE_BLUE_DARK => "深蓝",
-        APPEARANCE_GREEN_DARK => "深绿",
-        APPEARANCE_PURPLE_DARK => "深紫",
-        APPEARANCE_ORANGE_DARK => "深橙",
-        _ => "浅色",
-    }
+/// 兼容用途：真实变体的标签就是注册名本身，下拉由 `theme::available_themes`
+/// 提供；这里原样返回手改的配置值，方便在设置页发现拼写错误。
+pub fn appearance_label(name: &str) -> String {
+    name.trim().to_string()
 }
 
 impl Default for Settings {
@@ -91,14 +53,14 @@ impl Default for Settings {
             screenshot: Screenshot::default(),
             history: History::default(),
             hotkeys: Hotkeys::default(),
-            appearance: APPEARANCE_LIGHT.into(),
+            appearance: DEFAULT_APPEARANCE.into(),
         }
     }
 }
 
 impl Settings {
-    /// Whether the persisted appearance uses a dark base. Kept for callers
-    /// that only care about light/dark; the tinted variants answer here too.
+    /// 仅按名字猜测明暗，供纯逻辑调用方与测试兼容；真实变体的明暗由
+    /// 应用主题时的 `ThemeConfig.mode` 决定，UI 不再依赖这里。
     pub fn dark(&self) -> bool {
         appearance_dark(&self.appearance)
     }
@@ -1505,84 +1467,75 @@ mod tests {
         assert!(!s.screenshot.export.auto_save);
         assert!(s.screenshot.export.auto_copy);
         assert_eq!(s.hotkeys.region, Hotkeys::default().region);
-        // A file written before the appearance field existed starts light.
-        assert_eq!(s.appearance, APPEARANCE_LIGHT);
+        // A file written before the appearance field existed starts with the
+        // gpui-kit default light variant.
+        assert_eq!(s.appearance, DEFAULT_APPEARANCE);
         assert!(!s.dark());
     }
 
     #[test]
-    fn appearance_roundtrips_and_unknown_values_stay_light() {
-        let s = Settings {
-            appearance: APPEARANCE_DARK.into(),
-            ..Default::default()
-        };
-        let json = serde_json::to_string_pretty(&s).expect("serializes");
-        assert!(json.contains("\"appearance\": \"dark\""), "{json}");
-        assert!(parse(&json).dark());
-
-        let back = parse(r#"{"appearance": "dark"}"#);
-        assert!(back.dark());
-        assert!(!parse(r#"{"appearance": "nonsense"}"#).dark());
-        assert!(!parse(r#"{"appearance": ""}"#).dark());
-        assert_eq!(Settings::default().appearance, APPEARANCE_LIGHT);
-
-        // 每种主题色（含深色变体）都能原样写入并读回。
-        for name in APPEARANCES {
+    fn appearance_variant_names_roundtrip() {
+        assert_eq!(Settings::default().appearance, DEFAULT_APPEARANCE);
+        // 变体注册名（含空格）原样写入、原样读回，不依赖任何内置 tint id。
+        for name in [
+            DEFAULT_APPEARANCE,
+            DEFAULT_DARK_APPEARANCE,
+            "Catppuccin Latte",
+            "Catppuccin Mocha",
+            "CitePix Dark",
+            "Tokyo Storm",
+        ] {
             let s = Settings {
                 appearance: name.into(),
                 ..Default::default()
             };
-            let json = serde_json::to_string(&s).expect("serializes");
+            let json = serde_json::to_string_pretty(&s).expect("serializes");
+            assert!(
+                json.contains(&format!("\"appearance\": \"{name}\"")),
+                "{json}"
+            );
             let back = parse(&json);
             assert_eq!(back.appearance, name, "{name}");
-            assert_eq!(back.dark(), appearance_dark(name), "{name}");
         }
+        // 手改的未知值也不会让整个配置文件失效；主题切换时回退默认浅色。
+        let unknown = parse(r#"{"appearance": "nonsense"}"#);
+        assert_eq!(unknown.appearance, "nonsense");
+        assert!(!unknown.dark());
     }
 
     #[test]
-    fn appearance_dark_and_label_cover_every_variant() {
-        // 深色底只有 dark 和 *-dark；其余一律按浅色处理。
-        let expected_dark = [
-            false, true, false, false, false, false, true, true, true, true,
-        ];
-        let labels = [
-            "浅色", "深色", "蓝色", "绿色", "紫色", "橙色", "深蓝", "深绿", "深紫", "深橙",
-        ];
-        for (i, name) in APPEARANCES.iter().enumerate() {
-            assert_eq!(appearance_dark(name), expected_dark[i], "{name}");
-            assert_eq!(appearance_label(name), labels[i], "{name}");
-            // 大小写和空白来自手工编辑，不能改变判定结果。
-            let noisy = format!("  {}  ", name.to_ascii_uppercase());
-            assert_eq!(appearance_dark(&noisy), expected_dark[i], "{name}");
-            assert_eq!(appearance_label(&noisy), labels[i], "{name}");
+    fn appearance_dark_and_label_are_compatibility_helpers() {
+        // 真实明暗由 ThemeConfig.mode 决定；这里只验证历史名字启发式。
+        assert!(!appearance_dark(DEFAULT_APPEARANCE));
+        for name in [
+            DEFAULT_DARK_APPEARANCE,
+            "CitePix Dark",
+            "macOS Classic Dark",
+            "legacy-dark",
+            "DARK",
+        ] {
+            assert!(appearance_dark(name), "{name}");
         }
+        assert!(!appearance_dark("Catppuccin Mocha"));
         assert!(!appearance_dark(""));
         assert!(!appearance_dark("nonsense"));
-        assert_eq!(appearance_label("nonsense"), "浅色");
-        assert_eq!(appearance_label(""), "浅色");
+        // 标签保持注册名原文，空白由手工编辑产生时会被去掉。
+        assert_eq!(appearance_label("  Catppuccin Latte  "), "Catppuccin Latte");
+        assert_eq!(appearance_label("nonsense"), "nonsense");
+        assert_eq!(appearance_label(""), "");
     }
 
     #[test]
-    fn theme_family_ids_use_the_dark_suffix() {
-        // 主题族名直接写入 appearance；深色变体在族名后加 -dark。
-        for family in ["Catppuccin", "CitePix", "macOS Classic"] {
-            assert!(!appearance_dark(family), "{family}");
-            let dark = format!("{family}-dark");
-            assert!(appearance_dark(&dark), "{dark}");
-            // 手工编辑的大小写与空白不能改变判定。
-            assert!(appearance_dark(&format!(
-                "  {}  ",
-                dark.to_ascii_uppercase()
-            )));
-
+    fn theme_variant_names_do_not_need_a_dark_suffix() {
+        // 变体名直接写进 appearance，深色变体不再要求 -dark 后缀。
+        for name in ["Catppuccin Mocha", "CitePix Dark", "Adventure"] {
             let settings = Settings {
-                appearance: dark.clone(),
+                appearance: name.into(),
                 ..Default::default()
             };
             let json = serde_json::to_string(&settings).expect("serializes");
             let back = parse(&json);
-            assert_eq!(back.appearance, dark);
-            assert!(back.dark());
+            assert_eq!(back.appearance, name);
         }
     }
 

@@ -113,7 +113,7 @@ impl Default for Translation {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Screenshot {
     /// Toolbar ids the user turned off. Empty keeps every tool on the bar,
@@ -126,7 +126,7 @@ pub struct Screenshot {
     /// Exported-image watermark (text and/or image). Empty by default — the
     /// export composite only touches the image when this is visible.
     pub watermark: Watermark,
-    /// How the region picker snaps to windows. See [`SmartSelection`].
+    /// How the region picker snaps to windows. See [`SmartSelectionMode`].
     pub smart_selection: SmartSelectionMode,
     /// Auto-scroll cadence for long screenshots. See [`AutoScroll`].
     pub auto_scroll: AutoScroll,
@@ -140,6 +140,67 @@ pub struct Screenshot {
     /// 与 collage / pdf 不同，这里直接复用可序列化的 `imagesplit::SplitSettings`，
     /// 由图片切图窗口的 setter 逐项写回。
     pub split: crate::imagesplit::SplitSettings,
+    /// 截屏时使用的捕获方式。
+    pub capture_mode: CaptureMode,
+    /// 截屏结果中是否显示鼠标光标。
+    pub show_cursor: bool,
+    /// 开始截屏且尚未创建选区时是否自动显示辅助线。
+    pub show_guides: bool,
+    /// 进入长截屏工具时的开始策略。
+    pub long_capture_auto_start: LongCaptureAutoStart,
+    /// 选区完成后双击左键执行的操作。
+    pub left_double_click: ClickAction,
+    /// 选区完成后单击中键执行的操作。
+    pub middle_click: ClickAction,
+    /// 点击选区外时的行为。
+    pub click_outside: ClickOutside,
+    /// 自动记录到历史图片的截屏类型。
+    pub record_history_sources: Vec<String>,
+    /// 截屏工具栏的位置策略。
+    pub toolbar_position: ToolbarPosition,
+    /// 参数面板的位置策略。
+    pub panel_position: PanelPosition,
+    /// 是否在鼠标附近显示像素放大预览和当前颜色信息。
+    pub show_magnifier: bool,
+    /// 是否在选区附近显示尺寸、圆角和比例等信息。
+    pub show_info_bar: bool,
+    /// 是否每次开始截屏时显示当前阶段可用的快捷键提示。
+    pub show_shortcut_hints: bool,
+}
+
+impl Default for Screenshot {
+    fn default() -> Self {
+        Self {
+            hidden_toolbar_items: Vec::new(),
+            save_dir: None,
+            annotation: Annotation::default(),
+            watermark: Watermark::default(),
+            smart_selection: SmartSelectionMode::default(),
+            auto_scroll: AutoScroll::default(),
+            export: Export::default(),
+            collage: CollageSettings::default(),
+            pdf: PdfSettings::default(),
+            split: crate::imagesplit::SplitSettings::default(),
+            capture_mode: CaptureMode::default(),
+            show_cursor: false,
+            show_guides: false,
+            long_capture_auto_start: LongCaptureAutoStart::default(),
+            left_double_click: ClickAction::default(),
+            middle_click: ClickAction::default(),
+            click_outside: ClickOutside::default(),
+            record_history_sources: vec![
+                "region".into(),
+                "copyOnly".into(),
+                "fullscreen".into(),
+                "currentWindow".into(),
+            ],
+            toolbar_position: ToolbarPosition::default(),
+            panel_position: PanelPosition::default(),
+            show_magnifier: true,
+            show_info_bar: true,
+            show_shortcut_hints: true,
+        }
+    }
 }
 
 /// Long-capture auto-scroll cadence, persisted so the settings page can honour
@@ -743,12 +804,12 @@ impl SmartSelectionMode {
         }
     }
 
-    /// Short label for the picker's mode switch.
+    /// Short label for the picker's mode switch. Mirrors the 元素检测 options.
     pub fn label(self) -> &'static str {
         match self {
-            Self::WindowSubElement => "子元素",
-            Self::Window => "整窗",
-            Self::Disabled => "禁用",
+            Self::WindowSubElement => "窗口与元素",
+            Self::Window => "仅窗口",
+            Self::Disabled => "不检测",
         }
     }
 
@@ -761,6 +822,218 @@ impl SmartSelectionMode {
     /// Whether candidates include the panes inside a window.
     pub fn wants_sub_elements(self) -> bool {
         self == Self::WindowSubElement
+    }
+}
+
+/// 截屏时使用的捕获方式。自动模式由运行时根据系统环境挑选最佳实现。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptureMode {
+    /// 根据系统环境选择最佳方式。
+    #[default]
+    Auto,
+    /// Windows Graphics Capture。
+    Wgc,
+    /// Desktop Duplication API。
+    Dxgi,
+}
+
+impl CaptureMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Wgc, Self::Dxgi];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Wgc => "wgc",
+            Self::Dxgi => "dxgi",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动（推荐）",
+            Self::Wgc => "WGC",
+            Self::Dxgi => "DXGI",
+        }
+    }
+}
+
+/// 进入长截屏工具时的开始策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LongCaptureAutoStart {
+    /// 进入工具后自动开始滚动截取。
+    #[default]
+    Auto,
+    /// 由用户手动点击开始。
+    Manual,
+}
+
+impl LongCaptureAutoStart {
+    pub const ALL: [Self; 2] = [Self::Auto, Self::Manual];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动开始（默认）",
+            Self::Manual => "手动开始",
+        }
+    }
+}
+
+/// 选区完成后鼠标按键触发的操作；左键双击与中键单击共用同一组选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClickAction {
+    /// 不执行任何操作。
+    #[default]
+    None,
+    /// 完成当前截屏。
+    Complete,
+    /// 复制图片到剪贴板。
+    Copy,
+    /// 保存图片到文件。
+    Save,
+}
+
+impl ClickAction {
+    pub const ALL: [Self; 4] = [Self::None, Self::Complete, Self::Copy, Self::Save];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Complete => "complete",
+            Self::Copy => "copy",
+            Self::Save => "save",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "无",
+            Self::Complete => "完成截屏",
+            Self::Copy => "复制到剪贴板",
+            Self::Save => "保存到文件",
+        }
+    }
+}
+
+/// 点击选区外时的行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClickOutside {
+    /// 扩展现有选区。
+    #[default]
+    Expand,
+    /// 丢弃现有选区并重新创建。
+    Recreate,
+}
+
+impl ClickOutside {
+    pub const ALL: [Self; 2] = [Self::Expand, Self::Recreate];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Expand => "expand",
+            Self::Recreate => "recreate",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Expand => "扩展选区（默认）",
+            Self::Recreate => "重新创建",
+        }
+    }
+}
+
+/// 截屏工具栏相对选区的位置策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolbarPosition {
+    /// 跟随选区移动。
+    #[default]
+    FollowSelection,
+    /// 记住上一次的位置。
+    Remember,
+    /// 固定在选区所在屏幕的顶部。
+    Top,
+    /// 固定在选区所在屏幕的底部。
+    Bottom,
+}
+
+impl ToolbarPosition {
+    pub const ALL: [Self; 4] = [
+        Self::FollowSelection,
+        Self::Remember,
+        Self::Top,
+        Self::Bottom,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::FollowSelection => "followSelection",
+            Self::Remember => "remember",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FollowSelection => "跟随选区",
+            Self::Remember => "记住位置",
+            Self::Top => "顶部",
+            Self::Bottom => "底部",
+        }
+    }
+}
+
+/// 参数面板相对选区的位置策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PanelPosition {
+    /// 跟随选区移动。
+    #[default]
+    FollowSelection,
+    /// 记住上一次的位置。
+    Remember,
+    /// 固定在选区所在屏幕的左侧。
+    Left,
+    /// 固定在选区所在屏幕的右侧。
+    Right,
+}
+
+impl PanelPosition {
+    pub const ALL: [Self; 4] = [
+        Self::FollowSelection,
+        Self::Remember,
+        Self::Left,
+        Self::Right,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::FollowSelection => "followSelection",
+            Self::Remember => "remember",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FollowSelection => "跟随选区",
+            Self::Remember => "记住位置",
+            Self::Left => "左侧",
+            Self::Right => "右侧",
+        }
     }
 }
 

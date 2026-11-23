@@ -234,9 +234,10 @@ pub(crate) fn capture_region_live(
     }
 }
 
-/// Pin copy / save: tight BGRA, already composited, no marks to apply.
+/// Pin copy / save: tight BGRA, already composited, no marks to apply. Pins
+/// start from a region crop, so their history records use the region source.
 pub(crate) fn export_pin_pixels(px: Vec<u8>, w: u32, h: u32, write_file: bool, copy: bool) {
-    export_pixels_async(px, w, h, w * 4, write_file, copy, None);
+    export_pixels_async(px, w, h, w * 4, write_file, copy, None, "region");
 }
 
 /// Release builds are Windows-subsystem, so a shell-launched process starts with
@@ -952,7 +953,7 @@ fn take_shot(action: HotkeyAction) -> Result<ShotFlow> {
             let (x, y, w, h) = (0, 0, cap.width, cap.height);
             let (px, cw, ch, stride) = with_gpui_app(|cx| crop_from_app(cx, &cap, x, y, w, h))
                 .unwrap_or_else(|| Err(Error::new("GPUI app unavailable")))?;
-            export_pixels(px, cw, ch, stride, true, true)?;
+            export_pixels(px, cw, ch, stride, true, true, "fullscreen")?;
             let _ = perf.write_log();
             Ok(ShotFlow::Finished)
         }
@@ -963,12 +964,13 @@ pub(crate) fn complete_region_shot(
     result: OverlayResult,
     cap: Option<CapturedDesktop>,
     perf: Option<PerfSession>,
+    source: &'static str,
     cx: &mut App,
 ) {
     let bench = crate::overlay::bench_auto_hide_enabled();
     if result.confirmed && !bench {
         if let Some(cap) = cap {
-            export_annotated_region(cx, &cap, &result);
+            export_annotated_region(cx, &cap, &result, source);
         }
     }
     let mut sample = None;
@@ -990,11 +992,25 @@ pub(crate) fn complete_region_shot(
     }
 }
 
-pub(crate) fn export_annotated_region(cx: &mut App, cap: &CapturedDesktop, result: &OverlayResult) {
+pub(crate) fn export_annotated_region(
+    cx: &mut App,
+    cap: &CapturedDesktop,
+    result: &OverlayResult,
+    source: &'static str,
+) {
     match crop_from_app(cx, cap, result.x, result.y, result.w, result.h) {
         Ok((px, cw, ch, stride)) => {
             let marks = Some((result.x as f64, result.y as f64, result.marks.clone()));
-            export_pixels_async(px, cw, ch, stride, result.write_file, result.copy, marks);
+            export_pixels_async(
+                px,
+                cw,
+                ch,
+                stride,
+                result.write_file,
+                result.copy,
+                marks,
+                source,
+            );
         }
         Err(e) => crate::perf::log_app(&format!("crop failed: {e}")),
     }
@@ -1005,6 +1021,7 @@ pub(crate) fn export_annotated_region(cx: &mut App, cap: &CapturedDesktop, resul
 /// after that -- rasterizing marks, the clipboard DIB copy, the PNG encode --
 /// is pure CPU work that would otherwise run before the overlay window gets a
 /// chance to hide on the next frame.
+#[allow(clippy::too_many_arguments)]
 fn export_pixels_async(
     mut px: Vec<u8>,
     cw: u32,
@@ -1013,6 +1030,7 @@ fn export_pixels_async(
     write_file: bool,
     copy: bool,
     marks: Option<(f64, f64, Vec<Element>)>,
+    source: &'static str,
 ) {
     std::thread::spawn(move || {
         // default_png_path -> SHGetKnownFolderPath is COM; this is a fresh thread.
@@ -1025,7 +1043,7 @@ fn export_pixels_async(
         if let Some((ox, oy, marks)) = marks {
             apply_annotations(&mut px, cw, ch, stride, ox, oy, &marks);
         }
-        if let Err(e) = export_pixels(px, cw, ch, stride, write_file, copy) {
+        if let Err(e) = export_pixels(px, cw, ch, stride, write_file, copy, source) {
             crate::perf::log_app(&format!("export failed: {e}"));
         }
     });
@@ -1038,16 +1056,26 @@ fn export_pixels(
     stride: u32,
     write_file: bool,
     copy: bool,
+    source: &'static str,
 ) -> Result<()> {
     // Full-screen 4K is ~33 MB; share it with the writer thread instead of cloning.
-    export_pixels_shared(std::sync::Arc::new(px), cw, ch, stride, write_file, copy)
+    export_pixels_shared_with_source(
+        std::sync::Arc::new(px),
+        cw,
+        ch,
+        stride,
+        write_file,
+        copy,
+        source,
+    )
 }
 
 /// Same export, but the caller already holds the buffer behind an `Arc`.
 ///
 /// The long-capture preview window keeps the stitched pixels alive for its own
 /// rendering, so it can hand the same allocation here instead of cloning what
-/// can be a 16384 px tall buffer on the UI thread.
+/// can be a 16384 px tall buffer on the UI thread. Long captures start from a
+/// region selection, so their records carry the `region` source tag.
 pub(crate) fn export_pixels_shared(
     px: std::sync::Arc<Vec<u8>>,
     cw: u32,
@@ -1055,6 +1083,21 @@ pub(crate) fn export_pixels_shared(
     stride: u32,
     write_file: bool,
     copy: bool,
+) -> Result<()> {
+    export_pixels_shared_with_source(px, cw, ch, stride, write_file, copy, "region")
+}
+
+/// Same as [`export_pixels_shared`] with an explicit capture-origin tag for the
+/// per-source history filter. `&'static str` because every caller passes a
+/// literal, which also keeps the tag safe to move into the export threads.
+fn export_pixels_shared_with_source(
+    px: std::sync::Arc<Vec<u8>>,
+    cw: u32,
+    ch: u32,
+    stride: u32,
+    write_file: bool,
+    copy: bool,
+    source: &'static str,
 ) -> Result<()> {
     if write_file {
         let mut export = crate::config::get().screenshot.export.clone();
@@ -1091,7 +1134,7 @@ pub(crate) fn export_pixels_shared(
                     export.format.extension(),
                     cw,
                     ch,
-                    "saved_to_file",
+                    source,
                 );
             }
         });
@@ -1114,9 +1157,9 @@ pub(crate) fn export_pixels_shared(
                 crate::perf::log_app(&format!("clipboard: {cw}x{ch} copied"));
                 // Copy-only captures (no saved file) still get a history record
                 // so copied screenshots appear in the gallery, mirroring
-                // CitePix. When the same capture also wrote a file, the
-                // saved_to_file record is the canonical one and we don't
-                // duplicate it here. History failures never fail the copy.
+                // CitePix. When the same capture also wrote a file, that file
+                // record is the canonical one and we don't duplicate it here.
+                // History failures never fail the copy.
                 if !write_file {
                     // PNG-encode on a worker thread: a full-screen 4K buffer is
                     // ~30 MB and synchronous encoding here would stall the UI.
@@ -1125,13 +1168,7 @@ pub(crate) fn export_pixels_shared(
                     let px_hist = px.clone();
                     std::thread::spawn(move || {
                         if let Ok(png) = crate::codec::encode_png_bgra(&px_hist, cw, ch, stride) {
-                            crate::history::record_saved_image(
-                                &png,
-                                "png",
-                                cw,
-                                ch,
-                                "copied_to_clipboard",
-                            );
+                            crate::history::record_saved_image(&png, "png", cw, ch, source);
                         }
                     });
                 }

@@ -417,7 +417,29 @@ pub fn source_label(source: &str) -> &'static str {
         "pinned_to_screen" => "贴图",
         "current_monitor" => "全屏",
         "focused_window" => "窗口",
+        // Capture-origin tags written by the current export pipeline. The
+        // legacy labels above are kept so records saved by older builds still
+        // read the same way.
+        "region" => "区域截图",
+        "copyOnly" => "仅复制截图",
+        "fullscreen" => "全屏截图",
+        "currentWindow" => "当前窗口",
         _ => "截图",
+    }
+}
+
+/// Per-source opt-in for history recording. The four keys mirror the
+/// `record_history_sources` checkboxes in settings. A source we do not recognise
+/// (legacy "saved_to_file" / "copied_to_clipboard", a future tag, or a
+/// third-party caller) is always allowed so existing flows keep working.
+/// `currentWindow` stays in the list for completeness: no hotkey currently
+/// emits it, so filtering it is a no-op until such a capture action exists.
+fn source_is_recordable(allowed: &[String], source: &str) -> bool {
+    match source {
+        "region" | "copyOnly" | "fullscreen" | "currentWindow" => {
+            allowed.iter().any(|key| key == source)
+        }
+        _ => true,
     }
 }
 
@@ -427,7 +449,10 @@ pub fn source_label(source: &str) -> &'static str {
 /// failed to save.
 pub fn record_saved_image(bytes: &[u8], extension: &str, width: u32, height: u32, source: &str) {
     let settings = crate::config::get();
-    if !settings.history.enabled {
+    // The global switch still wins; the per-source list only narrows it.
+    if !settings.history.enabled
+        || !source_is_recordable(&settings.screenshot.record_history_sources, source)
+    {
         return;
     }
     let dir = match settings.history.store_dir() {

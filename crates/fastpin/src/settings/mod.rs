@@ -206,7 +206,7 @@ fn logo_element(size: f32) -> gpui::AnyElement {
 }
 
 /// The dropdown currently open, if any — only one overlays the page at a time.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectId {
     Language,
     StrokeWidth,
@@ -216,6 +216,8 @@ enum SelectId {
     WaterScale,
     ExportFormat,
     ExportQuality,
+    // 旧「智能选区」行的 id，已被 ElementDetection 取代，保留以兼容历史引用。
+    #[allow(dead_code)]
     SmartSelection,
     AutoScrollInterval,
     AutoScrollNotches,
@@ -232,7 +234,35 @@ enum SelectId {
     PdfExportMode,
     PdfPaperSize,
     PdfOrientation,
+    // 截屏页新增的下拉；SmartSelection 保留给旧id，元素检测改用一个新id。
+    CaptureMode,
+    LongCaptureAutoStart,
+    LeftDoubleClick,
+    MiddleClick,
+    ClickOutside,
+    ElementDetection,
+    ToolbarPosition,
+    PanelPosition,
 }
+
+/// 截屏页的布尔开关，共用一套「取反后写回」逻辑。
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+enum ScreenshotToggle {
+    ShowCursor,
+    ShowGuides,
+    ShowMagnifier,
+    ShowInfoBar,
+    ShowShortcutHints,
+}
+
+/// 「记录截屏历史」的四类截屏。id 与 `record_history_sources` 里存的字符串一致。
+const RECORD_HISTORY_SOURCES: [(&str, &str); 4] = [
+    ("region", "普通截屏"),
+    ("copyOnly", "快速截屏"),
+    ("currentWindow", "截取当前窗口"),
+    ("fullscreen", "截取全屏"),
+];
 
 /// (label, position key) presets for the watermark 9-grid.
 const WM_POSITIONS: [(&str, &str); 9] = [
@@ -427,6 +457,8 @@ pub struct SettingsView {
     status: SharedString,
     status_error: bool,
     open_select: Option<SelectId>,
+    /// 「自定义工具栏」按钮是否展开下方的勾选面板。
+    customize_panel_open: bool,
     prompt_open: bool,
     /// Which action is being bound, if any. The recording hook is live for
     /// exactly as long as this is `Some`.
@@ -892,6 +924,7 @@ impl SettingsView {
             status: SharedString::default(),
             status_error: false,
             open_select: None,
+            customize_panel_open: false,
             prompt_open: false,
             recording: None,
             recording_seq: 0,
@@ -1071,6 +1104,7 @@ impl SettingsView {
     fn go_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
         self.open_select = None;
+        self.customize_panel_open = false;
         self.confirm_reset_all = false;
         self.http_warn_confirm = false;
         // Leaving/entering a page disarms any pending destructive confirmation.
@@ -1750,6 +1784,38 @@ impl SettingsView {
         self.persist(cx);
     }
 
+    /// 截屏页的布尔开关统一入口：取反后写回配置并持久化。
+    fn toggle_screenshot_bool(&mut self, which: ScreenshotToggle, cx: &mut Context<Self>) {
+        let s = &mut self.settings.screenshot;
+        let slot = match which {
+            ScreenshotToggle::ShowCursor => &mut s.show_cursor,
+            ScreenshotToggle::ShowGuides => &mut s.show_guides,
+            ScreenshotToggle::ShowMagnifier => &mut s.show_magnifier,
+            ScreenshotToggle::ShowInfoBar => &mut s.show_info_bar,
+            ScreenshotToggle::ShowShortcutHints => &mut s.show_shortcut_hints,
+        };
+        *slot = !*slot;
+        self.persist(cx);
+    }
+
+    /// 「记录截屏历史」的四类截屏复选框；配置里的 vec 就是唯一存储。
+    fn toggle_record_history_source(&mut self, id: &str, cx: &mut Context<Self>) {
+        let sources = &mut self.settings.screenshot.record_history_sources;
+        match sources.iter().position(|s| s == id) {
+            Some(i) => {
+                sources.remove(i);
+            }
+            None => sources.push(id.to_string()),
+        }
+        self.persist(cx);
+    }
+
+    /// 「自定义...」按钮展开 / 收起下方的工具栏勾选面板。
+    fn toggle_customize_panel(&mut self, cx: &mut Context<Self>) {
+        self.customize_panel_open = !self.customize_panel_open;
+        cx.notify();
+    }
+
     fn language_label(&self) -> SharedString {
         let code = self.settings.translation.target_language.trim();
         match LANGUAGES.iter().find(|(c, _)| *c == code) {
@@ -1836,6 +1902,52 @@ impl SettingsView {
                         .child(widgets::select_list().children(rows)),
                 ))
             })
+    }
+
+    /// 从配置枚举的 `ALL`/`id`/`label` 生成一行下拉，截屏页新增的枚举共用它。
+    /// `apply` 返回是否真的改了值，未变化时不写文件。
+    #[allow(clippy::too_many_arguments)]
+    fn enum_select_row<T, F>(
+        &self,
+        cx: &mut Context<Self>,
+        which: SelectId,
+        header: &'static str,
+        desc: &'static str,
+        current: T,
+        all: &[T],
+        id_of: fn(T) -> &'static str,
+        label_of: fn(T) -> &'static str,
+        apply: F,
+    ) -> gpui::Div
+    where
+        T: Copy + PartialEq + 'static,
+        F: Fn(&mut Settings, T) -> bool + Clone + 'static,
+    {
+        let current_label: SharedString = label_of(current).into();
+        let rows: Vec<gpui::Stateful<gpui::Div>> = all
+            .iter()
+            .copied()
+            .map(|value| {
+                let apply = apply.clone();
+                widgets::select_option(
+                    SharedString::from(format!("{which:?}-{}", id_of(value))),
+                    label_of(value),
+                    value == current,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_select = None;
+                        if apply(&mut this.settings, value) {
+                            this.persist(cx);
+                        } else {
+                            cx.notify();
+                        }
+                    }),
+                )
+            })
+            .collect();
+        self.select_row(cx, which, header, desc, current_label, rows)
     }
 
     fn hotkey_text(&self, action: HotkeyAction) -> SharedString {
@@ -2467,53 +2579,319 @@ impl SettingsView {
             mosaic_rows,
         );
 
-        let smart_mode = self.settings.screenshot.smart_selection;
-        let smart_label: SharedString = smart_mode.label().into();
-        let smart_rows = crate::config::SmartSelectionMode::ALL
-            .into_iter()
-            .map(|mode| {
-                widgets::select_option(
-                    SharedString::from(format!("smart-{}", mode.id())),
-                    mode.label(),
-                    mode == smart_mode,
+        use crate::config::{
+            CaptureMode, ClickAction, ClickOutside, LongCaptureAutoStart, PanelPosition,
+            SmartSelectionMode, ToolbarPosition,
+        };
+
+        // 1 截屏模式
+        let capture_mode = self.enum_select_row(
+            cx,
+            SelectId::CaptureMode,
+            "截屏模式",
+            "选择截屏时使用的捕获方式。自动模式会根据系统环境选择最佳方式。",
+            self.settings.screenshot.capture_mode,
+            &CaptureMode::ALL,
+            CaptureMode::id,
+            CaptureMode::label,
+            |s: &mut Settings, v: CaptureMode| {
+                if s.screenshot.capture_mode != v {
+                    s.screenshot.capture_mode = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
+        // 2 捕获鼠标光标
+        let show_cursor =
+            widgets::row("捕获鼠标光标", "在截屏结果中显示鼠标光标。").child(widgets::control(
+                widgets::toggle("toggle-show-cursor", self.settings.screenshot.show_cursor)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_screenshot_bool(ScreenshotToggle::ShowCursor, cx)
+                        }),
+                    ),
+            ));
+
+        // 3 未选区时显示辅助线
+        let show_guides = widgets::row(
+            "未选区时显示辅助线",
+            "开始截屏且尚未创建选区时自动显示辅助线；选区完成后自动隐藏。",
+        )
+        .child(widgets::control(
+            widgets::toggle("toggle-show-guides", self.settings.screenshot.show_guides)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_screenshot_bool(ScreenshotToggle::ShowGuides, cx)
+                    }),
+                ),
+        ));
+
+        // 4 长截屏自动开始
+        let long_capture = self.enum_select_row(
+            cx,
+            SelectId::LongCaptureAutoStart,
+            "长截屏自动开始",
+            "选择进入长截屏工具时的开始策略。",
+            self.settings.screenshot.long_capture_auto_start,
+            &LongCaptureAutoStart::ALL,
+            LongCaptureAutoStart::id,
+            LongCaptureAutoStart::label,
+            |s: &mut Settings, v: LongCaptureAutoStart| {
+                if s.screenshot.long_capture_auto_start != v {
+                    s.screenshot.long_capture_auto_start = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
+        // 5 左键双击行为
+        let left_double_click = self.enum_select_row(
+            cx,
+            SelectId::LeftDoubleClick,
+            "左键双击行为",
+            "在截屏选区完成后双击左键时执行的操作。",
+            self.settings.screenshot.left_double_click,
+            &ClickAction::ALL,
+            ClickAction::id,
+            ClickAction::label,
+            |s: &mut Settings, v: ClickAction| {
+                if s.screenshot.left_double_click != v {
+                    s.screenshot.left_double_click = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
+        // 6 中键单击行为
+        let middle_click = self.enum_select_row(
+            cx,
+            SelectId::MiddleClick,
+            "中键单击行为",
+            "在截屏选区完成后单击中键时执行的操作。",
+            self.settings.screenshot.middle_click,
+            &ClickAction::ALL,
+            ClickAction::id,
+            ClickAction::label,
+            |s: &mut Settings, v: ClickAction| {
+                if s.screenshot.middle_click != v {
+                    s.screenshot.middle_click = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
+        // 7 点击选区外行为
+        let click_outside = self.enum_select_row(
+            cx,
+            SelectId::ClickOutside,
+            "点击选区外行为",
+            "选择点击选区外时扩展现有选区，或重新创建新选区。",
+            self.settings.screenshot.click_outside,
+            &ClickOutside::ALL,
+            ClickOutside::id,
+            ClickOutside::label,
+            |s: &mut Settings, v: ClickOutside| {
+                if s.screenshot.click_outside != v {
+                    s.screenshot.click_outside = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
+        // 9 记录截屏历史：配置里的 vec 就是四个复选框的唯一存储。
+        let history_sources = self.settings.screenshot.record_history_sources.clone();
+        let history_checks: Vec<gpui::Stateful<gpui::Div>> = RECORD_HISTORY_SOURCES
+            .iter()
+            .map(|(id, label)| {
+                let checked = history_sources.iter().any(|s| s == *id);
+                widgets::checkbox(
+                    SharedString::from(format!("history-src-{id}")),
+                    *label,
+                    checked,
                 )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
-                        this.settings.screenshot.smart_selection = mode;
-                        this.open_select = None;
-                        this.persist(cx);
+                        this.toggle_record_history_source(id, cx);
                     }),
                 )
             })
             .collect();
-        let smart = self.select_row(
-            cx,
-            SelectId::SmartSelection,
-            "智能选区",
-            "框选时吸附到窗口或其内部元素；「禁用」为自由拖拽。",
-            smart_label,
-            smart_rows,
+        let record_history = widgets::stack(
+            "记录截屏历史",
+            "选择自动记录到历史图片的截屏类型；成功复制、保存或创建图片贴图后才会记录。",
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(4.))
+                .children(history_checks),
         );
+
+        // 11 工具栏位置
+        let toolbar_position = self.enum_select_row(
+            cx,
+            SelectId::ToolbarPosition,
+            "工具栏位置",
+            "选择跟随选区、记住位置，或固定在选区所在屏幕的顶部或底部。",
+            self.settings.screenshot.toolbar_position,
+            &ToolbarPosition::ALL,
+            ToolbarPosition::id,
+            ToolbarPosition::label,
+            |s: &mut Settings, v: ToolbarPosition| {
+                if s.screenshot.toolbar_position != v {
+                    s.screenshot.toolbar_position = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
+        // 12 参数面板位置
+        let panel_position = self.enum_select_row(
+            cx,
+            SelectId::PanelPosition,
+            "参数面板位置",
+            "选择跟随选区、记住位置，或固定在选区所在屏幕的左侧或右侧。",
+            self.settings.screenshot.panel_position,
+            &PanelPosition::ALL,
+            PanelPosition::id,
+            PanelPosition::label,
+            |s: &mut Settings, v: PanelPosition| {
+                if s.screenshot.panel_position != v {
+                    s.screenshot.panel_position = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
+        // 13 放大镜
+        let show_magnifier = widgets::row("放大镜", "在鼠标附近显示像素放大预览和当前颜色信息。")
+            .child(widgets::control(
+                widgets::toggle(
+                    "toggle-show-magnifier",
+                    self.settings.screenshot.show_magnifier,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_screenshot_bool(ScreenshotToggle::ShowMagnifier, cx)
+                    }),
+                ),
+            ));
+
+        // 14 信息栏
+        let show_info_bar = widgets::row("信息栏", "在选区附近显示尺寸、圆角和比例等信息。").child(
+            widgets::control(
+                widgets::toggle(
+                    "toggle-show-info-bar",
+                    self.settings.screenshot.show_info_bar,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_screenshot_bool(ScreenshotToggle::ShowInfoBar, cx)
+                    }),
+                ),
+            ),
+        );
+
+        // 15 快捷键提示
+        let show_shortcut_hints =
+            widgets::row("快捷键提示", "每次开始截屏时显示当前阶段可用的快捷键提示。").child(
+                widgets::control(
+                    widgets::toggle(
+                        "toggle-show-shortcut-hints",
+                        self.settings.screenshot.show_shortcut_hints,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_screenshot_bool(ScreenshotToggle::ShowShortcutHints, cx)
+                        }),
+                    ),
+                ),
+            );
+
+        // 8 元素检测：复用 smart_selection 配置，只改标题与选项文案。
+        let element_detection = self.enum_select_row(
+            cx,
+            SelectId::ElementDetection,
+            "元素检测",
+            "选择框选时吸附到窗口与元素、仅窗口，或完全不检测。",
+            self.settings.screenshot.smart_selection,
+            &SmartSelectionMode::ALL,
+            SmartSelectionMode::id,
+            SmartSelectionMode::label,
+            |s: &mut Settings, v: SmartSelectionMode| {
+                if s.screenshot.smart_selection != v {
+                    s.screenshot.smart_selection = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
+        // 10 自定义工具栏：按钮切换下方的勾选面板，逻辑沿用 toggle_toolbar_item。
+        let customize = widgets::stack(
+            "自定义工具栏",
+            "选择截屏工具栏上显示的按钮；完成与取消始终显示。",
+        )
+        .child(
+            widgets::button("customize-toolbar", "自定义...").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.toggle_customize_panel(cx)),
+            ),
+        )
+        .when(self.customize_panel_open, |el| {
+            el.child(div().flex().flex_col().gap(px(2.)).children(grid))
+        });
 
         div()
             .flex()
             .flex_col()
             .child(widgets::rows(vec![
-                widgets::stack(
-                    "工具栏按钮",
-                    "取消勾选的按钮不会出现在截图工具栏上，完成和取消始终显示。",
-                )
-                .child(div().flex().flex_col().gap(px(2.)).children(grid)),
+                capture_mode,
+                show_cursor,
+                show_guides,
+                long_capture,
+                left_double_click,
+                middle_click,
+                click_outside,
+                element_detection,
+                record_history,
                 widgets::row("默认颜色", "新画笔、形状和文字标注的颜色。").child(widgets::control(
                     div().flex().flex_row().gap(px(8.)).children(swatches),
                 )),
                 width,
                 mosaic,
-                smart,
                 self.scroll_interval_row(cx),
                 self.scroll_notches_row(cx),
-                widgets::unsupported_row("截屏模式", "当前版本固定为冻结屏幕后框选区域。"),
+                customize,
+                toolbar_position,
+                panel_position,
+                show_magnifier,
+                show_info_bar,
+                show_shortcut_hints,
             ]))
             .child(widgets::hint(
                 "工具栏与注释默认值在下一次截图时生效；自动滚动的间隔与步长在下一次长截图时生效。",
@@ -3780,11 +4158,16 @@ impl SettingsView {
         let total_bytes: u64 = visible.iter().map(|r| r.bytes).sum();
         let total_label = model::human_size(total_bytes);
 
-        // Source filter dropdown (全部 / 保存到文件 / 复制到剪贴板).
-        const FILTERS: [(&str, &str); 3] = [
+        // Source filter dropdown. New records use concrete source keys; older
+        // ones kept `saved_to_file` / `copied_to_clipboard`, both still matched.
+        const FILTERS: [(&str, &str); 7] = [
             ("all", "全部来源"),
-            ("saved_to_file", "保存到文件"),
-            ("copied_to_clipboard", "复制到剪贴板"),
+            ("region", "普通截屏"),
+            ("copyOnly", "快速截屏"),
+            ("fullscreen", "截取全屏"),
+            ("currentWindow", "截取当前窗口"),
+            ("saved_to_file", "保存到文件（旧）"),
+            ("copied_to_clipboard", "复制到剪贴板（旧）"),
         ];
         let filter_open = self.open_select == Some(SelectId::HistoryFilter);
         let current_label: SharedString = FILTERS

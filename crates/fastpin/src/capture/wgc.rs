@@ -43,7 +43,12 @@ pub struct WgcReady {
     hdr: bool,
 }
 
-pub fn start_monitor(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<WgcPending> {
+pub fn start_monitor(
+    gpu: &Gpu,
+    mon: &MonitorInfo,
+    want_hdr: bool,
+    show_cursor: bool,
+) -> Result<WgcPending> {
     gpu.ensure_current()?;
     let item = create_item_for_monitor(mon.handle)?;
     let size = item.Size()?;
@@ -56,7 +61,7 @@ pub fn start_monitor(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<Wgc
         DirectXPixelFormat::B8G8R8A8UIntNormalized
     };
     let device: IDirect3DDevice = gpu.winrt_device()?;
-    start_item(&item, &device, format, mon.hdr && want_hdr)
+    start_item(&item, &device, format, mon.hdr && want_hdr, show_cursor)
 }
 
 pub fn wait_frame(mut pending: WgcPending) -> Result<WgcReady> {
@@ -149,7 +154,12 @@ pub struct WgcLive {
 /// Starts a persistent session on `mon`, same pool/session setup as
 /// `start_item` but keeping every delivered frame in `latest` instead of a
 /// one-shot channel.
-pub fn start_live(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<WgcLive> {
+pub fn start_live(
+    gpu: &Gpu,
+    mon: &MonitorInfo,
+    want_hdr: bool,
+    show_cursor: bool,
+) -> Result<WgcLive> {
     gpu.ensure_current()?;
     let item = create_item_for_monitor(mon.handle)?;
     let size: SizeInt32 = item.Size()?;
@@ -165,7 +175,7 @@ pub fn start_live(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<WgcLiv
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&device, format, 1, size)?;
     let session: GraphicsCaptureSession = pool.CreateCaptureSession(&item)?;
     let _ = session.SetIsBorderRequired(false);
-    let _ = session.SetIsCursorCaptureEnabled(false);
+    let _ = session.SetIsCursorCaptureEnabled(show_cursor);
     let _ = session.SetIncludeSecondaryWindows(true);
 
     let latest: Arc<Mutex<Option<Direct3D11CaptureFrame>>> = Arc::new(Mutex::new(None));
@@ -262,12 +272,13 @@ fn start_item(
     device: &IDirect3DDevice,
     format: DirectXPixelFormat,
     hdr: bool,
+    show_cursor: bool,
 ) -> Result<WgcPending> {
     let size: SizeInt32 = item.Size()?;
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(device, format, 1, size)?;
     let session: GraphicsCaptureSession = pool.CreateCaptureSession(item)?;
     let _ = session.SetIsBorderRequired(false);
-    let _ = session.SetIsCursorCaptureEnabled(false);
+    let _ = session.SetIsCursorCaptureEnabled(show_cursor);
     let _ = session.SetIncludeSecondaryWindows(true);
 
     let (tx, rx) = mpsc::channel::<Direct3D11CaptureFrame>();

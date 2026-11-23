@@ -194,6 +194,12 @@ pub struct OverlayView {
     /// Copy-only capture: mouse-up on a fresh selection confirms immediately,
     /// skipping the toolbar — "框选后直接复制".
     copy_only: bool,
+    /// 截屏显示开关：打开覆盖层时从配置读一次，整场截屏内保持不变，
+    /// Settings 窗口在截屏途中改写配置也不会让画面中途变形。
+    show_magnifier: bool,
+    show_info_bar: bool,
+    show_guides: bool,
+    show_shortcut_hints: bool,
     /// Screen colour picker state: the colour under the magnifier crosshair and
     /// the format it is shown in. `C` copies it, `F` cycles the format. Ported
     /// from snow-shot's `ScreenshotColorPicker` controller/window pair.
@@ -821,7 +827,13 @@ pub fn show_overlay(
         Ok(entity) => entity,
         Err(e) => {
             eprintln!("overlay: {e}");
-            crate::app::complete_region_shot(empty_result(), None, None, cx);
+            crate::app::complete_region_shot(
+                empty_result(),
+                None,
+                None,
+                if copy_only { "copyOnly" } else { "region" },
+                cx,
+            );
             cx.new(OverlayView::placeholder)
         }
     }
@@ -941,6 +953,7 @@ pub(crate) fn toolbar_items_for(_tool: Tool, hidden: &[String]) -> Vec<&'static 
 
 impl OverlayView {
     fn placeholder(cx: &mut Context<Self>) -> Self {
+        let screenshot = crate::config::get().screenshot;
         Self {
             selection: Rect::new(0.0, 0.0, 0.0, 0.0),
             hover: None,
@@ -978,6 +991,10 @@ impl OverlayView {
             panel: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
             copy_only: false,
+            show_magnifier: screenshot.show_magnifier,
+            show_info_bar: screenshot.show_info_bar,
+            show_guides: screenshot.show_guides,
+            show_shortcut_hints: screenshot.show_shortcut_hints,
             picked_color: None,
             color_format: crate::colorpicker::ColorFormat::Hex,
             last_color_notice: None,
@@ -997,6 +1014,7 @@ impl OverlayView {
         window: &mut Window,
     ) -> Self {
         let freeze_generation = Some(cap.generation);
+        let screenshot = crate::config::get().screenshot;
         let mut view = Self {
             selection: Rect::new(0.0, 0.0, 0.0, 0.0),
             hover: None,
@@ -1034,6 +1052,10 @@ impl OverlayView {
             panel: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
             copy_only,
+            show_magnifier: screenshot.show_magnifier,
+            show_info_bar: screenshot.show_info_bar,
+            show_guides: screenshot.show_guides,
+            show_shortcut_hints: screenshot.show_shortcut_hints,
             picked_color: None,
             color_format: crate::colorpicker::ColorFormat::Hex,
             last_color_notice: None,
@@ -1054,6 +1076,7 @@ impl OverlayView {
         smart_selection: crate::config::SmartSelectionMode,
         window: &mut Window,
     ) {
+        let screenshot = crate::config::get().screenshot;
         self.selection = Rect::new(0.0, 0.0, 0.0, 0.0);
         self.hover = None;
         self.mouse = Point { x: 0.0, y: 0.0 };
@@ -1078,6 +1101,10 @@ impl OverlayView {
         self.panel = None;
         self.hidden_toolbar_items = crate::config::get().screenshot.hidden_toolbar_items;
         self.copy_only = copy_only;
+        self.show_magnifier = screenshot.show_magnifier;
+        self.show_info_bar = screenshot.show_info_bar;
+        self.show_guides = screenshot.show_guides;
+        self.show_shortcut_hints = screenshot.show_shortcut_hints;
         self.picked_color = None;
         self.last_color_notice = None;
         self.smart_selection = smart_selection;
@@ -1381,6 +1408,13 @@ impl OverlayView {
             self.cancel(window, cx);
             return;
         }
+        // Middle click can be bound to the same finished-crop shortcuts as a
+        // left double-click. It only has an effect once a crop exists.
+        if event.button == MouseButton::Middle
+            && self.trigger_click_action(crate::config::get().screenshot.middle_click, window, cx)
+        {
+            return;
+        }
         if event.button != MouseButton::Left {
             return;
         }
@@ -1412,6 +1446,18 @@ impl OverlayView {
             self.phase, self.editor.tool, self.mouse.x, self.mouse.y
         ));
         self.commit_text_draft();
+        // A left double-click on a finished crop runs the configured shortcut.
+        // When it closes the overlay the matching release is swallowed by the
+        // `!visible` guard in on_mouse_up.
+        if event.click_count >= 2
+            && self.trigger_click_action(
+                crate::config::get().screenshot.left_double_click,
+                window,
+                cx,
+            )
+        {
+            return;
+        }
         self.down = true;
         self.down_pt = self.mouse;
         self.hit = SelectionHitKind::None;
@@ -1431,6 +1477,18 @@ impl OverlayView {
         match self.editor.tool {
             Tool::Select => {
                 self.hit = hit_test(self.selection, self.mouse, 8.0);
+                // A press fully outside the crop means "start over" when 点击外部
+                // is configured to recreate. Drawing tools keep their own press
+                // handling below and are deliberately left alone.
+                if self.hit == SelectionHitKind::None
+                    && matches!(
+                        crate::config::get().screenshot.click_outside,
+                        crate::config::ClickOutside::Recreate
+                    )
+                {
+                    self.restart_selection();
+                    return;
+                }
                 self.sel_at_press = self.selection;
                 let on_handle =
                     self.hit != SelectionHitKind::None && self.hit != SelectionHitKind::Inside;
@@ -1455,6 +1513,71 @@ impl OverlayView {
                 PressKind::Capture => {}
             },
         }
+    }
+
+    /// Clears the finished crop and returns to the fresh-drag phase so the drag
+    /// that follows this press defines a replacement selection. Used by
+    /// 点击外部 = 重新框选; `down`/`down_pt` stay set for that drag.
+    fn restart_selection(&mut self) {
+        self.selection = Rect::new(0.0, 0.0, 0.0, 0.0);
+        self.has_sel = false;
+        self.from_drag = false;
+        self.hit = SelectionHitKind::None;
+        self.hover = None;
+        self.candidates_at = None;
+        self.phase = Phase::Selecting;
+    }
+
+    /// Runs the action bound to a left double-click / middle click on a finished
+    /// crop. Returns true when the overlay was closed, so the caller stops
+    /// processing the event.
+    fn trigger_click_action(
+        &mut self,
+        action: crate::config::ClickAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::config::ClickAction;
+        if !self.visible || self.phase != Phase::Active || !self.has_sel {
+            return false;
+        }
+        match action {
+            ClickAction::None => false,
+            ClickAction::Complete => {
+                self.confirm(window, cx);
+                true
+            }
+            ClickAction::Copy => {
+                self.export_selection_and_finish(false, true, window, cx);
+                true
+            }
+            ClickAction::Save => {
+                self.export_selection_and_finish(true, false, window, cx);
+                true
+            }
+        }
+    }
+
+    /// Exports the finished crop with fixed write/copy flags and closes the
+    /// overlay. `confirm` honours the export-page switches instead; a click
+    /// shortcut needs a deterministic destination, so it uses this path.
+    fn export_selection_and_finish(
+        &mut self,
+        write_file: bool,
+        copy: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut result) = self.result_from_current() else {
+            return;
+        };
+        result.write_file = write_file;
+        result.copy = copy;
+        let source = self.capture_source();
+        if let Some(cap) = self.cap.as_ref() {
+            crate::app::export_annotated_region(cx, cap, &result, source);
+        }
+        self.finish(empty_result(), window, cx);
     }
 
     fn on_mouse_move(
@@ -1535,6 +1658,11 @@ impl OverlayView {
             return;
         }
         if self.phase == Phase::LongCapturing {
+            return;
+        }
+        if event.button == MouseButton::Middle {
+            // A middle-click shortcut fires on press; its release is swallowed
+            // here like any other non-left button.
             return;
         }
         if event.button != MouseButton::Left {
@@ -1771,6 +1899,16 @@ impl OverlayView {
         }
     }
 
+    /// Capture-origin tag persisted with history records. The overlay is only
+    /// opened for region or copy-only shots; long previews tag themselves.
+    fn capture_source(&self) -> &'static str {
+        if self.copy_only {
+            "copyOnly"
+        } else {
+            "region"
+        }
+    }
+
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.visible {
             return;
@@ -1787,8 +1925,9 @@ impl OverlayView {
         };
         result.copy = false;
         result.write_file = true;
+        let source = self.capture_source();
         if let Some(cap) = self.cap.as_ref() {
-            crate::app::export_annotated_region(cx, cap, &result);
+            crate::app::export_annotated_region(cx, cap, &result, source);
         }
     }
 
@@ -1827,9 +1966,10 @@ impl OverlayView {
             });
         })
         .detach();
+        let source = self.capture_source();
         let cap = self.cap.take();
         let perf = self.perf.borrow_mut().take();
-        crate::app::complete_region_shot(result, cap, perf, cx);
+        crate::app::complete_region_shot(result, cap, perf, source, cx);
         cx.notify();
     }
 
@@ -2108,9 +2248,20 @@ impl OverlayView {
         let target = focus_window_under(crate::platform::hwnd_of(window), center);
         if let Some(state) = self.long.as_mut() {
             state.target = target;
-            // Auto-scroll is opt-in: it starts off and the user flips it on
-            // from the long-capture bar. It never turns itself on, so a fresh
-            // capture never scrolls unless the user asks it to.
+            // Auto-scroll starts off by default (Manual); the Auto setting
+            // turns it on for this session the moment the target is known,
+            // without persisting anything back to config.
+            if matches!(
+                crate::config::get().screenshot.long_capture_auto_start,
+                crate::config::LongCaptureAutoStart::Auto
+            ) {
+                if state.target.is_some() {
+                    state.auto_scroll.set_enabled(true);
+                    state.status = "自动滚动：开".to_string();
+                } else {
+                    state.status = AUTO_SCROLL_POST_FAILED.to_string();
+                }
+            }
         }
         self.spawn_long_poll(gen, cx);
         cx.notify();
@@ -2126,6 +2277,14 @@ impl OverlayView {
     /// have no WGC frame to deliver here either, so they take the same
     /// fallback path as any other start failure -- no separate detection.
     fn start_live_session(&self, abs_x: i32, abs_y: i32, w: u32, h: u32) -> Option<LongLive> {
+        // 只有 Auto 模式才尝试持续 WGC live 会话；显式选择 Wgc / Dxgi 时
+        // 越过它，整场长截图都走 fallback（由选中的捕获模式接管）。
+        if !matches!(
+            crate::config::get().screenshot.capture_mode,
+            crate::config::CaptureMode::Auto
+        ) {
+            return None;
+        }
         let cap = self.cap.as_ref()?;
         let monitors = crate::capture::enumerate_monitors().ok()?;
         let mon = monitors.iter().find(|m| {
@@ -2134,7 +2293,8 @@ impl OverlayView {
                 && abs_x + w as i32 <= m.x + m.w
                 && abs_y + h as i32 <= m.y + m.h
         })?;
-        let session = crate::capture::start_live(&cap.gpu, mon, mon.hdr).ok()?;
+        let show_cursor = crate::config::get().screenshot.show_cursor;
+        let session = crate::capture::start_live(&cap.gpu, mon, mon.hdr, show_cursor).ok()?;
         // A cold WGC session used to busy-wait up to 500 ms here, on the UI
         // thread, before the bar even appeared. The very first frame has a
         // fresh-capture fallback anyway, so only give the live session a short
@@ -3882,7 +4042,8 @@ impl Render for OverlayView {
         // One magnifier readback per painted frame, not one per WM_MOUSEMOVE:
         // `refresh_magnifier_gpu` also short-circuits when the cursor has not
         // moved to a new source pixel since the last readback.
-        if self.visible && self.phase == Phase::Selecting {
+        // 放大镜关闭时连 GPU 回读一起省掉，不只是不画。
+        if self.visible && self.phase == Phase::Selecting && self.show_magnifier {
             self.refresh_magnifier_gpu(cx);
         }
         let scale = window.scale_factor().max(0.01);
@@ -3920,6 +4081,10 @@ impl Render for OverlayView {
         let picked_color = self.picked_color;
         let color_format = self.color_format;
         let color_notice = self.last_color_notice.clone();
+        let show_magnifier = self.show_magnifier;
+        let show_guides = self.show_guides;
+        let show_info_bar = self.show_info_bar;
+        let show_shortcut_hints = self.show_shortcut_hints;
         // The canvas paint closure is `move`: give it its own `Rc` handle so the
         // original stays available for `text_layer` later in this same frame.
         let paint_marks = marks.clone();
@@ -3976,21 +4141,28 @@ impl Render for OverlayView {
                                     dim,
                                     mosaic,
                                     candidates,
+                                    show_magnifier,
+                                    show_guides,
                                 },
                             );
                         },
                     )
                     .size_full(),
                 )
-                .child(coord_label(shown, mouse, phase, scale))
-                .child(color_picker_label(
-                    picked_color,
-                    color_format,
-                    color_notice,
-                    mouse,
-                    phase,
-                    scale,
-                ))
+                .when(show_info_bar, |el| {
+                    el.child(coord_label(shown, mouse, phase, scale))
+                        .child(color_picker_label(
+                            picked_color,
+                            color_format,
+                            color_notice,
+                            mouse,
+                            phase,
+                            scale,
+                        ))
+                })
+                .when(show_shortcut_hints, |el| {
+                    el.child(shortcut_hints_bar(phase))
+                })
                 .children(self.toolbar_element(scale, cx, &visible_items, toolbar_geom))
                 .children(self.props_element(scale, cx, toolbar_geom, active_monitor))
                 .children(self.long_bar_element(scale, cx, active_monitor))
@@ -4096,6 +4268,32 @@ fn color_picker_label(
         )
 }
 
+/// 覆盖层底部的一行快捷键提示；长截图阶段换成对应文案。
+/// 与信息栏一样是纯 UI，不参与导出图像。
+fn shortcut_hints_bar(phase: Phase) -> impl IntoElement {
+    let text = if phase == Phase::LongCapturing {
+        "Enter 完成 · Esc 取消 · 滚动栏切换方向/自动"
+    } else {
+        "Enter 完成 · Esc 取消 · 右键菜单"
+    };
+    div()
+        .absolute()
+        .bottom(px(10.0))
+        .left(px(0.0))
+        .w_full()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .bg(hsla(0., 0., 0., 0.7))
+                .text_color(white())
+                .text_xs()
+                .px(px(8.0))
+                .py(px(4.0))
+                .child(text),
+        )
+}
+
 struct OverlayPaint {
     shown: Option<Rect>,
     mouse: Point,
@@ -4109,6 +4307,8 @@ struct OverlayPaint {
     dim: Option<Rc<Vec<CoverageRun>>>,
     mosaic: Rc<MosaicTiles>,
     candidates: Vec<crate::smart_selection::Candidate>,
+    show_magnifier: bool,
+    show_guides: bool,
 }
 
 fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPaint) {
@@ -4125,6 +4325,8 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
         dim,
         mosaic,
         candidates,
+        show_magnifier,
+        show_guides,
     } = paint;
     let origin = Point { x: 0.0, y: 0.0 };
     let hole = shown.map(|r| annotate::rect_to_bounds(r, scale));
@@ -4147,6 +4349,28 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
         if let Some(cand) = candidates.first() {
             let bounds = annotate::rect_to_bounds(cand.rect, scale);
             window.paint_quad(outline(bounds, hsla(0., 0.8, 1., 0.8), BorderStyle::Solid));
+        }
+        // 未选区时的辅助线：一对过光标的半透明细线。鼠标是截图像素坐标，
+        // 这里按 scale 换回逻辑像素；一旦按下拖出选区（shown）就不再画。
+        if show_guides {
+            let mx = mouse.x as f32 / scale;
+            let my = mouse.y as f32 / scale;
+            let thin = px(1.0 / scale);
+            let guide = hsla(0., 0., 1., 0.35);
+            window.paint_quad(fill(
+                Bounds {
+                    origin: point(bounds.origin.x, px(my)),
+                    size: size(bounds.size.width, thin),
+                },
+                guide,
+            ));
+            window.paint_quad(fill(
+                Bounds {
+                    origin: point(px(mx), bounds.origin.y),
+                    size: size(thin, bounds.size.height),
+                },
+                guide,
+            ));
         }
     }
     // Annotations are clipped to the selection: the export composites onto a buffer
@@ -4171,7 +4395,7 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
             annotate::paint_marks(window, &marks, &masks, &mosaic, origin, scale);
         }
     }
-    if phase == Phase::Selecting {
+    if phase == Phase::Selecting && show_magnifier {
         if let Some(pixels) = mag {
             paint_magnifier(window, bounds, mouse, pixels, scale);
         }

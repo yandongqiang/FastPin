@@ -71,6 +71,10 @@ pub fn prepare_capture(
     shaders: &GpuShaders,
     overlay_luid: (u32, i32),
 ) -> Result<PreparedCapture> {
+    // Cursor composition is a per-WGC-session switch. Read it once here so
+    // every monitor captured by this shot agrees, even if settings are edited
+    // while the parallel waits are in flight.
+    let show_cursor = crate::config::get().screenshot.show_cursor;
     let gpu = Gpu::bind(device, shaders);
     let monitors = enumerate_monitors()?;
     if monitors.is_empty() {
@@ -125,7 +129,7 @@ pub fn prepare_capture(
             wgc.push(WgcOutcome::Missing);
             continue;
         }
-        match wgc::start_monitor(&gpu, &monitors[idx], want_hdr) {
+        match wgc::start_monitor(&gpu, &monitors[idx], want_hdr, show_cursor) {
             Ok(pending) => {
                 // Placeholder until the wait thread returns.
                 wgc.push(WgcOutcome::Missing);
@@ -204,6 +208,10 @@ pub fn capture_for_action(
         // Every way of reaching `got == None` — create failure, wait failure, a
         // near-black frame, or a session skipped under exclusive fullscreen — wants
         // the same DuplicateOutput1 fallback, so there is nothing left to branch on.
+        // Note: DXGI DuplicateOutput1 cannot composite the cursor into a captured
+        // frame (unlike WGC's SetIsCursorCaptureEnabled), so `show_cursor` only
+        // takes effect on the WGC path above; a DXGI-fallback frame is always
+        // cursor-free. This is a platform limitation, not a missed setting.
         if got.is_none() {
             if dxgi_allowed(mon, overlay_luid) {
                 match dxgi_dup::capture_monitor(&gpu, ctx, mon, want_hdr, overlay_luid) {

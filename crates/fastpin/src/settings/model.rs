@@ -63,7 +63,7 @@ impl Page {
     pub fn title(self) -> &'static str {
         match self {
             Page::General => "常规",
-            Page::Screenshot => "截屏",
+            Page::Screenshot => "截图",
             Page::Record => "录屏",
             Page::History => "历史图片",
             Page::Output => "输出",
@@ -80,7 +80,7 @@ impl Page {
     pub fn desc(self) -> &'static str {
         match self {
             Page::General => "启动与语言等基础行为。",
-            Page::Screenshot => "截图内容、工具栏按钮与注释工具的默认值。",
+            Page::Screenshot => "调整截屏功能的相关设置。",
             Page::Record => "录屏方式、编码与输出。",
             Page::History => "查看、复制或删除已保存的截图历史。",
             Page::Output => "保存位置与导出的水印。",
@@ -154,11 +154,51 @@ pub const ROWS: &[RowMeta] = &[
         title: "界面语言",
         desc: "当前版本仅提供简体中文界面。",
     },
-    // 截屏
+    // 截图
     RowMeta {
         page: Page::Screenshot,
-        title: "工具栏按钮",
-        desc: "取消勾选的按钮不会出现在截图工具栏上，完成和取消始终显示。",
+        title: "截屏模式",
+        desc: "选择截屏时使用的捕获方式。自动模式会根据系统环境选择最佳方式。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "捕获鼠标光标",
+        desc: "在截屏结果中显示鼠标光标。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "未选区时显示辅助线",
+        desc: "开始截屏且尚未创建选区时自动显示辅助线；选区完成后自动隐藏。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "长截屏自动开始",
+        desc: "选择进入长截屏工具时的开始策略。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "左键双击行为",
+        desc: "在截屏选区完成后双击左键时执行的操作。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "中键单击行为",
+        desc: "在截屏选区完成后单击中键时执行的操作。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "点击选区外行为",
+        desc: "选择点击选区外时扩展现有选区，或重新创建新选区。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "元素检测",
+        desc: "选择框选时吸附到窗口与元素、仅窗口，或完全不检测。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "记录截屏历史",
+        desc: "选择自动记录到历史图片的截屏类型；成功复制、保存或创建图片贴图后才会记录。",
     },
     RowMeta {
         page: Page::Screenshot,
@@ -177,11 +217,6 @@ pub const ROWS: &[RowMeta] = &[
     },
     RowMeta {
         page: Page::Screenshot,
-        title: "智能选区",
-        desc: "框选时吸附到窗口或其内部元素；禁用后为自由拖拽。",
-    },
-    RowMeta {
-        page: Page::Screenshot,
         title: "自动滚动间隔",
         desc: "长截图自动滚动时两次滚动之间的等待时间，间隔越短滚动越快。",
     },
@@ -192,8 +227,33 @@ pub const ROWS: &[RowMeta] = &[
     },
     RowMeta {
         page: Page::Screenshot,
-        title: "截屏模式",
-        desc: "当前版本固定为冻结屏幕后框选区域。",
+        title: "自定义工具栏",
+        desc: "选择截屏工具栏上显示的按钮；完成与取消始终显示。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "工具栏位置",
+        desc: "选择跟随选区、记住位置，或固定在选区所在屏幕的顶部或底部。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "参数面板位置",
+        desc: "选择跟随选区、记住位置，或固定在选区所在屏幕的左侧或右侧。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "放大镜",
+        desc: "在鼠标附近显示像素放大预览和当前颜色信息。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "信息栏",
+        desc: "在选区附近显示尺寸、圆角和比例等信息。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "快捷键提示",
+        desc: "每次开始截屏时显示当前阶段可用的快捷键提示。",
     },
     // 录屏
     RowMeta {
@@ -585,6 +645,22 @@ pub fn reset_page(settings: &mut Settings, page: Page) -> bool {
             settings.screenshot.annotation = default.screenshot.annotation.clone();
             settings.screenshot.smart_selection = default.screenshot.smart_selection;
             settings.screenshot.auto_scroll = default.screenshot.auto_scroll.clone();
+            // 截屏页新增的配置，逐项回到默认，避免重置按钮留下半页旧值。
+            settings.screenshot.capture_mode = default.screenshot.capture_mode;
+            settings.screenshot.show_cursor = default.screenshot.show_cursor;
+            settings.screenshot.show_guides = default.screenshot.show_guides;
+            settings.screenshot.long_capture_auto_start =
+                default.screenshot.long_capture_auto_start;
+            settings.screenshot.left_double_click = default.screenshot.left_double_click;
+            settings.screenshot.middle_click = default.screenshot.middle_click;
+            settings.screenshot.click_outside = default.screenshot.click_outside;
+            settings.screenshot.record_history_sources =
+                default.screenshot.record_history_sources.clone();
+            settings.screenshot.toolbar_position = default.screenshot.toolbar_position;
+            settings.screenshot.panel_position = default.screenshot.panel_position;
+            settings.screenshot.show_magnifier = default.screenshot.show_magnifier;
+            settings.screenshot.show_info_bar = default.screenshot.show_info_bar;
+            settings.screenshot.show_shortcut_hints = default.screenshot.show_shortcut_hints;
             true
         }
         Page::Output => {
@@ -660,6 +736,20 @@ mod tests {
         s.screenshot.hidden_toolbar_items = vec!["text".into(), "redo".into()];
         s.screenshot.save_dir = Some("D:/shots".into());
         s.screenshot.smart_selection = crate::config::SmartSelectionMode::Disabled;
+        // 截屏页新增字段：全部偏离各自默认值，避免重置测试出现假阳性。
+        s.screenshot.capture_mode = crate::config::CaptureMode::Dxgi;
+        s.screenshot.show_cursor = true;
+        s.screenshot.show_guides = true;
+        s.screenshot.long_capture_auto_start = crate::config::LongCaptureAutoStart::Manual;
+        s.screenshot.left_double_click = crate::config::ClickAction::Save;
+        s.screenshot.middle_click = crate::config::ClickAction::Copy;
+        s.screenshot.click_outside = crate::config::ClickOutside::Recreate;
+        s.screenshot.record_history_sources = vec!["region".into()];
+        s.screenshot.toolbar_position = crate::config::ToolbarPosition::Bottom;
+        s.screenshot.panel_position = crate::config::PanelPosition::Right;
+        s.screenshot.show_magnifier = false;
+        s.screenshot.show_info_bar = false;
+        s.screenshot.show_shortcut_hints = false;
         s.screenshot.export.auto_save = true;
         s.screenshot.export.auto_copy = false;
         s.screenshot.export.format = crate::config::ImageFormat::Jpeg;
@@ -763,6 +853,37 @@ mod tests {
         assert!(Page::Data.has_config());
         // A search for a history row must land on the page that renders it.
         assert!(search("保留期限").iter().all(|r| r.page == Page::Data));
+    }
+
+    /// 截图页的 15 项配置都要能被搜索到，并跳回「截图」页。
+    #[test]
+    fn screenshot_rows_are_searchable() {
+        for title in [
+            "截屏模式",
+            "捕获鼠标光标",
+            "未选区时显示辅助线",
+            "长截屏自动开始",
+            "左键双击行为",
+            "中键单击行为",
+            "点击选区外行为",
+            "元素检测",
+            "记录截屏历史",
+            "自定义工具栏",
+            "工具栏位置",
+            "参数面板位置",
+            "放大镜",
+            "信息栏",
+            "快捷键提示",
+        ] {
+            assert!(
+                search(title)
+                    .iter()
+                    .any(|r| r.title == title && r.page == Page::Screenshot),
+                "search lost '{title}' on Page::Screenshot"
+            );
+        }
+        assert_eq!(Page::Screenshot.title(), "截图");
+        assert_eq!(Page::Screenshot.desc(), "调整截屏功能的相关设置。");
     }
 
     #[test]
@@ -893,6 +1014,22 @@ mod tests {
                     && s.screenshot.auto_scroll.notches == 1
                     && s.screenshot.smart_selection
                         == crate::config::SmartSelectionMode::WindowSubElement
+                    && s.screenshot.capture_mode == crate::config::CaptureMode::Auto
+                    && !s.screenshot.show_cursor
+                    && !s.screenshot.show_guides
+                    && s.screenshot.long_capture_auto_start
+                        == crate::config::LongCaptureAutoStart::Auto
+                    && s.screenshot.left_double_click == crate::config::ClickAction::None
+                    && s.screenshot.middle_click == crate::config::ClickAction::None
+                    && s.screenshot.click_outside == crate::config::ClickOutside::Expand
+                    && s.screenshot.record_history_sources
+                        == ["region", "copyOnly", "fullscreen", "currentWindow"]
+                    && s.screenshot.toolbar_position
+                        == crate::config::ToolbarPosition::FollowSelection
+                    && s.screenshot.panel_position == crate::config::PanelPosition::FollowSelection
+                    && s.screenshot.show_magnifier
+                    && s.screenshot.show_info_bar
+                    && s.screenshot.show_shortcut_hints
             }
             Page::Output => {
                 s.screenshot.save_dir.is_none()

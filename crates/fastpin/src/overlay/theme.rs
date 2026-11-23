@@ -131,21 +131,78 @@ pub fn apply_theme(theme: &Theme) {
 /// any window opens.
 pub fn init(cx: &mut gpui::App) {
     gpui_kit::init(cx);
-    set_dark(cx, crate::config::get().dark());
+    set_appearance(cx, &crate::config::get().appearance);
+}
+
+/// Component palette for a named appearance.
+///
+/// Tinted variants only replace the primary / accent / selection tokens: the
+/// surface, foreground, border and input tokens stay at the mode defaults so
+/// body text keeps its light/dark contrast. For plain `light` / `dark` (or any
+/// unknown value) the untouched default palette is returned.
+fn themed_colors(name: &str) -> ThemeColor {
+    let dark = crate::config::appearance_dark(name);
+    let mut colors = if dark {
+        *ThemeColor::dark()
+    } else {
+        *ThemeColor::light()
+    };
+    let hex = match name.trim().to_ascii_lowercase().as_str() {
+        crate::config::APPEARANCE_BLUE | crate::config::APPEARANCE_BLUE_DARK => 0x3B82F6,
+        crate::config::APPEARANCE_GREEN | crate::config::APPEARANCE_GREEN_DARK => 0x22B14C,
+        crate::config::APPEARANCE_PURPLE | crate::config::APPEARANCE_PURPLE_DARK => 0xA855F7,
+        crate::config::APPEARANCE_ORANGE | crate::config::APPEARANCE_ORANGE_DARK => 0xFF8C00,
+        _ => return colors,
+    };
+    let base = Hsla::from(rgb(hex));
+    let shift = |delta: f32| hsla(base.h, base.s, (base.l + delta).clamp(0.0, 1.0), base.a);
+    colors.primary = base;
+    colors.primary_hover = shift(0.08);
+    colors.primary_active = shift(-0.08);
+    // 纯白或纯黑，保证按钮文字压在主题色上时始终可读。
+    colors.primary_foreground = if base.l > 0.55 {
+        hsla(0.0, 0.0, 0.0, 1.0)
+    } else {
+        hsla(0.0, 0.0, 1.0, 1.0)
+    };
+    colors.accent = base;
+    colors.accent_foreground = colors.primary_foreground;
+    // selection 仍作半透明选中底色，不用不透明的主题色盖住文字。
+    colors.selection = base.opacity(0.20);
+    colors
 }
 
 /// Switches appearance at runtime through the component theme, refreshes the
 /// snapshot, and asks every window (settings included) to repaint.
-pub fn set_dark(cx: &mut gpui::App, dark: bool) {
-    let mode = if dark {
+///
+/// `Theme::change` loads the mode's registered palette, so the accent edit has
+/// to happen in a second `Theme::update` or it would be overwritten. Its second
+/// argument is an unused `Option<&mut Window>`, not a colour.
+pub fn set_appearance(cx: &mut gpui::App, name: &str) {
+    let mode = if crate::config::appearance_dark(name) {
         ThemeMode::Dark
     } else {
         ThemeMode::Light
     };
     Theme::change(mode, None, cx);
+    let colors = themed_colors(name);
+    Theme::update(cx, |t| t.colors = colors);
     let theme = Theme::global(cx).clone();
     apply_theme(&theme);
     cx.refresh_windows();
+}
+
+/// Historical light/dark entry point, kept for callers that only have a bool.
+#[allow(dead_code)]
+pub fn set_dark(cx: &mut gpui::App, dark: bool) {
+    set_appearance(
+        cx,
+        if dark {
+            crate::config::APPEARANCE_DARK
+        } else {
+            crate::config::APPEARANCE_LIGHT
+        },
+    );
 }
 
 // ---- chrome tokens ---------------------------------------------------------
@@ -302,6 +359,16 @@ mod tests {
         palette_from(&theme)
     }
 
+    fn themed_palette(name: &str) -> Palette {
+        let mut theme = Theme::from(&themed_colors(name));
+        theme.mode = if crate::config::appearance_dark(name) {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        };
+        palette_from(&theme)
+    }
+
     #[test]
     fn light_and_dark_resolve_different_readable_palettes() {
         let light = light();
@@ -336,6 +403,57 @@ mod tests {
     }
 
     #[test]
+    fn tinted_themes_recolour_only_the_accents() {
+        use crate::config::{
+            APPEARANCE_BLUE, APPEARANCE_BLUE_DARK, APPEARANCE_GREEN, APPEARANCE_GREEN_DARK,
+            APPEARANCE_ORANGE, APPEARANCE_ORANGE_DARK, APPEARANCE_PURPLE, APPEARANCE_PURPLE_DARK,
+        };
+
+        let light = light();
+        let dark = dark();
+        let pairs = [
+            (APPEARANCE_BLUE, APPEARANCE_BLUE_DARK),
+            (APPEARANCE_GREEN, APPEARANCE_GREEN_DARK),
+            (APPEARANCE_ORANGE, APPEARANCE_ORANGE_DARK),
+            (APPEARANCE_PURPLE, APPEARANCE_PURPLE_DARK),
+        ];
+        let mut primaries = Vec::new();
+        for &(light_name, dark_name) in &pairs {
+            let tinted = themed_palette(light_name);
+            let tinted_dark = themed_palette(dark_name);
+            // 四种主题色的 primary 两两不同，且与默认色不同。
+            assert!(!primaries.contains(&rgb_of(tinted.primary)), "{light_name}");
+            primaries.push(rgb_of(tinted.primary));
+            assert_ne!(rgb_of(tinted.primary), rgb_of(light.primary));
+            assert_ne!(rgb_of(tinted_dark.primary), rgb_of(dark.primary));
+            // 同一主题色的浅/深变体共享 primary，只换底色。
+            assert_eq!(rgb_of(tinted.primary), rgb_of(tinted_dark.primary));
+            // 控件填充上的文字始终有对比，selection 保持半透明。
+            assert!((tinted.primary.l - tinted.primary_foreground.l).abs() > 0.4);
+            assert!((tinted_dark.primary.l - tinted_dark.primary_foreground.l).abs() > 0.4);
+            assert!(tinted.selection.a < 1.0);
+            assert!(tinted_dark.selection.a < 1.0);
+            // 背景与正文仍取自对应模式，可读性不因换主题色而回退。
+            assert_eq!(rgb_of(tinted.surface), rgb_of(light.surface));
+            assert_eq!(rgb_of(tinted.foreground), rgb_of(light.foreground));
+            assert_eq!(rgb_of(tinted.input), rgb_of(light.input));
+            assert_eq!(rgb_of(tinted_dark.surface), rgb_of(dark.surface));
+            assert_eq!(rgb_of(tinted_dark.foreground), rgb_of(dark.foreground));
+            assert_eq!(rgb_of(tinted_dark.input), rgb_of(dark.input));
+            // 底色依旧一浅一深。
+            assert!(tinted.surface.l > 0.9, "{light_name}");
+            assert!(tinted_dark.surface.l < 0.2, "{dark_name}");
+        }
+        assert_eq!(primaries.len(), 4);
+        // 普通 light/dark 不引入自定义色。
+        assert_eq!(
+            rgb_of(themed_palette("light").primary),
+            rgb_of(light.primary)
+        );
+        assert_eq!(rgb_of(themed_palette("dark").primary), rgb_of(dark.primary));
+    }
+
+    #[test]
     fn apply_theme_is_idempotent() {
         // The only test that touches the process-wide snapshot: everything
         // else maps themes through `palette_from`, so parallel tests cannot
@@ -348,6 +466,15 @@ mod tests {
         assert_eq!(once, current());
         apply_theme(&t);
         assert_eq!(once, current());
+
+        // 带主题色的快照同样可重复应用：set_appearance 连续调用不会漂移。
+        let mut tinted = Theme::from(&themed_colors(crate::config::APPEARANCE_PURPLE));
+        tinted.mode = ThemeMode::Light;
+        apply_theme(&tinted);
+        let colored = current();
+        apply_theme(&tinted);
+        assert_eq!(colored, current());
+        assert_ne!(colored.primary, once.primary);
     }
 
     #[test]

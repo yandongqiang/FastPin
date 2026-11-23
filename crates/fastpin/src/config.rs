@@ -21,15 +21,73 @@ pub struct Settings {
     pub screenshot: Screenshot,
     pub history: History,
     pub hotkeys: Hotkeys,
-    /// UI appearance: `"light"` (default) or `"dark"`. A plain string keeps the
-    /// file hand-editable, same rationale as the hotkey strings; an unknown
-    /// value falls back to light instead of failing the whole file.
+    /// UI appearance: `"light"` (default), `"dark"`, or a tinted variant such
+    /// as `"blue"` / `"blue-dark"`. A plain string keeps the file hand-editable,
+    /// same rationale as the hotkey strings; an unknown value falls back to
+    /// light instead of failing the whole file.
     pub appearance: String,
 }
 
-/// Stored values of `Settings::appearance`.
+/// Stored values of `Settings::appearance`. Tinted variants keep the light or
+/// dark surface of their base mode and only recolour the chrome accents.
 pub const APPEARANCE_LIGHT: &str = "light";
 pub const APPEARANCE_DARK: &str = "dark";
+pub const APPEARANCE_BLUE: &str = "blue";
+pub const APPEARANCE_GREEN: &str = "green";
+pub const APPEARANCE_PURPLE: &str = "purple";
+pub const APPEARANCE_ORANGE: &str = "orange";
+pub const APPEARANCE_BLUE_DARK: &str = "blue-dark";
+pub const APPEARANCE_GREEN_DARK: &str = "green-dark";
+pub const APPEARANCE_PURPLE_DARK: &str = "purple-dark";
+pub const APPEARANCE_ORANGE_DARK: &str = "orange-dark";
+
+/// Every value the appearance dropdown offers, in display order.
+pub const APPEARANCES: [&str; 10] = [
+    APPEARANCE_LIGHT,
+    APPEARANCE_DARK,
+    APPEARANCE_BLUE,
+    APPEARANCE_GREEN,
+    APPEARANCE_PURPLE,
+    APPEARANCE_ORANGE,
+    APPEARANCE_BLUE_DARK,
+    APPEARANCE_GREEN_DARK,
+    APPEARANCE_PURPLE_DARK,
+    APPEARANCE_ORANGE_DARK,
+];
+
+/// Whether a stored appearance uses the dark base palette. The tinted variants
+/// carry a `-dark` suffix; anything unrecognised (including an empty or
+/// hand-edited value) reads as light.
+pub fn appearance_dark(name: &str) -> bool {
+    let name = name.trim();
+    name.eq_ignore_ascii_case(APPEARANCE_DARK)
+        || [
+            APPEARANCE_BLUE_DARK,
+            APPEARANCE_GREEN_DARK,
+            APPEARANCE_PURPLE_DARK,
+            APPEARANCE_ORANGE_DARK,
+        ]
+        .iter()
+        .any(|v| name.eq_ignore_ascii_case(v))
+}
+
+/// Chinese label shown in the settings dropdown. Unknown values read as light,
+/// matching [`Settings::dark`].
+pub fn appearance_label(name: &str) -> &'static str {
+    let name = name.trim().to_ascii_lowercase();
+    match name.as_str() {
+        APPEARANCE_DARK => "深色",
+        APPEARANCE_BLUE => "蓝色",
+        APPEARANCE_GREEN => "绿色",
+        APPEARANCE_PURPLE => "紫色",
+        APPEARANCE_ORANGE => "橙色",
+        APPEARANCE_BLUE_DARK => "深蓝",
+        APPEARANCE_GREEN_DARK => "深绿",
+        APPEARANCE_PURPLE_DARK => "深紫",
+        APPEARANCE_ORANGE_DARK => "深橙",
+        _ => "浅色",
+    }
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -45,10 +103,10 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Whether the persisted appearance is the dark one. Anything else
-    /// (including an empty or hand-edited value) reads as light.
+    /// Whether the persisted appearance uses a dark base. Kept for callers
+    /// that only care about light/dark; the tinted variants answer here too.
     pub fn dark(&self) -> bool {
-        self.appearance.trim().eq_ignore_ascii_case(APPEARANCE_DARK)
+        appearance_dark(&self.appearance)
     }
 }
 
@@ -1473,6 +1531,41 @@ mod tests {
         assert!(!parse(r#"{"appearance": "nonsense"}"#).dark());
         assert!(!parse(r#"{"appearance": ""}"#).dark());
         assert_eq!(Settings::default().appearance, APPEARANCE_LIGHT);
+
+        // 每种主题色（含深色变体）都能原样写入并读回。
+        for name in APPEARANCES {
+            let s = Settings {
+                appearance: name.into(),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&s).expect("serializes");
+            let back = parse(&json);
+            assert_eq!(back.appearance, name, "{name}");
+            assert_eq!(back.dark(), appearance_dark(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn appearance_dark_and_label_cover_every_variant() {
+        // 深色底只有 dark 和 *-dark；其余一律按浅色处理。
+        let expected_dark = [
+            false, true, false, false, false, false, true, true, true, true,
+        ];
+        let labels = [
+            "浅色", "深色", "蓝色", "绿色", "紫色", "橙色", "深蓝", "深绿", "深紫", "深橙",
+        ];
+        for (i, name) in APPEARANCES.iter().enumerate() {
+            assert_eq!(appearance_dark(name), expected_dark[i], "{name}");
+            assert_eq!(appearance_label(name), labels[i], "{name}");
+            // 大小写和空白来自手工编辑，不能改变判定结果。
+            let noisy = format!("  {}  ", name.to_ascii_uppercase());
+            assert_eq!(appearance_dark(&noisy), expected_dark[i], "{name}");
+            assert_eq!(appearance_label(&noisy), labels[i], "{name}");
+        }
+        assert!(!appearance_dark(""));
+        assert!(!appearance_dark("nonsense"));
+        assert_eq!(appearance_label("nonsense"), "浅色");
+        assert_eq!(appearance_label(""), "浅色");
     }
 
     #[test]

@@ -1202,7 +1202,7 @@ impl SettingsView {
             // The appearance page resets to light; re-projecting the (possibly
             // unchanged) theme here keeps the chrome and every other window in
             // step without a second click.
-            theme::set_dark(cx, self.settings.dark());
+            theme::set_appearance(cx, &self.settings.appearance);
             self.sync_inputs(cx);
             if self.page == Page::Hotkey {
                 self.reapply_hotkeys();
@@ -1221,7 +1221,7 @@ impl SettingsView {
         let _ = crate::translate::set_api_key("");
         self.saved_api_key.clear();
         let autostart_error = system::set_autostart(false).err();
-        theme::set_dark(cx, self.settings.dark());
+        theme::set_appearance(cx, &self.settings.appearance);
         self.autostart = system::autostart_enabled();
         self.sync_inputs(cx);
         self.reapply_hotkeys();
@@ -1913,25 +1913,16 @@ impl SettingsView {
     }
 
     fn appearance_label(&self) -> SharedString {
-        if self.settings.dark() {
-            "深色".into()
-        } else {
-            "浅色".into()
-        }
+        crate::config::appearance_label(&self.settings.appearance).into()
     }
 
-    /// Dark/light switch: save first, then push the theme into gpui-kit and
+    /// Appearance switch: save first, then push the theme into gpui-kit and
     /// refresh every window so the toolbar and this window repaint together.
-    fn set_appearance(&mut self, dark: bool, cx: &mut Context<Self>) {
+    fn set_appearance(&mut self, name: &'static str, cx: &mut Context<Self>) {
         self.open_select = None;
-        let key = if dark {
-            crate::config::APPEARANCE_DARK
-        } else {
-            crate::config::APPEARANCE_LIGHT
-        };
-        if self.settings.appearance != key {
-            self.settings.appearance = key.to_string();
-            theme::set_dark(cx, dark);
+        if !self.settings.appearance.eq_ignore_ascii_case(name) {
+            self.settings.appearance = name.to_string();
+            theme::set_appearance(cx, name);
             self.persist(cx);
         } else {
             cx.notify();
@@ -3904,26 +3895,26 @@ impl SettingsView {
     }
 
     fn page_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let dark = self.settings.dark();
-        let rows = [("浅色", false), ("深色", true)]
-            .map(|(label, value)| {
+        let current = self.settings.appearance.trim();
+        let rows = crate::config::APPEARANCES
+            .iter()
+            .map(|&name| {
                 widgets::select_option(
-                    SharedString::from(format!("appearance-{value}")),
-                    label,
-                    dark == value,
+                    SharedString::from(format!("appearance-{name}")),
+                    crate::config::appearance_label(name),
+                    current.eq_ignore_ascii_case(name),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.set_appearance(value, cx)),
+                    cx.listener(move |this, _, _, cx| this.set_appearance(name, cx)),
                 )
             })
-            .into_iter()
             .collect();
         let select = self.select_row(
             cx,
             SelectId::Appearance,
             "外观模式",
-            "切换整个界面的浅色 / 深色主题。",
+            "切换界面主题，立即生效并保存。",
             self.appearance_label(),
             rows,
         );

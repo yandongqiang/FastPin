@@ -14,12 +14,13 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    actions, div, img, prelude::*, px, size, App, AsyncApp, Bounds, Context, CursorStyle,
+    actions, canvas, div, img, prelude::*, px, size, App, AsyncApp, Bounds, Context, CursorStyle,
     FocusHandle, Focusable, FontWeight, ImageSource, KeyBinding, MouseButton, Render, RenderImage,
     SharedString, Window, WindowBounds, WindowHandle, WindowOptions,
 };
@@ -46,6 +47,17 @@ const THUMB_SIZE: u32 = 200;
 const CARD_W: f32 = 240.0;
 /// Padding inside each card.
 const CARD_PAD: f32 = 12.0;
+/// 宫格（瀑布流）的列间距与纵向间距。
+const GRID_GAP: f32 = 16.0;
+
+/// 历史窗口的两种浏览方式（会话内状态，不持久化）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryViewMode {
+    /// 宫格：Masonry 瀑布流，卡片贪心投放到最矮列。
+    Grid,
+    /// 列表：小缩略图 + 纵向排列的元信息。
+    List,
+}
 
 /// 缩略图显示宽度固定（THUMB_SIZE - 2 * CARD_PAD），高度按原图宽高比计算。
 /// 极端比例做 clamp，避免网格等高行被撑得失衡。
@@ -57,6 +69,37 @@ fn thumb_height(width: u32, height: u32) -> f32 {
         return THUMB_W;
     }
     (THUMB_W * height as f32 / width as f32).clamp(MIN_H, MAX_H)
+}
+
+/// 宫格卡片总高度估计，供瀑布流累计列高使用：上下内边距 + 缩略图 +
+/// 图文间距 + 两行信息文字。留出少量余量，保证相邻卡片不会重叠。
+fn card_height(record: &HistoryRecord) -> f32 {
+    const INFO_H: f32 = 36.0; // 12px/10px 两行文字 + 3px gap 的保守估计
+    2.0 * CARD_PAD + thumb_height(record.width, record.height) + 8.0 + INFO_H
+}
+
+/// 空历史提示（宫格 / 列表共用）。
+fn empty_hint() -> impl IntoElement {
+    div()
+        .w_full()
+        .py(px(80.))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .text_size(px(13.))
+                .text_color(theme::secondary_fg())
+                .child("还没有截图历史。"),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(theme::secondary_fg())
+                .child("保存截图后会自动记录到这里。"),
+        )
 }
 
 thread_local! {
@@ -209,6 +252,11 @@ pub struct HistoryWindowView {
     /// it with `history_revision()` so a capture saved elsewhere shows up
     /// without the user pressing 刷新.
     revision_seen: u64,
+    /// 当前浏览方式（宫格 / 列表），仅会话内有效，不写入配置。
+    view_mode: HistoryViewMode,
+    /// 列表容器宽度，由 canvas prepaint 测得；变化时触发瀑布流重排。
+    /// 初值 1000 与窗口默认宽度一致，避免首帧列数抖动。
+    container_width: Rc<Cell<f32>>,
 }
 
 impl HistoryWindowView {
@@ -223,6 +271,8 @@ impl HistoryWindowView {
             selected: None,
             status: SharedString::default(),
             revision_seen: crate::history::history_revision(),
+            view_mode: HistoryViewMode::Grid,
+            container_width: Rc::new(Cell::new(1000.0)),
         };
         this.load_thumbs_async(cx);
         this
@@ -431,8 +481,55 @@ impl HistoryWindowView {
         )
     }
 
-    /// Info bar beneath the title: "N 张图片 · X MB".
-    fn info_bar(&self) -> impl IntoElement {
+    /// 视图切换按钮（宫格 / 列表），当前模式高亮显示。
+    fn view_toggle(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        mode: HistoryViewMode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.view_mode == mode;
+        div()
+            .id(id)
+            .flex_none()
+            .h(px(24.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.))
+            .text_size(px(11.))
+            .cursor(CursorStyle::PointingHand)
+            .bg(if active {
+                theme::accent()
+            } else {
+                theme::elevated_surface()
+            })
+            .text_color(if active {
+                theme::on_accent()
+            } else {
+                theme::primary_fg()
+            })
+            .border_1()
+            .border_color(if active {
+                theme::accent()
+            } else {
+                theme::border()
+            })
+            .hover(|s| s.border_color(theme::accent_hover()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.view_mode = mode;
+                    cx.notify();
+                }),
+            )
+            .child(label)
+    }
+
+    /// Info bar beneath the title: "N 张图片 · X MB" + 视图切换。
+    fn info_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_none()
             .h(px(32.))
@@ -457,6 +554,16 @@ impl HistoryWindowView {
                     .text_size(px(12.))
                     .text_color(theme::secondary_fg())
                     .child(total_size(&self.records)),
+            )
+            .child(
+                div()
+                    .ml_auto()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(self.view_toggle("view-grid", "宫格", HistoryViewMode::Grid, cx))
+                    .child(self.view_toggle("view-list", "列表", HistoryViewMode::List, cx)),
             )
     }
 
@@ -561,48 +668,208 @@ impl HistoryWindowView {
             )
     }
 
-    /// Grid gallery: cards wrap in rows.
+    /// 列表模式的一行：左侧小缩略图（80px 宽，按原图比例定高），右侧
+    /// 日期 / 宽高 / 大小 / 来源纵向排列。点击选中，交互与宫格卡片一致。
+    fn list_row(
+        &self,
+        index: usize,
+        record: &HistoryRecord,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.selected.as_ref() == Some(&record.id);
+        let id = record.id.clone();
+        const ROW_THUMB_W: f32 = 80.0;
+        let thumb_h = if record.width == 0 {
+            ROW_THUMB_W
+        } else {
+            (ROW_THUMB_W * record.height as f32 / record.width as f32).clamp(30.0, 120.0)
+        };
+        div()
+            .id(("history-row", index))
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.))
+            .p(px(8.))
+            .rounded(px(6.))
+            .cursor(CursorStyle::PointingHand)
+            .bg(if selected {
+                theme::selection_wash()
+            } else {
+                theme::elevated_surface()
+            })
+            .border_1()
+            .border_color(if selected {
+                theme::accent()
+            } else {
+                theme::border()
+            })
+            .hover(|s| s.border_color(theme::accent_hover()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.selected = Some(id.clone());
+                    this.status = SharedString::default();
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(ROW_THUMB_W))
+                    .h(px(thumb_h))
+                    .rounded(px(4.))
+                    .bg(theme::muted())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(match self.thumbs.get(&record.id).and_then(|t| t.clone()) {
+                        Some(image) => img(ImageSource::Render(image))
+                            .w(px(ROW_THUMB_W))
+                            .h(px(thumb_h))
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .rounded(px(4.))
+                            .into_any_element(),
+                        None => div()
+                            .w(px(ROW_THUMB_W))
+                            .h(px(thumb_h))
+                            .rounded(px(4.))
+                            .bg(theme::muted())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(theme::secondary_fg())
+                                    .child("无预览"),
+                            )
+                            .into_any_element(),
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::primary_fg())
+                            .child(crate::history::format_utc(record.created_ms)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(theme::secondary_fg())
+                            .child(format!("{} × {}", record.width, record.height)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(theme::secondary_fg())
+                            .child(crate::settings::model::human_size(record.bytes)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(theme::secondary_fg())
+                            .child(crate::history::source_label(&record.source)),
+                    ),
+            )
+    }
+
+    /// 浏览区：顶部一条不可见的 canvas 测量容器宽度（宽度变化时 notify 重排），
+    /// 下方是滚动区。宫格用 Masonry 瀑布流，列表用纵向行。
     fn list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut el = div()
+        let entity_id = cx.entity_id();
+        let width_cell = self.container_width.clone();
+        let measurer = canvas(
+            move |bounds, _, app: &mut App| {
+                let w = f32::from(bounds.size.width);
+                // 容差 1px，避免滚动条出现/消失造成的抖动循环。
+                if (width_cell.get() - w).abs() > 1.0 {
+                    width_cell.set(w);
+                    app.notify(entity_id);
+                }
+            },
+            |_, _, _, _| (),
+        )
+        .w_full()
+        .h(px(1.));
+
+        let mut scroll = div()
             .id("history-grid")
             .flex_1()
             .min_h(px(0.))
             .w_full()
             .overflow_scroll()
             .bg(theme::surface_solid())
-            .p(px(16.))
-            .flex()
-            .flex_wrap()
-            .gap(px(16.));
+            .p(px(16.));
+
         if self.records.is_empty() {
-            el = el.child(
-                div()
-                    .w_full()
-                    .py(px(80.))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(theme::secondary_fg())
-                            .child("还没有截图历史。"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(theme::secondary_fg())
-                            .child("保存截图后会自动记录到这里。"),
-                    ),
-            );
+            scroll = scroll.child(empty_hint());
         } else {
-            for (i, record) in self.records.iter().enumerate() {
-                el = el.child(self.card(i, record, cx));
+            match self.view_mode {
+                HistoryViewMode::Grid => {
+                    // 瀑布流：按测得宽度算列数，卡片贪心投放到当前最矮列。
+                    let w = self.container_width.get();
+                    let cols = ((w - 2.0 * 16.0 + GRID_GAP) / (CARD_W + GRID_GAP))
+                        .floor()
+                        .max(1.0) as usize;
+                    let mut col_h = vec![0.0f32; cols];
+                    let mut placements: Vec<(usize, f32, f32)> =
+                        Vec::with_capacity(self.records.len());
+                    for (i, record) in self.records.iter().enumerate() {
+                        let col = col_h
+                            .iter()
+                            .enumerate()
+                            .min_by(|(_, a), (_, b)| {
+                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|(c, _)| c)
+                            .unwrap_or(0);
+                        let x = col as f32 * (CARD_W + GRID_GAP);
+                        let y = col_h[col];
+                        col_h[col] = y + card_height(record) + GRID_GAP;
+                        placements.push((i, x, y));
+                    }
+                    let max_col_h = col_h.iter().copied().fold(0.0f32, f32::max);
+                    let mut masonry = div()
+                        .id("history-masonry")
+                        .relative()
+                        .w_full()
+                        .h(px(max_col_h.max(1.0)));
+                    for (i, x, y) in placements {
+                        masonry = masonry.child(
+                            div().absolute().left(px(x)).top(px(y)).child(self.card(
+                                i,
+                                &self.records[i],
+                                cx,
+                            )),
+                        );
+                    }
+                    scroll = scroll.child(masonry);
+                }
+                HistoryViewMode::List => {
+                    let mut rows = div().w_full().flex().flex_col().gap(px(8.));
+                    for (i, record) in self.records.iter().enumerate() {
+                        rows = rows.child(self.list_row(i, record, cx));
+                    }
+                    scroll = scroll.child(rows);
+                }
             }
         }
-        el
+
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(measurer)
+            .child(scroll)
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -687,7 +954,7 @@ impl Render for HistoryWindowView {
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_close))
             .child(self.titlebar())
-            .child(self.info_bar())
+            .child(self.info_bar(cx))
             .child(self.list(cx))
             .child(self.footer(cx))
     }

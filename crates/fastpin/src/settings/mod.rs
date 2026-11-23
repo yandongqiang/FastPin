@@ -14,14 +14,15 @@ pub mod widgets;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    deferred, div, img, prelude::*, px, size, App, AsyncApp, Bounds, Context, CursorStyle, Entity,
-    Focusable, FontWeight, ImageSource, MouseButton, RenderImage, SharedString, Subscription,
-    Window, WindowBounds, WindowHandle, WindowOptions,
+    canvas, deferred, div, img, prelude::*, px, size, App, AsyncApp, Bounds, Context, CursorStyle,
+    Entity, Focusable, FontWeight, ImageSource, MouseButton, RenderImage, SharedString,
+    Subscription, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 
 use crate::config::Settings;
@@ -451,6 +452,16 @@ impl From<crate::ocr::EngineStatus> for EngineStatusSnapshot {
     }
 }
 
+/// 「历史图片」内嵌页的呈现方式。会话内状态即可，不需要持久化。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum HistoryViewMode {
+    /// 瀑布流宫格：卡片按最矮列投放。
+    #[default]
+    Grid,
+    /// 单列列表：小缩略图 + 详细信息。
+    List,
+}
+
 pub struct SettingsView {
     page: Page,
     settings: Settings,
@@ -530,6 +541,11 @@ pub struct SettingsView {
     history_confirm_clear: bool,
     /// Source filter for the embedded gallery ("all" / a record source string).
     history_filter: String,
+    /// 宫格 / 列表切换状态（仅本次会话有效）。
+    history_view_mode: HistoryViewMode,
+    /// 宫格容器的真实宽度。GPUI 此 fork 没有 `on_bounds_changed`，由 canvas
+    /// 的 prepaint 回调写入；仅宽度变化时 `notify()` 触发重排。
+    history_grid_width: Rc<Cell<f32>>,
     /// Last history index revision this view loaded. A 400ms poll compares it
     /// with `history_revision()` so a capture copied on the bare export thread
     /// appears without the user pressing 刷新.
@@ -974,6 +990,12 @@ impl SettingsView {
             history_confirm_delete: false,
             history_confirm_clear: false,
             history_filter: "all".to_string(),
+            history_view_mode: HistoryViewMode::Grid,
+            // 近似值：页面内容区宽度 ≈ min(视口宽 - 导航(200) - 内边距(24*2), 内容最大宽)。
+            // 首帧由 canvas prepaint 用真实宽度覆盖。
+            history_grid_width: Rc::new(Cell::new(
+                (f32::from(window.viewport_size().width) - 248.0).clamp(240.0, CONTENT_MAX_W),
+            )),
             history_revision_seen: crate::history::history_revision(),
             history_poll_running: false,
             update_checking: false,
@@ -4195,6 +4217,166 @@ impl SettingsView {
         widgets::rows(rows)
     }
 
+    /// 视图切换按钮（宫格 / 列表），当前模式高亮。样式与独立历史窗口一致。
+    fn history_view_toggle(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        mode: HistoryViewMode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.history_view_mode == mode;
+        div()
+            .id(id)
+            .flex_none()
+            .h(px(24.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.))
+            .text_size(px(11.))
+            .cursor(CursorStyle::PointingHand)
+            .bg(if active {
+                theme::accent()
+            } else {
+                theme::elevated_surface()
+            })
+            .text_color(if active {
+                theme::on_accent()
+            } else {
+                theme::primary_fg()
+            })
+            .border_1()
+            .border_color(if active {
+                theme::accent()
+            } else {
+                theme::border()
+            })
+            .hover(|s| s.border_color(theme::accent_hover()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.history_view_mode = mode;
+                    cx.notify();
+                }),
+            )
+            .child(label)
+    }
+
+    /// 列表模式下的单行历史卡片：左侧小缩略图，右侧日期 / 尺寸 / 大小 / 来源。
+    /// 点击整行即选中该图片，与宫格卡片行为一致。
+    fn history_list_row(
+        &self,
+        record: &HistoryRecord,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        const ROW_THUMB_W: f32 = 80.0;
+        const ROW_PAD: f32 = 8.0;
+
+        let selected = self.history_selected.as_ref() == Some(&record.id);
+        let id = record.id.clone();
+        let thumb = self.history_thumbs.get(&record.id).and_then(|t| t.clone());
+        // 小缩略图按原图比例缩放，限制在合理区间避免把行撑得过高/过矮。
+        let thumb_h = if record.width == 0 || record.height == 0 {
+            ROW_THUMB_W
+        } else {
+            (ROW_THUMB_W * record.height as f32 / record.width as f32).clamp(44.0, 80.0)
+        };
+
+        div()
+            .id(("settings-history-row", index))
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.))
+            .p(px(ROW_PAD))
+            .rounded(px(8.))
+            .cursor(CursorStyle::PointingHand)
+            .bg(if selected {
+                theme::selection_wash()
+            } else {
+                theme::elevated_surface()
+            })
+            .border_1()
+            .border_color(if selected {
+                theme::accent()
+            } else {
+                theme::border()
+            })
+            .hover(|s| s.border_color(theme::accent_hover()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.history_selected = Some(id.clone());
+                    this.history_status = SharedString::default();
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(ROW_THUMB_W))
+                    .h(px(thumb_h))
+                    .rounded(px(4.))
+                    .bg(theme::muted())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(match thumb {
+                        Some(image) => img(ImageSource::Render(image))
+                            .w(px(ROW_THUMB_W))
+                            .h(px(thumb_h))
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .rounded(px(4.))
+                            .into_any_element(),
+                        None => div()
+                            .w(px(ROW_THUMB_W))
+                            .h(px(thumb_h))
+                            .rounded(px(4.))
+                            .bg(theme::muted())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child("无预览")
+                            .into_any_element(),
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::primary_fg())
+                            .child(crate::history::format_utc(record.created_ms)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::secondary_fg())
+                            .child(format!("{} × {}", record.width, record.height)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::secondary_fg())
+                            .child(model::human_size(record.bytes)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::secondary_fg())
+                            .child(crate::history::source_label(&record.source)),
+                    ),
+            )
+    }
+
     /// Embedded history gallery. This renders the *same* grid as the standalone
     /// history window so clicking "历史图片" in the nav shows the actual captured
     /// images — not a near-empty action page that looks like "nothing loaded".
@@ -4274,14 +4456,15 @@ impl SettingsView {
                 ))
             });
 
-        let mut grid = div()
-            .id("settings-history-grid")
-            .w_full()
-            .flex()
-            .flex_wrap()
-            .gap(px(16.));
+        const GAP: f32 = 16.0;
+        // 卡片中除缩略图以外的固定高度估算：上下内边距 + 图文间距 + 两行文字 + 边框。
+        // 只用于瀑布流列高平衡，不影响卡片真实布局。
+        const CARD_CHROME_H: f32 = 2.0 * PAD + 8.0 + 34.0 + 2.0;
 
-        if visible.is_empty() {
+        let view_id = cx.entity_id();
+        let width_cell = self.history_grid_width.clone();
+
+        let gallery = if visible.is_empty() {
             let (title, hint) = if self.history_records.is_empty() {
                 (
                     "还没有截图历史。",
@@ -4290,30 +4473,85 @@ impl SettingsView {
             } else {
                 ("当前筛选下没有图片。", "试试将来源筛选切换为“全部来源”。")
             };
-            grid = grid.child(
-                div()
-                    .w_full()
-                    .py(px(60.))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(theme::secondary_fg())
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(theme::secondary_fg())
-                            .child(hint),
-                    ),
-            );
-        } else {
+            div()
+                .id("settings-history-grid")
+                .w_full()
+                .py(px(60.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(theme::secondary_fg())
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::secondary_fg())
+                        .child(hint),
+                )
+        } else if self.history_view_mode == HistoryViewMode::List {
+            // 列表模式：纵向堆叠的单行卡片。
+            let mut list = div()
+                .id("settings-history-list")
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(8.));
             for (i, record) in visible.iter().enumerate() {
+                list = list.child(self.history_list_row(record, i, cx));
+            }
+            list
+        } else {
+            // 宫格模式：Masonry 瀑布流。按容器宽度计算列数，每张图投放到最矮列。
+            let w = width_cell.get().max(CARD_W + 2.0 * PAD);
+            let cols = ((w - 2.0 * PAD + GAP) / (CARD_W + GAP)).floor().max(1.0) as usize;
+            let mut col_heights = vec![0.0f32; cols];
+            let mut placements: Vec<((f32, f32), &HistoryRecord, usize)> =
+                Vec::with_capacity(visible.len());
+            for (i, record) in visible.iter().enumerate() {
+                let card_h = thumb_height(record.width, record.height) + CARD_CHROME_H + GAP;
+                // 投放到当前最矮的一列；相同高度时保留靠左的优先级。
+                let col = col_heights
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(c, _)| c)
+                    .unwrap_or(0);
+                let x = PAD + col as f32 * (CARD_W + GAP);
+                let y = col_heights[col];
+                col_heights[col] += card_h;
+                placements.push(((x, y), *record, i));
+            }
+            let max_h = col_heights.iter().copied().fold(0.0f32, f32::max).max(PAD);
+
+            let mut grid = div()
+                .id("settings-history-grid")
+                .relative()
+                .w_full()
+                .h(px(max_h))
+                // 用 canvas 的 prepaint 读取真实容器宽度；只有变化超过 1px 才
+                // notify 重排，避免滚动条或舍入误差引起的抖动。
+                .child(
+                    canvas(
+                        move |bounds, _, app| {
+                            let new_w: f32 = bounds.size.width.into();
+                            if (new_w - width_cell.get()).abs() > 1.0 {
+                                width_cell.set(new_w);
+                                app.notify(view_id);
+                            }
+                        },
+                        |_, _, _, _| (),
+                    )
+                    .w_full()
+                    .h(px(1.)),
+                );
+
+            for ((x, y), record, i) in placements {
                 let selected = self.history_selected.as_ref() == Some(&record.id);
                 let id = record.id.clone();
                 let thumb = self.history_thumbs.get(&record.id).and_then(|t| t.clone());
@@ -4321,7 +4559,9 @@ impl SettingsView {
                 grid = grid.child(
                     div()
                         .id(("settings-history-card", i))
-                        .flex_none()
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
                         .w(px(CARD_W))
                         .flex()
                         .flex_col()
@@ -4404,7 +4644,8 @@ impl SettingsView {
                         ),
                 );
             }
-        }
+            grid
+        };
 
         div()
             .w_full()
@@ -4440,6 +4681,26 @@ impl SettingsView {
                     .flex_row()
                     .items_center()
                     .gap(px(8.))
+                    // 宫格 / 列表切换：选中项用强调色高亮。
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(self.history_view_toggle(
+                                "hist-view-grid",
+                                "宫格",
+                                HistoryViewMode::Grid,
+                                cx,
+                            ))
+                            .child(self.history_view_toggle(
+                                "hist-view-list",
+                                "列表",
+                                HistoryViewMode::List,
+                                cx,
+                            )),
+                    )
                     .child(widgets::button("hist-refresh", "刷新").on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.reload_history(cx)),
@@ -4497,7 +4758,7 @@ impl SettingsView {
                     })
                     .child(self.history_status.clone()),
             )
-            .child(grid)
+            .child(gallery)
             .into_any_element()
     }
 

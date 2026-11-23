@@ -71,7 +71,7 @@ impl Page {
             Page::Appearance => "外观",
             Page::Hotkey => "快捷键",
             Page::Translate => "翻译",
-            Page::Resources => "资源管理",
+            Page::Resources => "文本识别",
             Page::Data => "数据管理",
             Page::About => "关于",
         }
@@ -88,7 +88,7 @@ impl Page {
             Page::Appearance => "界面主题与标注外观。",
             Page::Hotkey => "全局快捷键，在任何界面都可以触发。",
             Page::Translate => "翻译服务的接口、模型与目标语言。",
-            Page::Resources => "本地识别模型的存放位置。",
+            Page::Resources => "本地 OCR 识别引擎与模型目录。",
             Page::Data => "数据目录、日志、存储占用与截图历史。",
             Page::About => "版本信息与更新检查。",
         }
@@ -508,7 +508,7 @@ pub const ROWS: &[RowMeta] = &[
         title: "明文 HTTP 警告",
         desc: "http:// 接口携带 API Key 时需两次点击确认明文传输风险。",
     },
-    // 资源管理
+    // 文本识别
     RowMeta {
         page: Page::Resources,
         title: "识别引擎",

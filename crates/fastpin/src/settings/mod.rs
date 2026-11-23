@@ -465,7 +465,7 @@ enum HistoryViewMode {
 pub struct SettingsView {
     page: Page,
     settings: Settings,
-    /// 外观下拉的全部选项（themes 目录里每个主题族的全部变体），开窗时取样一次。
+    /// 外观下拉的全部选项（gpui-kit registry 里的主题名，默认两项在前），开窗时取样一次。
     theme_options: Vec<(String, String)>,
     status: SharedString,
     status_error: bool,
@@ -1928,7 +1928,7 @@ impl SettingsView {
 
     /// Appearance switch: save first, then push the theme into gpui-kit and
     /// refresh every window so the toolbar and this window repaint together.
-    /// `name` 是 themes 目录里变体的注册名；历史配置文件里的族 id 仍可解析。
+    /// `name` 是 registry 里的主题注册名；未知值在 `theme::set_appearance` 里回退默认浅色。
     fn set_appearance(&mut self, name: &str, cx: &mut Context<Self>) {
         self.open_select = None;
         if !self.settings.appearance.eq_ignore_ascii_case(name) {
@@ -3929,7 +3929,7 @@ impl SettingsView {
             cx,
             SelectId::Appearance,
             "外观模式",
-            "选择界面主题（来自 themes 目录），立即生效并保存。",
+            "选择界面主题（gpui-kit 内置主题），立即生效并保存。",
             self.appearance_label(),
             rows,
         );

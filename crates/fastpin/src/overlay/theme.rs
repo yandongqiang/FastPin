@@ -8,11 +8,18 @@
 //!
 //! Everything is a snapshot rather than a `cx` lookup because most of these
 //! helpers are called from pure element builders that never see the app.
+//!
+//! `themes/*.json` 由 build.rs 生成 `include_str!` 列表编译进二进制，`init_themes`
+//! 把它们注册进 gpui-kit 的 `ThemeRegistry`；下拉和切换都以 registry 为唯一来源，
+//! 不再扫描运行时目录，也不再自己维护族映射表。
 
 use std::sync::RwLock;
 
 use gpui::{hsla, rgb, Hsla, Pixels, SharedString};
 use gpui_kit::component::{Theme, ThemeColor, ThemeMode, ThemeRegistry};
+
+// build.rs 扫描仓库根的 themes 目录生成；主题文本随二进制发布，换目录运行也能加载。
+include!(concat!(env!("OUT_DIR"), "/themes_included.rs"));
 
 /// Colours the chrome needs, already resolved from the theme's colour tokens.
 ///
@@ -126,193 +133,36 @@ pub fn apply_theme(theme: &Theme) {
     *guard = Some(palette);
 }
 
-/// 磁盘上的一个 gpui-kit 主题族。设置文件现在直接写变体在 registry 里的
-/// 注册名；light/dark key 只用于兼容历史配置文件里的族 id / `-dark` 写法。
-#[derive(Clone, Debug)]
-struct ThemeFamily {
-    /// 族名，如 "CitePix" / "Catppuccin"。保留用于诊断输出。
-    #[allow(dead_code)]
-    name: String,
-    /// 设置文件里的稳定 id，目前就是族名。
-    id: String,
-    /// 第一个浅色变体的注册名；族内没有浅色变体时为 None。
-    light_key: Option<String>,
-    /// 第一个深色变体的注册名；族内没有深色变体时为 None。
-    dark_key: Option<String>,
-    /// 全部变体注册名，允许 appearance 直接写变体名。
-    variants: Vec<String>,
+/// registry 里的主题名快照。`available_themes()` 是静态函数拿不到 `cx`，
+/// 只能在 `init_themes` 时从 registry 收集一次；默认两项在前，其余按名字排序。
+fn theme_keys() -> &'static RwLock<Vec<String>> {
+    static KEYS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+    &KEYS
 }
 
-/// 进程内的主题族映射。gpui-kit 的 registry 会丢掉族名，只按变体名注册，
-/// 族 → 变体的对应关系只能在这里自己维护。
-fn families() -> &'static RwLock<Vec<ThemeFamily>> {
-    static FAMILIES: RwLock<Vec<ThemeFamily>> = RwLock::new(Vec::new());
-    &FAMILIES
+/// 默认两项固定排在最前，其余按名字排序。纯函数，便于无 `cx` 的测试。
+fn theme_name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn rank(name: &str) -> u8 {
+        if name == crate::config::DEFAULT_APPEARANCE {
+            0
+        } else if name == crate::config::DEFAULT_DARK_APPEARANCE {
+            1
+        } else {
+            2
+        }
+    }
+    rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
 }
 
-/// 从主题文件文本里读出族映射。用 `serde_json::Value` 而不是强类型
-/// `ThemeSet`：文件可能新增字段，这里只关心 name / themes[].name / mode。
-fn parse_family(text: &str) -> Option<ThemeFamily> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let name = value.get("name")?.as_str()?.trim().to_string();
-    if name.is_empty() {
-        return None;
-    }
-    let mut light_key = None;
-    let mut dark_key = None;
-    let mut variants = Vec::new();
-    if let Some(themes) = value.get("themes").and_then(|v| v.as_array()) {
-        for variant in themes {
-            let Some(key) = variant.get("name").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if key.trim().is_empty() {
-                continue;
-            }
-            let dark = variant
-                .get("mode")
-                .and_then(|v| v.as_str())
-                .is_some_and(|mode| mode.eq_ignore_ascii_case("dark"));
-            if dark {
-                dark_key.get_or_insert_with(|| key.to_string());
-            } else {
-                light_key.get_or_insert_with(|| key.to_string());
-            }
-            variants.push(key.to_string());
-        }
-    }
-    if variants.is_empty() {
-        return None;
-    }
-    Some(ThemeFamily {
-        id: name.clone(),
-        name,
-        light_key,
-        dark_key,
-        variants,
-    })
+fn sorted_theme_names(mut names: Vec<String>) -> Vec<String> {
+    names.sort_by(|a, b| theme_name_cmp(a, b));
+    names
 }
 
-/// 主题文件查找路径：优先 exe 旁的 `themes/`（便携版），其次是当前工作
-/// 目录下的 `themes/`（源码目录直接运行时）。
-fn theme_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            dirs.push(parent.join("themes"));
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let dir = cwd.join("themes");
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    }
-    dirs
-}
-
-/// 扫描主题目录，把每个族的所有变体注册进 gpui-kit 并记下族映射。
-/// 目录缺失、文件损坏或注册失败都静默降级到 gpui-kit 默认主题，绝不影响启动。
-pub fn init_themes(cx: &mut gpui::App) {
-    // 正常由 init() 在 gpui_kit::init 之后调用；单独调用时不 panic，静默跳过。
-    if !cx.has_global::<ThemeRegistry>() {
-        *families().write().unwrap_or_else(|e| e.into_inner()) = Vec::new();
-        return;
-    }
-    let mut loaded: Vec<ThemeFamily> = Vec::new();
-    for dir in theme_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut files: Vec<_> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-            })
-            .collect();
-        files.sort();
-        for path in files {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Some(family) = parse_family(&text) else {
-                continue;
-            };
-            if loaded
-                .iter()
-                .any(|known| known.id.eq_ignore_ascii_case(&family.id))
-            {
-                continue;
-            }
-            if let Err(e) = ThemeRegistry::global_mut(cx).load_themes_from_str(&text) {
-                eprintln!("主题 {} 注册失败：{e}", path.display());
-                continue;
-            }
-            loaded.push(family);
-        }
-        // 命中一个目录即可：exe 旁有主题时不再读工作目录的同名文件。
-        if !loaded.is_empty() {
-            break;
-        }
-    }
-    *families().write().unwrap_or_else(|e| e.into_inner()) = loaded;
-}
-
-/// 在已知主题族里解析 appearance id，返回 registry 里的变体注册名。
-/// 同时接受族 id（`Catppuccin` / `Catppuccin-dark`）与具体变体名
-///（`Catppuccin Mocha`），便于手工编辑设置文件。
-fn family_key_in(families: &[ThemeFamily], name: &str) -> Option<String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    let lower = name.to_ascii_lowercase();
-    for family in families {
-        if let Some(variant) = family
-            .variants
-            .iter()
-            .find(|key| key.to_ascii_lowercase() == lower)
-        {
-            return Some(variant.clone());
-        }
-        let (base, want_dark) = match lower.strip_suffix("-dark") {
-            Some(base) => (base, true),
-            None => (lower.as_str(), false),
-        };
-        if base == family.id.to_ascii_lowercase() {
-            let key = if want_dark {
-                family.dark_key.as_ref().or(family.light_key.as_ref())
-            } else {
-                family.light_key.as_ref().or(family.dark_key.as_ref())
-            };
-            if let Some(key) = key {
-                return Some(key.clone());
-            }
-        }
-    }
-    None
-}
-
-fn family_theme_key(name: &str) -> Option<String> {
-    let guard = families().read().unwrap_or_else(|e| e.into_inner());
-    family_key_in(&guard, name)
-}
-
-/// 设置页下拉用的 (id, 标签)：完全来自 themes 目录，按文件 / 族顺序列出每个
-/// 主题族的全部变体。id 与标签都是变体在 gpui-kit registry 里的注册名，
-/// 直接作为 `appearance` 写进设置文件。
-///
-/// 极端情况（目录缺失、全部文件损坏）下一个变体都没有时，回退到 gpui-kit
-/// 默认注册的两项，保证下拉不为空。
-fn theme_options_from(families: &[ThemeFamily]) -> Vec<(String, String)> {
-    let options: Vec<(String, String)> = families
-        .iter()
-        .flat_map(|family| family.variants.iter().map(|key| (key.clone(), key.clone())))
-        .collect();
-    if options.is_empty() {
+/// 下拉选项直接以 registry 注册名作为 id 和标签；空快照回退 gpui-kit 默认
+/// 两项，保证下拉永远不为空。纯函数，便于无 `cx` 的测试。
+fn theme_options_from_keys(names: &[String]) -> Vec<(String, String)> {
+    if names.is_empty() {
         return vec![
             (
                 crate::config::DEFAULT_APPEARANCE.to_string(),
@@ -324,18 +174,47 @@ fn theme_options_from(families: &[ThemeFamily]) -> Vec<(String, String)> {
             ),
         ];
     }
-    options
+    names
+        .iter()
+        .map(|name| (name.clone(), name.clone()))
+        .collect()
 }
 
-/// 设置页下拉内容；变体列表在 `init_themes` 后不再变化，开窗时取一次即可。
+/// 设置页下拉内容；列表在 `init_themes` 后不再变化，开窗时取一次即可。
 pub fn available_themes() -> Vec<(String, String)> {
-    let guard = families().read().unwrap_or_else(|e| e.into_inner());
-    theme_options_from(&guard)
+    let guard = theme_keys().read().unwrap_or_else(|e| e.into_inner());
+    theme_options_from_keys(&guard)
 }
 
-/// Initializes gpui-kit (GPUI base, components and their globals), loads the
-/// shipped theme families, and applies the appearance persisted in
-/// `settings.json`. Call once per `App`, before any window opens.
+/// 把编译进二进制的 `themes/*.json` 全部注册进 gpui-kit，并把 registry 里的
+/// 主题名记到快照里供下拉使用。单个文件注册失败（如缺 `syntax` 的
+/// `citepix.json`）静默跳过；没有 registry 时只清空快照，绝不 panic。
+pub fn init_themes(cx: &mut gpui::App) {
+    // 正常由 init() 在 gpui_kit::init 之后调用；单独调用时不 panic，静默跳过。
+    if !cx.has_global::<ThemeRegistry>() {
+        *theme_keys().write().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        return;
+    }
+
+    for &(_, text) in INCLUDED_THEMES {
+        let _ = ThemeRegistry::global_mut(cx).load_themes_from_str(text);
+    }
+
+    // 下拉完全来自 registry：默认两项在前，其余按名字排序；不排除默认，
+    // 让用户也能从其它主题切回 gpui-kit 自带外观。
+    let keys = sorted_theme_names(
+        ThemeRegistry::global(cx)
+            .themes()
+            .keys()
+            .map(|key| key.to_string())
+            .collect(),
+    );
+    *theme_keys().write().unwrap_or_else(|e| e.into_inner()) = keys;
+}
+
+/// Initializes gpui-kit (GPUI base, components and their globals), registers
+/// the embedded themes, and applies the appearance persisted in `settings.json`.
+/// Call once per `App`, before any window opens.
 pub fn init(cx: &mut gpui::App) {
     gpui_kit::init(cx);
     init_themes(cx);
@@ -345,14 +224,14 @@ pub fn init(cx: &mut gpui::App) {
 /// Switches appearance at runtime through the component theme, refreshes the
 /// snapshot, and asks every window (settings included) to repaint.
 ///
-/// `name` 是 themes 目录里变体的注册名（下拉直接写这个名字）；历史配置文件里
-/// 的族 id（`Catppuccin` / `Catppuccin-dark`）仍由 `family_theme_key` 解析到
-/// 族内变体。明暗与颜色一概取自 registry 里的 `ThemeConfig`，不再叠加任何
-/// 人造 tint。找不到的名字回退到 gpui-kit 默认浅色变体，绝不 panic。
+/// `name` 是 registry 里的主题注册名（下拉直接写这个名字），gpui-kit 默认
+/// 浅色 / 深色两项也始终可选。明暗与颜色一概取自 registry 里的 `ThemeConfig`，
+/// 不再叠加任何族映射或人造 tint。找不到的名字回退到 gpui-kit 默认浅色变体，
+/// 绝不 panic。
 pub fn set_appearance(cx: &mut gpui::App, name: &str) {
     let cfg = {
         let registry = ThemeRegistry::global(cx);
-        let key = family_theme_key(name).unwrap_or_else(|| name.trim().to_string());
+        let key = name.trim();
         registry
             .themes()
             .get(&SharedString::from(key))
@@ -682,123 +561,54 @@ mod tests {
         assert_eq!(p.danger_hover, tokens.danger_hover);
     }
 
-    /// 族映射的纯逻辑测试：不依赖 cx，也不触碰进程内的注册表。
+    /// registry 名列表的排序逻辑：默认两项在前，其余按名字排序。
+    /// 不依赖 cx，也不触碰进程内的注册表。
     #[test]
-    fn parses_theme_family_from_json() {
-        let text = r#"{
-            "name": "Catppuccin",
-            "themes": [
-                {"name": "Catppuccin Latte", "mode": "light"},
-                {"name": "Catppuccin Frappe", "mode": "dark"},
-                {"name": "Catppuccin Mocha", "mode": "dark"}
-            ]
-        }"#;
-        let family = parse_family(text).expect("parses family");
-        assert_eq!(family.name, "Catppuccin");
-        assert_eq!(family.id, "Catppuccin");
-        assert_eq!(family.light_key.as_deref(), Some("Catppuccin Latte"));
-        assert_eq!(family.dark_key.as_deref(), Some("Catppuccin Frappe"));
-        assert_eq!(family.variants.len(), 3);
-        // 缺字段、空族和坏 JSON 都不能产生映射。
-        assert!(parse_family(r#"{"themes": []}"#).is_none());
-        assert!(parse_family(r#"{"name": "X"}"#).is_none());
-        assert!(parse_family("not json").is_none());
+    fn registry_names_are_sorted_with_defaults_first() {
+        let names = sorted_theme_names(vec![
+            "Tokyo Night".to_string(),
+            crate::config::DEFAULT_DARK_APPEARANCE.to_string(),
+            "Catppuccin Mocha".to_string(),
+            crate::config::DEFAULT_APPEARANCE.to_string(),
+            "Adventure".to_string(),
+        ]);
+        let expected: Vec<String> = [
+            crate::config::DEFAULT_APPEARANCE,
+            crate::config::DEFAULT_DARK_APPEARANCE,
+            "Adventure",
+            "Catppuccin Mocha",
+            "Tokyo Night",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        assert_eq!(names, expected);
     }
 
-    /// 下拉只列 themes 目录的真实变体，id / 标签都是注册名；空目录回退默认两项。
+    /// 下拉的 id 与标签都直接取 registry 注册名，默认两项也在其中。
     #[test]
-    fn available_themes_list_every_variant_in_family_order() {
+    fn theme_options_come_from_registry_names() {
         let option = |name: &str| (name.to_string(), name.to_string());
-        let families = vec![
-            parse_family(
-                r#"{
-                    "name": "Catppuccin",
-                    "themes": [
-                        {"name": "Catppuccin Latte", "mode": "light"},
-                        {"name": "Catppuccin Frappe", "mode": "dark"},
-                        {"name": "Catppuccin Mocha", "mode": "dark"}
-                    ]
-                }"#,
-            )
-            .unwrap(),
-            parse_family(
-                r#"{
-                    "name": "CitePix",
-                    "themes": [
-                        {"name": "CitePix Light", "mode": "light"},
-                        {"name": "CitePix Dark", "mode": "dark"}
-                    ]
-                }"#,
-            )
-            .unwrap(),
-        ];
+        let names = sorted_theme_names(vec![
+            "Catppuccin Mocha".to_string(),
+            crate::config::DEFAULT_APPEARANCE.to_string(),
+            crate::config::DEFAULT_DARK_APPEARANCE.to_string(),
+        ]);
         assert_eq!(
-            theme_options_from(&families),
+            theme_options_from_keys(&names),
             vec![
-                option("Catppuccin Latte"),
-                option("Catppuccin Frappe"),
+                option(crate::config::DEFAULT_APPEARANCE),
+                option(crate::config::DEFAULT_DARK_APPEARANCE),
                 option("Catppuccin Mocha"),
-                option("CitePix Light"),
-                option("CitePix Dark"),
             ]
         );
+        // 空快照时只回退默认两项，保证下拉不为空。
         assert_eq!(
-            theme_options_from(&[]),
+            theme_options_from_keys(&[]),
             vec![
                 option(crate::config::DEFAULT_APPEARANCE),
                 option(crate::config::DEFAULT_DARK_APPEARANCE),
             ]
         );
-    }
-
-    #[test]
-    fn family_ids_and_variant_names_resolve_to_registry_keys() {
-        let families = vec![
-            parse_family(
-                r#"{
-                    "name": "Catppuccin",
-                    "themes": [
-                        {"name": "Catppuccin Latte", "mode": "light"},
-                        {"name": "Catppuccin Frappe", "mode": "dark"}
-                    ]
-                }"#,
-            )
-            .unwrap(),
-            parse_family(
-                r#"{
-                    "name": "Adventure",
-                    "themes": [{"name": "Adventure", "mode": "dark"}]
-                }"#,
-            )
-            .unwrap(),
-        ];
-        // 族 id 按 mode 选变体；只有深色变体时浅色 id 也回落到它。
-        assert_eq!(
-            family_key_in(&families, "Catppuccin").as_deref(),
-            Some("Catppuccin Latte")
-        );
-        assert_eq!(
-            family_key_in(&families, "Catppuccin-dark").as_deref(),
-            Some("Catppuccin Frappe")
-        );
-        assert_eq!(
-            family_key_in(&families, "  catppuccin-DARK  ").as_deref(),
-            Some("Catppuccin Frappe")
-        );
-        // 变体名与空白、大小写都接受。
-        assert_eq!(
-            family_key_in(&families, "catppuccin frappe").as_deref(),
-            Some("Catppuccin Frappe")
-        );
-        assert_eq!(
-            family_key_in(&families, " Adventure ").as_deref(),
-            Some("Adventure")
-        );
-        // 默认主题名等非主题族值不能误命中主题族。
-        assert_eq!(
-            family_key_in(&families, crate::config::DEFAULT_APPEARANCE),
-            None
-        );
-        assert_eq!(family_key_in(&families, ""), None);
     }
 }

@@ -454,7 +454,7 @@ pub const ROWS: &[RowMeta] = &[
     RowMeta {
         page: Page::Appearance,
         title: "外观模式",
-        desc: "选择界面主题（来自 themes 目录），立即生效并保存。",
+        desc: "选择界面主题（gpui-kit 内置主题），立即生效并保存。",
     },
     // 快捷键
     RowMeta {
@@ -969,10 +969,10 @@ mod tests {
         assert_eq!(search("OPENAI").len(), by_desc.len());
     }
 
-    /// 外观行的描述指向 themes 目录，搜索与重置测试都要覆盖新文案。
+    /// 外观行的描述指向 gpui-kit 内置主题，搜索与重置测试都要覆盖新文案。
     #[test]
     fn appearance_row_search_and_reset_use_the_new_wording() {
-        let hits = search("来自 themes 目录");
+        let hits = search("gpui-kit 内置主题");
         assert!(hits
             .iter()
             .any(|r| r.page == Page::Appearance && r.title == "外观模式"));

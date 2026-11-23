@@ -21,8 +21,8 @@ pub struct Settings {
     pub screenshot: Screenshot,
     pub history: History,
     pub hotkeys: Hotkeys,
-    /// UI 外观：themes 目录里主题变体的注册名（如 `"Catppuccin Latte"`、
-    /// `"CitePix Dark"`），默认 `"Default Light"`（gpui-kit 自带变体）。
+    /// UI 外观：编译进二进制并注册到 gpui-kit 的主题变体名（如
+    /// `"Catppuccin Latte"`、`"CitePix Dark"`），默认 `"Default Light"`。
     /// 纯字符串保持配置文件可手改；未知值在启动时回退到默认浅色主题，
     /// 不会让整个配置文件失效。
     pub appearance: String,

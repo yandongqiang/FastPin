@@ -111,13 +111,25 @@ pub fn encode_png_bgra(pixels: &[u8], width: u32, height: u32, stride: u32) -> R
 /// history gallery, the settings grid, the collage and the image-split tools so
 /// the channel order stays identical everywhere.
 pub fn decode_bgra(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+    // 与水印解码同一套三重检查：文件大小 → 头部声明的尺寸 → 解码后的实际
+    // 尺寸。否则一张小文件的「图片炸弹」能让 `to_rgba8` 在预算外分配。
+    let meta = path.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    BUDGET.checked_len(meta.len()).ok()?;
+    let (header_w, header_h) = image::image_dimensions(path).ok()?;
+    BUDGET.checked_dims(header_w as u64, header_h as u64).ok()?;
+
     let decoded = image::open(path).ok()?.to_rgba8();
     let (w, h) = decoded.dimensions();
     if w == 0 || h == 0 {
         return None;
     }
+    BUDGET.checked_dims(w as u64, h as u64).ok()?;
     let src = decoded.into_raw();
-    let mut bgra = vec![0u8; src.len()];
+    // 第二次拷贝（RGBA → BGRA）同样走预算，不能用 infallible `vec!`。
+    let mut bgra = BUDGET.alloc_rgba(w as u64, h as u64).ok()?;
     // `as_chunks` yields `&[u8; 4]` / `&mut [u8; 4]` so the swap stays in-bounds
     // and clippy's `chunks_exact` lint is silenced without losing the zip.
     for (s, d) in src

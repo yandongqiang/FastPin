@@ -48,6 +48,10 @@ use crate::platform::{
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 
+/// 截图文件名的进程内预留锁。去重扫描和 `create_new` 预留必须在一把锁内，
+/// 否则两个同时完成的截屏会看到同一个「不存在」的名字，再互相截断文件。
+static SAVE_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 thread_local! {
     static GPUI_APP: RefCell<Option<gpui::AsyncApp>> = const { RefCell::new(None) };
     static BENCH_CTRL: RefCell<Option<BenchControl>> = const { RefCell::new(None) };
@@ -1103,6 +1107,8 @@ fn export_pixels_shared_with_source(
         let mut export = crate::config::get().screenshot.export.clone();
         // A format this machine cannot encode falls back to PNG, so a config
         // copied from another PC still saves the screenshot instead of failing.
+        // 设置页用同一个 effective_format 显示当前实际格式，并与这里的回退
+        // 保持一致：本机缺 WebP 时不展示质量滑块、提示实际写的是 PNG。
         export.format = crate::codec::effective_format(export.format);
         let path = default_image_path(&export)?;
         let px_file = px.clone();
@@ -1122,6 +1128,9 @@ fn export_pixels_shared_with_source(
                 ch,
                 stride,
             ) {
+                // `default_image_path` 已经预留了空文件；写入失败要把它删掉，
+                // 免得留下一个永远不会被重命名的 0 字节截图。
+                let _ = std::fs::remove_file(&path);
                 crate::perf::log_app(&format!("image write failed: {e}"));
                 return;
             }
@@ -1190,7 +1199,26 @@ fn default_image_path(export: &crate::config::Export) -> Result<PathBuf> {
     let date = format!("{:04}{:02}{:02}", t.wYear, t.wMonth, t.wDay);
     let time = format!("{:02}{:02}{:02}", t.wHour, t.wMinute, t.wSecond);
     let stem = export.expand_name(&date, &time);
-    Ok(unique_path(&dir, &stem, export.format.extension()))
+    let extension = export.format.extension();
+
+    // 从查重到预留空文件全程持锁；`create_new` 还能挡住进程外的同名竞争。
+    // 返回的空文件由导出线程用 File::create 覆盖，编码失败时它负责删除。
+    let _guard = SAVE_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let candidate = unique_path(&dir, &stem, extension);
+    for path in
+        std::iter::once(candidate).chain((2..).map(|n| dir.join(format!("{stem}_{n}.{extension}"))))
+    {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::new("无法预留截图文件名"))
 }
 
 /// Two shots inside the same second share a stem; a screenshot silently

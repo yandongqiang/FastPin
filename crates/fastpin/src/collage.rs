@@ -713,11 +713,13 @@ pub fn calculate_collage_layout(
 
             let w = max_cell_w
                 .saturating_mul(cols)
-                .saturating_add(settings.spacing * (cols - 1))
+                // spacing * (n-1) 手改配置时可能回绕成很小的值，进而让拼版
+                // 越界；这里按饱和乘法算，让尺寸顶到上限而不是绕回去。
+                .saturating_add(settings.spacing.saturating_mul(cols - 1))
                 .saturating_add(settings.border * 2);
             let h = max_cell_h
                 .saturating_mul(rows)
-                .saturating_add(settings.spacing * (rows - 1))
+                .saturating_add(settings.spacing.saturating_mul(rows - 1))
                 .saturating_add(settings.border * 2);
 
             let cols_usize = cols as usize;

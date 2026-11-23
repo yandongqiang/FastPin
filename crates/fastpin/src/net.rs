@@ -359,29 +359,62 @@ fn is_redirect(status: u32) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-/// Download hosts redirect to a CDN. Accept only absolute http(s) URLs or a
-/// root-relative path on the same host — never `file://` or a local path.
+/// Download hosts redirect to a CDN. 与 `update.rs` 的发布包策略保持一致：
+/// 重定向只允许 HTTPS，且目标主机必须在 GitHub / GitHub 资源 CDN 白名单内；
+/// 根相对路径沿用当前 URL 的主机。拒绝 `http://` 降级、`file://` 和本地路径。
+///
+/// 注意：`download_url_to` 目前没有业务调用方；若将来接入新的下载源，必须
+/// 先把它的主机加进下面的白名单，不能靠放宽这里的校验来「修」下载失败。
 fn resolve_download_redirect(base: &str, location: &str) -> Result<String> {
     let loc = location.trim();
     if loc.is_empty() {
         return Err(Error::new("下载重定向地址为空"));
     }
     let lower = loc.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("http://") {
+    if lower.starts_with("http://") {
+        return Err(Error::new("下载重定向只允许 HTTPS"));
+    }
+    if let Some(stripped) = lower.strip_prefix("https://") {
+        if !trusted_download_authority(stripped) {
+            return Err(Error::new("下载重定向主机不在白名单内"));
+        }
         return Ok(loc.to_string());
     }
     if let Some(path) = loc.strip_prefix('/') {
         let (scheme, rest) = base
             .split_once("://")
             .ok_or_else(|| Error::new("下载地址无效"))?;
+        if scheme != "https" {
+            return Err(Error::new("下载重定向只允许 HTTPS"));
+        }
         let authority = rest
             .split(['/', '?', '#'])
             .next()
             .filter(|host| !host.is_empty() && !host.contains('@'))
             .ok_or_else(|| Error::new("下载重定向地址不可用"))?;
-        return Ok(format!("{scheme}://{authority}/{path}"));
+        if !trusted_download_authority(authority) {
+            return Err(Error::new("下载重定向主机不在白名单内"));
+        }
+        return Ok(format!("https://{authority}/{path}"));
     }
     Err(Error::new("下载重定向地址不可用"))
+}
+
+/// GitHub 及其资源 CDN 之外的主机一律不接受，规则与 `update.rs` 相同：
+/// 拒绝 userinfo 技巧（`github.com@evil.example/`），并忽略可选的端口。
+fn trusted_download_authority(authority_and_path: &str) -> bool {
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority);
+    host == "github.com" || host.ends_with(".githubusercontent.com")
 }
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -497,16 +530,20 @@ mod tests {
     }
 
     #[test]
-    fn redirects_accept_only_http_scheme_or_same_host_path() {
-        let base = "https://models.example.com/a/b.bin";
+    fn redirects_accept_only_https_and_whitelisted_hosts() {
+        let base = "https://github.com/owner/repo/releases/a.bin";
         assert_eq!(
-            resolve_download_redirect(base, "https://cdn.example.com/x.bin").unwrap(),
-            "https://cdn.example.com/x.bin"
+            resolve_download_redirect(base, "https://objects.githubusercontent.com/x.bin").unwrap(),
+            "https://objects.githubusercontent.com/x.bin"
         );
         assert_eq!(
             resolve_download_redirect(base, "/other/x.bin").unwrap(),
-            "https://models.example.com/other/x.bin"
+            "https://github.com/other/x.bin"
         );
+        // 不允许明文降级，也不允许跳到白名单外的主机（含 userinfo 伪装）。
+        assert!(resolve_download_redirect(base, "http://github.com/x.bin").is_err());
+        assert!(resolve_download_redirect(base, "https://evil.example/x.bin").is_err());
+        assert!(resolve_download_redirect(base, "https://github.com@evil.example/x").is_err());
         assert!(resolve_download_redirect(base, "file:///C:/Windows/System32/cmd.exe").is_err());
         assert!(resolve_download_redirect(base, "  ").is_err());
         // 无网络调用：无效 URL 在 WinHTTP 之前就被拒绝。

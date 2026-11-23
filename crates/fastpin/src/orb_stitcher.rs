@@ -290,7 +290,7 @@ impl OrbStitcher {
         }
         if nh > self.max_height {
             return Err(StitchError::HeightCap {
-                total: self.canvas_height(),
+                total: self.canvas_extent(),
                 extra: nh,
                 max: self.max_height,
             });
@@ -339,9 +339,31 @@ impl OrbStitcher {
         Ok(Some(result))
     }
 
-    /// Current canvas height in screen space.
+    /// Pixels along the stitch axis: snow's canvas height, independent of the
+    /// screen-space axis.
+    ///
+    /// Snow always stitches vertically, so the growing dimension is always its
+    /// canvas height: the viewport height for a vertical session, the stitched
+    /// long side `L` for a horizontal one (exported width after the 270°
+    /// rotation). This is the value the UI must use for the trim extent, the
+    /// status "共 N px" and the auto-scroll growth detector. `dimensions()`
+    /// swaps the pair for a horizontal session, so its second component is the
+    /// *constant* screen height there and must never be used as the extent.
+    pub fn canvas_extent(&self) -> usize {
+        self.inner
+            .image_dimensions()
+            .map(|(_, h)| h as usize)
+            .unwrap_or(0)
+    }
+
+    /// Current stitched extent along the stitch axis.
+    ///
+    /// This is the source of the worker's `frame.total_height`: a vertical
+    /// session's canvas height, or a horizontal session's canvas width after
+    /// rotation. Callers that want screen-space dimensions (constant height for
+    /// a horizontal session) should use [`Self::dimensions`] instead.
     pub fn canvas_height(&self) -> usize {
-        self.dimensions().map(|(_, h)| h).unwrap_or(0)
+        self.canvas_extent()
     }
 
     /// Materializes the full stitched image in screen-space BGRA.
@@ -778,6 +800,30 @@ mod tests {
         px
     }
 
+    /// 横向滚动的页面窗口：内容沿屏幕 x 轴移动，旋转 90° 后变成 snow 的
+    /// 垂直位移，因此 ORB 会像纵向滚动一样增长画布。纹理沿 y（交叉轴）也有
+    /// 变化，ORB 才能提取到稳定的角点。
+    fn horizontal_page_window(width: usize, height: usize, scroll: usize) -> Vec<u8> {
+        let mut px = vec![0u8; width * height * 4];
+        for x in 0..width {
+            for y in 0..height {
+                let along = x + scroll;
+                let mut hash =
+                    (y as u32).wrapping_mul(0xc2b2_ae35) ^ (along as u32).wrapping_mul(0x27d4_eb2d);
+                hash ^= hash >> 16;
+                hash = hash.wrapping_mul(0x7feb_352d);
+                hash ^= hash >> 15;
+                let value = (hash >> 24) as u8;
+                let i = (y * width + x) * 4;
+                px[i] = value;
+                px[i + 1] = value;
+                px[i + 2] = value;
+                px[i + 3] = 255;
+            }
+        }
+        px
+    }
+
     #[test]
     fn accepts_a_clean_vertical_scroll() {
         let (w, h, shift) = (320usize, 256usize, 40usize);
@@ -1015,6 +1061,59 @@ mod tests {
         // The orientation is screen-space: the preview stays as wide as the
         // captured region and its height follows the viewport.
         assert_eq!(band.width, 320);
+    }
+
+    /// P0 回归：横向会话的增长维度是 snow 画布高度 L（旋转后的屏幕宽），
+    /// 不是 `dimensions()` 第二个分量那个常量屏幕高。trim、状态栏、自动滚动
+    /// 和 `finish()` 的宽度都必须跟着它走，否则导出会被截断到首屏宽。
+    #[test]
+    fn horizontal_extent_grows_and_finish_uses_the_grown_width() {
+        let (w, h, step) = (320usize, 256usize, 40usize);
+        let mut stitcher = OrbStitcher::new(Axis::Horizontal, w, h, 16384).unwrap();
+        stitcher
+            .push(&horizontal_page_window(w, h, 0), w, h)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stitcher.canvas_extent(),
+            w,
+            "首帧的增长维度是选区宽（旋转后成为 snow 画布高）"
+        );
+        assert_eq!(
+            stitcher.canvas_height(),
+            w,
+            "canvas_height 是 worker 的 total_height 来源，必须等于增长维度"
+        );
+
+        let mut last = stitcher.canvas_extent();
+        for i in 1..=3usize {
+            let pushed = stitcher
+                .push(&horizontal_page_window(w, h, i * step), w, h)
+                .unwrap()
+                .unwrap();
+            assert!(pushed.accepted, "第 {i} 步必须被接受：{pushed:?}");
+            let extent = stitcher.canvas_extent();
+            assert!(extent > last, "第 {i} 步必须增长画布：{last} → {extent}");
+            assert_eq!(
+                stitcher.canvas_height(),
+                extent,
+                "canvas_height 必须始终跟随增长维度"
+            );
+            last = extent;
+        }
+        assert!(last >= w + 3 * step, "三步滚动应累计至少 3×step");
+        assert_eq!(
+            stitcher.dimensions().unwrap().1,
+            h,
+            "屏幕高是常量，不能拿它当增长维度"
+        );
+
+        let (_, fw, fh) = stitcher.finish().unwrap();
+        assert_eq!(
+            fw as usize, last,
+            "finish 的宽必须是增长后的长边 L，而不是首屏宽"
+        );
+        assert_eq!(fh as usize, h);
     }
 
     /// The hover preview asks for a slice of canvas rows and must get exactly

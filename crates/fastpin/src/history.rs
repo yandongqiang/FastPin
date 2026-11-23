@@ -313,6 +313,13 @@ impl HistoryStore {
             return Ok(());
         }
         let _guard = lock();
+        self.remove_many_locked(ids)
+    }
+
+    /// Removal with `STORE_LOCK` already held. `prune` reads the index and then
+    /// deletes victims under the same guard; calling `remove_many` there would
+    /// try to take the (non-reentrant) mutex twice and deadlock.
+    fn remove_many_locked(&self, ids: &[String]) -> Result<()> {
         let mut index = self.read_index()?;
         let mut removed = Vec::new();
         index.records.retain(|r| {
@@ -332,6 +339,8 @@ impl HistoryStore {
         let to_remove: Vec<String> = removed.iter().map(|p| p.id.clone()).collect();
         index.pending_deletions.extend(removed);
         self.write_index(&index)?;
+        // 删除已提交到索引：广播给所有打开的历史视图，它们才能立刻移除卡片。
+        HISTORY_REVISION.fetch_add(1, Ordering::Release);
 
         for id in &to_remove {
             let _ = std::fs::remove_dir_all(self.record_dir(id));
@@ -380,6 +389,9 @@ impl HistoryStore {
     /// than "now" in this simplified model, so there is no pin concept here.
     /// Returns how many records were removed.
     pub fn prune(&self, retention: &Retention) -> Result<usize> {
+        // 读索引到删 victim 必须是同一把锁保护区；否则另一个截屏线程的 add
+        // 可能读到这里尚未反映的旧索引，后续写回会把新记录丢掉。
+        let _guard = lock();
         let index = self.read_index()?;
         let mut ordered: Vec<HistoryRecord> = index.records.clone();
         ordered.sort_by(|a, b| {
@@ -410,7 +422,8 @@ impl HistoryStore {
             }
         }
 
-        self.remove_many(&victims)?;
+        // 已经持有锁：走 locked 变体，避免重复加锁死锁。
+        self.remove_many_locked(&victims)?;
         Ok(victims.len())
     }
 
@@ -443,12 +456,12 @@ pub fn source_label(source: &str) -> &'static str {
     }
 }
 
-/// Per-source opt-in for history recording. The four keys mirror the
+/// Per-source opt-in for history recording. The three live keys mirror the
 /// `record_history_sources` checkboxes in settings. A source we do not recognise
 /// (legacy "saved_to_file" / "copied_to_clipboard", a future tag, or a
 /// third-party caller) is always allowed so existing flows keep working.
-/// `currentWindow` stays in the list for completeness: no hotkey currently
-/// emits it, so filtering it is a no-op until such a capture action exists.
+/// `currentWindow` stays in the list only for legacy indexes: no capture emits
+/// it and the settings checkbox was removed, so it can never be recorded now.
 fn source_is_recordable(allowed: &[String], source: &str) -> bool {
     match source {
         "region" | "copyOnly" | "fullscreen" | "currentWindow" => {
@@ -482,8 +495,9 @@ pub fn record_saved_image(bytes: &[u8], extension: &str, width: u32, height: u32
         crate::perf::log_app(&format!("history record failed: {e}"));
         return;
     }
-    // Best-effort prune after each addition — the store is already locked, so
-    // this cannot interleave with the add. A failure here is deliberately quiet
+    // Best-effort prune after each addition. `add` has released the lock by
+    // now; `prune` takes it again before reading the index, and it never races
+    // with the record we just committed. A failure here is deliberately quiet
     // (the record is already committed).
     let _ = store.prune(&settings.history.retention());
 }

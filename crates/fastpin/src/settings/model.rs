@@ -233,12 +233,12 @@ pub const ROWS: &[RowMeta] = &[
     RowMeta {
         page: Page::Screenshot,
         title: "工具栏位置",
-        desc: "选择跟随选区、记住位置，或固定在选区所在屏幕的顶部或底部。",
+        desc: "选择跟随选区，或固定在选区所在屏幕的顶部或底部。",
     },
     RowMeta {
         page: Page::Screenshot,
         title: "参数面板位置",
-        desc: "选择跟随选区、记住位置，或固定在选区所在屏幕的左侧或右侧。",
+        desc: "选择跟随选区，或固定在选区所在屏幕的左侧或右侧。",
     },
     RowMeta {
         page: Page::Screenshot,
@@ -668,9 +668,9 @@ pub fn reset_page(settings: &mut Settings, page: Page) -> bool {
             settings.screenshot.watermark = default.screenshot.watermark.clone();
             settings.screenshot.export = default.screenshot.export.clone();
             // 本页现在也承载拼图与 PDF 的默认设置，一并重置。
+            // 图片切图不在这页（由切图窗口单独管理），不能顺手重置。
             settings.screenshot.collage = default.screenshot.collage.clone();
             settings.screenshot.pdf = default.screenshot.pdf.clone();
-            settings.screenshot.split = default.screenshot.split.clone();
             true
         }
         // History settings live on the Data page now; resetting that page must
@@ -1067,8 +1067,7 @@ mod tests {
                     && s.screenshot.left_double_click == crate::config::ClickAction::None
                     && s.screenshot.middle_click == crate::config::ClickAction::None
                     && s.screenshot.click_outside == crate::config::ClickOutside::Expand
-                    && s.screenshot.record_history_sources
-                        == ["region", "copyOnly", "fullscreen", "currentWindow"]
+                    && s.screenshot.record_history_sources == ["region", "copyOnly", "fullscreen"]
                     && s.screenshot.toolbar_position
                         == crate::config::ToolbarPosition::FollowSelection
                     && s.screenshot.panel_position == crate::config::PanelPosition::FollowSelection
@@ -1106,8 +1105,6 @@ mod tests {
                     && s.screenshot.pdf.margin_right_mm == 10.0
                     && s.screenshot.pdf.export_mode == crate::config::ExportMode::Combined
                     && s.screenshot.pdf.image_quality == 90
-                    && s.screenshot.split.count == 2
-                    && s.screenshot.split.overlap_width == 0
             }
             Page::Hotkey => s.hotkeys.region == "Ctrl+Alt+A",
             Page::Appearance => s.appearance == crate::config::DEFAULT_APPEARANCE,
@@ -1151,6 +1148,9 @@ mod tests {
                         assert_eq!(s.screenshot.hidden_toolbar_items, ["text", "redo"]);
                         assert_eq!(s.translation.model, "qwen-plus");
                         assert_eq!(s.hotkeys.region, "Ctrl+Shift+1");
+                        // 切图设置由切图窗口管理，输出页重置不能碰它。
+                        assert_eq!(s.screenshot.split.count, 7);
+                        assert_eq!(s.screenshot.split.overlap_width, 6);
                     }
                     Page::Hotkey => {
                         assert_eq!(s.translation.model, "qwen-plus");

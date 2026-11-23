@@ -70,6 +70,10 @@ pub struct GroupEdit {
     pub preparing: bool,
     /// Identifies this session so a compose finishing after a cancel is ignored.
     epoch: u64,
+    /// Identifies the finish pass of this session, independent of the backdrop
+    /// `epoch`. Captured by the async finish so a result from an older session
+    /// can still be written back when a new session opened before it returned.
+    edit_epoch: u64,
     pub mask_cache: MaskCache,
     pub mosaic_cache: MosaicCache,
     toolbar: Option<WindowHandle<PinToolbar>>,
@@ -101,6 +105,9 @@ thread_local! {
 }
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Separate counter: a session's finish pass outlives its backdrop compose,
+/// so the two epochs must not be confused even though both use a `u64`.
+static NEXT_EDIT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub fn edit_for_group(group: u64) -> Option<Rc<RefCell<GroupEdit>>> {
     EDITS.with(|slot| slot.borrow().get(&group).cloned())
@@ -137,6 +144,7 @@ pub(crate) fn start(cx: &mut App, group: u64, tiles: &[TileSnapshot]) {
         })
         .collect();
     let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+    let edit_epoch = NEXT_EDIT_EPOCH.fetch_add(1, Ordering::Relaxed);
     let edit = Rc::new(RefCell::new(GroupEdit {
         session: Session::new(),
         text: None,
@@ -148,6 +156,7 @@ pub(crate) fn start(cx: &mut App, group: u64, tiles: &[TileSnapshot]) {
         backdrop: Vec::new(),
         preparing: true,
         epoch,
+        edit_epoch,
         mask_cache: RefCell::new(None),
         mosaic_cache: RefCell::new(None),
         toolbar: None,
@@ -258,6 +267,10 @@ pub(crate) fn finish_async(cx: &mut App, group: u64, commit: bool, tiles: Vec<Ti
     let Some(edit) = EDITS.with(|slot| slot.borrow_mut().remove(&group)) else {
         return;
     };
+    // Remember which session this finish belongs to: if another session is
+    // opened before the worker returns, its epoch differs and our pixels must
+    // still reach the tile views (the new flatten builds on top of them).
+    let edit_epoch = edit.borrow().edit_epoch;
     let elements = {
         let mut e = edit.borrow_mut();
         if let Some(toolbar) = e.toolbar.take() {
@@ -277,10 +290,15 @@ pub(crate) fn finish_async(cx: &mut App, group: u64, commit: bool, tiles: Vec<Ti
     cx.spawn(async move |cx: &mut AsyncApp| {
         let applied = task.await;
         cx.update(|cx: &mut App| {
-            // A new session opened while we were compositing owns the group
-            // now; do not push stale pixels into it.
-            if EDITS.with(|slot| slot.borrow().contains_key(&group)) {
-                return;
+            // Only the *same* session may block this write-back (a duplicate
+            // finish). A newer session has taken over the group, but it will
+            // flatten from the tiles we are about to install, so skipping our
+            // pixels here silently lost the first annotation.
+            let current = EDITS.with(|slot| slot.borrow().get(&group).cloned());
+            if let Some(current) = current {
+                if current.borrow().edit_epoch == edit_epoch {
+                    return;
+                }
             }
             for (id, px, w, h, zoom) in applied {
                 if let Some(handle) = pin::entry_handle(id) {
@@ -773,6 +791,7 @@ mod tests {
             backdrop: Vec::new(),
             preparing: false,
             epoch: 0,
+            edit_epoch: 0,
             mask_cache: RefCell::new(None),
             mosaic_cache: RefCell::new(None),
             toolbar: None,

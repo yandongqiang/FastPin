@@ -137,9 +137,11 @@ impl Retention {
         let mut still_blocked = Vec::with_capacity(self.retry.len());
         for (path, bytes, since) in self.retry.drain(..) {
             if !path.exists() || std::fs::remove_file(&path).is_ok() {
-                if since.elapsed() > TRANSFER_GRACE {
-                    self.bytes = self.bytes.saturating_sub(bytes);
-                }
+                // The file is gone: its reservation is over, regardless of how
+                // long it spent in the retry queue. Waiting for TRANSFER_GRACE
+                // here leaked the bytes whenever the receiver released the
+                // handle on the very next sweep, eventually freezing reserve().
+                self.bytes = self.bytes.saturating_sub(bytes);
                 continue;
             }
             // A receiver still holds it. Try again on the next sweep, and keep
@@ -252,6 +254,34 @@ mod tests {
         assert_eq!(retention.retained_files(), 0);
         assert_eq!(retention.retained_bytes(), 0);
         let _ = lease;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_retry_sweep_returns_bytes_as_soon_as_the_file_is_deletable() {
+        let dir = scratch();
+        // A directory cannot be removed by remove_file, so the first sweep
+        // defers the lease to the retry queue, still reserving its bytes.
+        let path = dir.join("retried.png");
+        std::fs::create_dir(&path).unwrap();
+        let mut retention = Retention::new();
+        let lease = retention.reserve(path.clone(), 24).unwrap();
+        retention.complete(&lease, true);
+        for live in retention.live.iter_mut() {
+            live.expires_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+        retention.expire();
+        assert_eq!(retention.retry.len(), 1);
+        assert_eq!(retention.retained_bytes(), 24);
+
+        // The receiver let go long before TRANSFER_GRACE: the very next sweep
+        // must return the bytes or a run of short drags freezes reserve().
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, vec![0u8; 24]).unwrap();
+        retention.expire();
+        assert_eq!(retention.retry.len(), 0);
+        assert_eq!(retention.retained_files(), 0);
+        assert_eq!(retention.retained_bytes(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

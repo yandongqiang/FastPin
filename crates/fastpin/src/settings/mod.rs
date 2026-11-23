@@ -257,11 +257,11 @@ enum ScreenshotToggle {
     ShowShortcutHints,
 }
 
-/// 「记录截屏历史」的四类截屏。id 与 `record_history_sources` 里存的字符串一致。
-const RECORD_HISTORY_SOURCES: [(&str, &str); 4] = [
+/// 「记录截屏历史」的可记录截屏类型。id 与 `record_history_sources` 里存的
+/// 字符串一致。当前窗口截屏没有采集入口，对应复选框已移除，避免死控件。
+const RECORD_HISTORY_SOURCES: [(&str, &str); 3] = [
     ("region", "普通截屏"),
     ("copyOnly", "快速截屏"),
-    ("currentWindow", "截取当前窗口"),
     ("fullscreen", "截取全屏"),
 ];
 
@@ -513,6 +513,9 @@ pub struct SettingsView {
     /// Two-click arming for the plaintext-HTTP API Key warning. The second click
     /// persists `allowInsecureHttp`, so the runtime guard and this banner agree.
     http_warn_confirm: bool,
+    /// 数据页「清空历史」的两击确认。与历史页的 `history_confirm_clear`
+    /// 分开，避免两个页面的状态串到一起。
+    data_confirm_clear: bool,
     /// Sizes for the Data page, sampled when the window opens and after a
     /// cleanup — never on every frame.
     data_bytes: u64,
@@ -868,11 +871,9 @@ impl SettingsView {
         subscriptions.push(cx.observe(&base_url, |this, input, cx| {
             let value = input.read(cx).text().to_string();
             if this.settings.translation.base_url != value {
-                // A confirmation only applies to the http:// endpoint it was
-                // given for; switching to https:// must revoke it.
-                if !crate::translate::is_insecure_http(&value) {
-                    this.settings.translation.allow_insecure_http = false;
-                }
+                // 授权只针对用户确认过的那个地址：任何改动（包括 http → 另一个
+                // http）都要重新确认，否则一个被改过的明文端点仍能拿到 API Key。
+                this.settings.translation.allow_insecure_http = false;
                 this.http_warn_confirm = false;
                 this.settings.translation.base_url = value;
                 this.persist(cx);
@@ -980,6 +981,7 @@ impl SettingsView {
             search,
             confirm_reset_all: false,
             http_warn_confirm: false,
+            data_confirm_clear: false,
             data_bytes,
             log_bytes,
             engine_status,
@@ -1145,6 +1147,7 @@ impl SettingsView {
         // Leaving/entering a page disarms any pending destructive confirmation.
         self.history_confirm_delete = false;
         self.history_confirm_clear = false;
+        self.data_confirm_clear = false;
         self.search.update(cx, |input, cx| input.set_text("", cx));
         if self.page == Page::History {
             // Load records + decode thumbnails on entry so the grid is never a
@@ -1211,6 +1214,10 @@ impl SettingsView {
                 self.reapply_hotkeys();
             }
             self.persist(cx);
+            if self.page == Page::Resources {
+                // 模型目录被重置，缓存的引擎状态快照必须同步刷新。
+                self.refresh_engine_status(true, cx);
+            }
             self.ok(format!("已重置「{}」", self.page.title()));
         } else {
             self.ok("本页没有可重置的配置");
@@ -1230,6 +1237,8 @@ impl SettingsView {
         self.reapply_hotkeys();
         self.confirm_reset_all = false;
         self.persist(cx);
+        // 全局重置也会清掉 OCR 模型目录，刷新状态页的缓存快照。
+        self.refresh_engine_status(true, cx);
         match autostart_error {
             Some(e) => self.fail(format!("所有设置已恢复默认，但关闭开机启动失败：{e}")),
             None => self.ok("所有设置已恢复默认"),
@@ -1771,8 +1780,16 @@ impl SettingsView {
             .map_err(|e| format!("清空历史失败：{e}"))
     }
 
-    /// Data-page "清空截图历史" button. Uses the Data page's status line.
+    /// Data-page "清空截图历史" button. Uses the Data page's status line and
+    /// the same two-click confirmation as the History page.
     fn clear_history(&mut self, cx: &mut Context<Self>) {
+        if !self.data_confirm_clear {
+            self.data_confirm_clear = true;
+            self.ok("再次点击「清空」以确认清空全部历史记录");
+            cx.notify();
+            return;
+        }
+        self.data_confirm_clear = false;
         match self.history_store_clear() {
             Ok(()) => self.ok("截图历史已清空"),
             Err(e) => self.fail(e),
@@ -2176,11 +2193,11 @@ impl SettingsView {
         match system::pick_folder(&start) {
             Ok(None) => {}
             Ok(Some(dir)) => {
-                // A model directory only counts once the three files are there;
-                // keep the choice but say so right away. The resources page
-                // recomputes the status on every render, so no cached label.
+                // 目录里的模型文件可能还不齐，但设置本身要立刻生效。资源页
+                // 用的是缓存快照（不是每次渲染重算），所以改完必须主动刷新。
                 self.settings.ocr.models_dir = Some(dir);
                 self.persist(cx);
+                self.refresh_engine_status(true, cx);
             }
             Err(e) => {
                 self.fail(format!("{e}"));
@@ -2192,6 +2209,7 @@ impl SettingsView {
     fn clear_models_dir(&mut self, cx: &mut Context<Self>) {
         if self.settings.ocr.models_dir.take().is_some() {
             self.persist(cx);
+            self.refresh_engine_status(true, cx);
         } else {
             cx.notify();
         }
@@ -2826,7 +2844,7 @@ impl SettingsView {
             cx,
             SelectId::ToolbarPosition,
             "工具栏位置",
-            "选择跟随选区、记住位置，或固定在选区所在屏幕的顶部或底部。",
+            "选择跟随选区，或固定在选区所在屏幕的顶部或底部。",
             self.settings.screenshot.toolbar_position,
             &ToolbarPosition::ALL,
             ToolbarPosition::id,
@@ -2846,7 +2864,7 @@ impl SettingsView {
             cx,
             SelectId::PanelPosition,
             "参数面板位置",
-            "选择跟随选区、记住位置，或固定在选区所在屏幕的左侧或右侧。",
+            "选择跟随选区，或固定在选区所在屏幕的左侧或右侧。",
             self.settings.screenshot.panel_position,
             &PanelPosition::ALL,
             PanelPosition::id,
@@ -3198,12 +3216,18 @@ impl SettingsView {
                 ),
             ),
         );
-        let clear = widgets::row("清空历史", "删除所有历史记录；此操作不可撤销。").child(
-            widgets::control(widgets::danger_button("hist-clear", "清空").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.clear_history(cx)),
-            )),
-        );
+        let clear_label = if self.data_confirm_clear {
+            "再次点击清空"
+        } else {
+            "清空"
+        };
+        let clear =
+            widgets::row("清空历史", "删除所有历史记录；此操作不可撤销。").child(widgets::control(
+                widgets::danger_button("hist-clear", clear_label).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.clear_history(cx)),
+                ),
+            ));
 
         vec![
             widgets::row("记录截图历史", "保存截图时自动留存一份副本到历史目录。").child(
@@ -3826,7 +3850,19 @@ impl SettingsView {
     fn export_format_row(&self, cx: &mut Context<Self>) -> gpui::Div {
         use crate::config::ImageFormat;
         let current_format = self.settings.screenshot.export.format;
-        let current: SharedString = current_format.label().into();
+        // 与导出线程使用同一个 effective_format：本机没有编码器时，界面必须
+        // 显示真实落盘的格式，不能再摆出一个无效的 WebP + 质量滑块。
+        let effective = crate::codec::effective_format(current_format);
+        let current: SharedString = if effective == current_format {
+            current_format.label().into()
+        } else {
+            format!(
+                "{}（本机不支持，实际保存为 {}）",
+                current_format.label(),
+                effective.label()
+            )
+            .into()
+        };
         let rows = ImageFormat::ALL
             .into_iter()
             // WebP comes from an optional Windows package; offering it where
@@ -3834,7 +3870,7 @@ impl SettingsView {
             // setting the user just picked on purpose.
             .filter(|f| crate::codec::format_available(*f))
             .map(|f| {
-                widgets::select_option(("export-fmt", f as u32), f.label(), f == current_format)
+                widgets::select_option(("export-fmt", f as u32), f.label(), f == effective)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.set_export_format(f, cx)),
@@ -3845,7 +3881,7 @@ impl SettingsView {
             cx,
             SelectId::ExportFormat,
             "图片格式",
-            "PNG 无损体积大；JPG/WebP 有损但适合长页面与照片。",
+            "PNG 无损体积大；JPG/WebP 有损但适合长页面与照片；本机不支持的格式自动回退为 PNG。",
             current,
             rows,
         )
@@ -3854,11 +3890,12 @@ impl SettingsView {
     fn export_quality_row(&self, cx: &mut Context<Self>) -> gpui::Div {
         let export = &self.settings.screenshot.export;
         // PNG ignores quality, so the row explains that instead of offering a
-        // control that changes nothing.
-        if !export.format.honours_quality() {
+        // control that changes nothing. Use the same fallback as the export
+        // thread: a selected-but-unavailable WebP really writes PNG.
+        if !crate::codec::effective_format(export.format).honours_quality() {
             return widgets::row(
                 "图片质量",
-                "PNG 为无损格式，质量设置对它不生效；选择 JPG 或 WebP 后可调。",
+                "PNG 为无损格式，质量设置对它不生效；不支持的格式会自动回退为 PNG，选择 JPG（或可用的 WebP）后可调。",
             );
         }
         let current: SharedString = EXPORT_QUALITIES

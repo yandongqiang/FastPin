@@ -174,11 +174,12 @@ pub struct Screenshot {
     pub toolbar_position: ToolbarPosition,
     /// 参数面板的位置策略。
     pub panel_position: PanelPosition,
-    /// 「记住位置」策略使用的工具栏左上角（截屏逻辑像素，未乘缩放）。
-    /// `None` 表示尚未记录，布局退回「跟随选区」。
+    /// 旧版「记住位置」策略使用的工具栏左上角（截屏逻辑像素，未乘缩放）。
+    /// 截屏流程从不写入该字段，策略因此已不再提供给用户；保留字段仅为兼容
+    /// 旧配置文件，值永远是 `None`，布局退回「跟随选区」。
     pub toolbar_remember_pos: Option<(f32, f32)>,
-    /// 「记住位置」策略使用的参数面板左上角（截屏逻辑像素，未乘缩放）。
-    /// `None` 表示尚未记录，布局退回「跟随选区」。
+    /// 旧版「记住位置」策略使用的参数面板左上角（截屏逻辑像素，未乘缩放）。
+    /// 同 `toolbar_remember_pos`：没有写入点，已不在设置页提供该选项。
     pub panel_remember_pos: Option<(f32, f32)>,
     /// 是否在鼠标附近显示像素放大预览和当前颜色信息。
     pub show_magnifier: bool,
@@ -208,12 +209,9 @@ impl Default for Screenshot {
             left_double_click: ClickAction::default(),
             middle_click: ClickAction::default(),
             click_outside: ClickOutside::default(),
-            record_history_sources: vec![
-                "region".into(),
-                "copyOnly".into(),
-                "fullscreen".into(),
-                "currentWindow".into(),
-            ],
+            // 当前窗口截屏没有采集入口，选项已从设置页移除；旧配置里残留的
+            // `currentWindow` 仍被历史读取逻辑识别，只是不再自动记录。
+            record_history_sources: vec!["region".into(), "copyOnly".into(), "fullscreen".into()],
             toolbar_position: ToolbarPosition::default(),
             panel_position: PanelPosition::default(),
             toolbar_remember_pos: None,
@@ -982,7 +980,9 @@ pub enum ToolbarPosition {
     /// 跟随选区移动。
     #[default]
     FollowSelection,
-    /// 记住上一次的位置。
+    /// 记住上一次的位置。已废弃：截屏流程从不写入记住的坐标，该策略实际
+    /// 等同「跟随选区」，因此不再出现在设置页的下拉中；仅保留变体以兼容
+    /// 旧配置文件。
     Remember,
     /// 固定在选区所在屏幕的顶部。
     Top,
@@ -991,12 +991,8 @@ pub enum ToolbarPosition {
 }
 
 impl ToolbarPosition {
-    pub const ALL: [Self; 4] = [
-        Self::FollowSelection,
-        Self::Remember,
-        Self::Top,
-        Self::Bottom,
-    ];
+    /// 设置页实际提供的策略；`Remember` 没有位置写入点，属于死设置。
+    pub const ALL: [Self; 3] = [Self::FollowSelection, Self::Top, Self::Bottom];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -1010,7 +1006,8 @@ impl ToolbarPosition {
     pub fn label(self) -> &'static str {
         match self {
             Self::FollowSelection => "跟随选区",
-            Self::Remember => "记住位置",
+            // 旧配置里的值仍可读，但每次渲染都退回跟随选区。
+            Self::Remember => "跟随选区（旧「记住位置」）",
             Self::Top => "顶部",
             Self::Bottom => "底部",
         }
@@ -1024,7 +1021,8 @@ pub enum PanelPosition {
     /// 跟随选区移动。
     #[default]
     FollowSelection,
-    /// 记住上一次的位置。
+    /// 记住上一次的位置。已废弃：参数面板坐标从未被写入，策略实际等同
+    /// 「跟随选区」，不再出现在设置页下拉中；仅保留变体兼容旧配置文件。
     Remember,
     /// 固定在选区所在屏幕的左侧。
     Left,
@@ -1033,12 +1031,8 @@ pub enum PanelPosition {
 }
 
 impl PanelPosition {
-    pub const ALL: [Self; 4] = [
-        Self::FollowSelection,
-        Self::Remember,
-        Self::Left,
-        Self::Right,
-    ];
+    /// 设置页实际提供的位置策略（`Remember` 无写入点，已移除）。
+    pub const ALL: [Self; 3] = [Self::FollowSelection, Self::Left, Self::Right];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -1052,7 +1046,8 @@ impl PanelPosition {
     pub fn label(self) -> &'static str {
         match self {
             Self::FollowSelection => "跟随选区",
-            Self::Remember => "记住位置",
+            // 同 ToolbarPosition：历史值只显示为「跟随选区」。
+            Self::Remember => "跟随选区（旧「记住位置」）",
             Self::Left => "左侧",
             Self::Right => "右侧",
         }

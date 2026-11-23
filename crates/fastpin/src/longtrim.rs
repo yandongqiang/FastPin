@@ -169,6 +169,9 @@ impl TrimRange {
         match axis {
             crate::longcapture::Axis::Vertical => self.crop_bgra(pixels, width, height),
             crate::longcapture::Axis::Horizontal => {
+                // `finish()` 已把画布转回屏幕空间：这里的 `width` 是增长后的
+                // 长边 L，`height` 才是常量屏幕高。trim 的两端必须按 L 钳制并
+                // 抽列；误用 h 会把 bottom 钉在首屏，导出只剩前 h 列。
                 let range = self.clamped(width)?;
                 let source_row = width as usize * 4;
                 let needed = source_row.checked_mul(height as usize)?;
@@ -474,6 +477,48 @@ mod tests {
         assert_eq!(cropped.len(), (w * 2 * 4) as usize);
         // Every pixel of the first cropped row is row 1.
         assert_eq!(&cropped[..4], &[1, 1, 1, 255]);
+    }
+
+    /// 横向导出的回归用例：`finish()` 返回 (宽=L, 高=屏幕高 h)，trim 必须按 L
+    /// 选列。全选时导出宽度等于 L；若按 h 钳制，则只剩前 h 列（旧 bug）。
+    #[test]
+    fn horizontal_crop_selects_columns_of_the_grown_long_side() {
+        use crate::longcapture::Axis;
+
+        let (l, h) = (6u32, 3u32);
+        // finish() 的 BGRA：每一列填列号，行内字节一致，便于核对抽列结果。
+        let mut pixels = Vec::new();
+        for _row in 0..h {
+            for col in 0..l {
+                pixels.extend_from_slice(&[col as u8, col as u8, col as u8, 255]);
+            }
+        }
+
+        // 选中 [2, 5) 列：输出宽 = 选中列数，高仍为屏幕高。
+        let (out, w, out_h) = TrimRange { top: 2, bottom: 5 }
+            .crop_bgra_axis(&pixels, l, h, Axis::Horizontal)
+            .unwrap();
+        assert_eq!((w, out_h), (3, h), "横向按列裁剪，不按行");
+        assert_eq!(out.len(), (3 * h * 4) as usize);
+        for row in 0..h as usize {
+            let base = row * 3 * 4;
+            assert_eq!(&out[base..base + 4], &[2, 2, 2, 255]);
+            assert_eq!(&out[base + 8..base + 12], &[4, 4, 4, 255]);
+        }
+
+        // 全选导出必须覆盖整个长边，一份像素都不能少。
+        let (full, fw, fh) = TrimRange::full(l)
+            .crop_bgra_axis(&pixels, l, h, Axis::Horizontal)
+            .unwrap();
+        assert_eq!((fw, fh), (l, h));
+        assert_eq!(full, pixels, "全选不得截断到首屏列数");
+
+        // 旧 bug 的复现：把常量屏幕高 h 当成 canvas 传进来，bottom 被钉在 3。
+        let (truncated, tw, _) = TrimRange::full(h)
+            .crop_bgra_axis(&pixels, l, h, Axis::Horizontal)
+            .unwrap();
+        assert_eq!(tw, h);
+        assert!(truncated.len() < full.len());
     }
 
     #[test]

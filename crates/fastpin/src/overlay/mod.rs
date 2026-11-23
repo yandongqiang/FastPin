@@ -294,6 +294,9 @@ struct LongCaptureState {
     /// Latest stitched counters, mirrored from the last applied result so the
     /// bar can draw without touching the worker's buffer.
     segments: usize,
+    /// 沿 stitch 轴的已拼接长度（worker 从 `canvas_height()` 取得）：纵向为画布
+    /// 高，横向为旋转后的画布长边 L。横向屏幕高是常量，绝不能拿它当增长值，
+    /// 否则 trim / 状态栏 / 自动滚动都会停在首屏。
     total_height: usize,
     /// Latest live-preview thumbnail, rendered once when a progress frame
     /// arrives and cached here so the bar draws without touching the worker.
@@ -518,17 +521,18 @@ const MIN_CANDIDATE_EXTENT: u32 = 6;
 /// Pacing and give-up accounting for opt-in auto-scroll. Pure bookkeeping --
 /// no Win32 and no timer: the host asks [`AutoScroll::plan`] on each poll,
 /// posts the wheel itself, reports the result with
-/// [`AutoScroll::observe_post`], and feeds the stitched height to
-/// [`AutoScroll::observe_height`]. Everything about when to post and when to
-/// give up is therefore testable without a window.
+/// [`AutoScroll::observe_post`], and feeds the stitched extent（沿 stitch 轴的
+/// 增长长度，横向为长边宽度）to [`AutoScroll::observe_height`]. Everything
+/// about when to post and when to give up is therefore testable without a
+/// window.
 #[derive(Debug, Default)]
 struct AutoScroll {
     enabled: bool,
     last_post: Option<Instant>,
     /// Notches posted since the stitched image last grew.
     idle_posts: u32,
-    /// Stitched height after the last applied frame, to detect growth.
-    last_height: Option<usize>,
+    /// 上一帧的 stitch 轴长度（横向为长边宽 L），用来判断是否真的在增长。
+    last_extent: Option<usize>,
     /// Beat interval and step magnitude. One source of truth shared with the
     /// manual single step, so the two can never drift apart.
     step: crate::scroll_step::ScrollStep,
@@ -552,7 +556,7 @@ impl AutoScroll {
             enabled: false,
             last_post: None,
             idle_posts: 0,
-            last_height: None,
+            last_extent: None,
             step,
         }
     }
@@ -568,16 +572,18 @@ impl AutoScroll {
         self.enabled = on;
         self.last_post = None;
         self.idle_posts = 0;
-        self.last_height = None;
+        self.last_extent = None;
     }
 
-    /// Folds the session's stitched height in after each applied frame: a
-    /// taller image means content arrived, so the give-up counter restarts.
-    fn observe_height(&mut self, total_height: usize) {
-        if self.last_height.is_some_and(|h| total_height > h) {
+    /// Folds the session's stitched extent in after each applied frame: a
+    /// longer image means content arrived, so the give-up counter restarts.
+    /// 横向必须传增长后的长边 L，而不是常量屏幕高，否则 10 次空转后会误判
+    /// "未检测到滚动"并自行关闭。
+    fn observe_height(&mut self, extent: usize) {
+        if self.last_extent.is_some_and(|h| extent > h) {
             self.idle_posts = 0;
         }
-        self.last_height = Some(total_height);
+        self.last_extent = Some(extent);
     }
 
     /// Folds one post's result in. Returns whether auto-scroll stays on: a
@@ -2191,6 +2197,10 @@ impl OverlayView {
             self.show_panel("长截图失败", e.to_string(), false, cx);
             return;
         }
+        // 首帧已建立画布：沿 stitch 轴的增长长度就是 total_height / trim 的
+        // 初始 extent。横向会话里它是选区宽 w（旋转后成为 snow 画布高），
+        // 不是屏幕高 h —— 后者是常量，会让 trim 从一开始就钉在首屏。
+        let initial_extent = stitcher.canvas_extent();
         self.long_seq = self.long_seq.wrapping_add(1);
         let gen = self.long_seq;
         let gpu_generation = self
@@ -2209,7 +2219,7 @@ impl OverlayView {
                 return;
             }
         };
-        let (segments, total_height) = (1, h);
+        let (segments, total_height) = (1, initial_extent);
         self.long = Some(LongCaptureState {
             abs_x,
             abs_y,
@@ -2233,7 +2243,8 @@ impl OverlayView {
             preview_buf_h: 0,
             // A fresh session selects everything: 完成 without touching a
             // handle exports the whole stitch, exactly as before this existed.
-            trim: crate::longtrim::TrimRange::full(h.clamp(1, u32::MAX as usize) as u32),
+            // 用增长维度初始化（横向为长边宽），不是常量屏幕高。
+            trim: crate::longtrim::TrimRange::full(initial_extent.max(1) as u32),
             trim_drag: None,
             gate: ResultGate::new(gen),
             worker,
@@ -2702,7 +2713,11 @@ impl OverlayView {
                     .cadence
                     .record_frame(frame.spans.capture, frame.spans.process);
                 state.segments = frame.segments;
-                state.total_height = frame.total_height;
+                // `frame.total_height` 由 worker 从 `canvas_height()` 取得：横向时
+                // 是旋转后的长边 L（增长维度），纵向时是画布高。统一用它维护
+                // total_height / trim / status / 自动滚动，不再用常量屏幕高。
+                let extent = frame.total_height;
+                state.total_height = extent;
                 state.stall_paused = frame.paused;
                 // A progress frame carries only the canvas rows it added; blit
                 // them into the accumulated buffer and rebuild the thumbnail
@@ -2723,15 +2738,16 @@ impl OverlayView {
                     }
                 }
                 // New rows confirm that scrolling works, whether they came
-                // from auto-scroll or from the user's own wheel.
-                state.auto_scroll.observe_height(frame.total_height);
+                // from auto-scroll or from the user's own wheel. 横向传入的是
+                // 增长的长边 L，常量屏幕高会让自动滚动误判"未检测到滚动"。
+                state.auto_scroll.observe_height(extent);
                 // Keep the trim selection meaningful as the canvas grows. The
                 // growth direction comes from the frame that grew it: a reset
                 // (first frame, axis flip) selects everything again, an upward
                 // scroll inserted rows above the selection, anything else
                 // appended below it. Ported from the snow-shot controller's
                 // Initial/Replaced, PrependedUp and append branches.
-                let canvas = frame.total_height as u32;
+                let canvas = extent as u32;
                 state.trim = if preview_reset {
                     crate::longtrim::TrimRange::after_reset(canvas)
                 } else {
@@ -2756,10 +2772,7 @@ impl OverlayView {
                 }
                 match frame.verdict {
                     Verdict::Progress { .. } => {
-                        state.status = format!(
-                            "已捕获 {} 段 · 共 {} px",
-                            frame.segments, frame.total_height
-                        );
+                        state.status = format!("已捕获 {} 段 · 共 {} px", frame.segments, extent);
                     }
                     Verdict::Paused => {
                         state.status = "未检测到滚动，继续等待…".to_string();
@@ -2771,7 +2784,7 @@ impl OverlayView {
                     Verdict::LocalChange => {
                         state.status = format!(
                             "已捕获 {} 段 · 共 {} px · 等待滚动…",
-                            frame.segments, frame.total_height
+                            frame.segments, extent
                         );
                     }
                     // A transient bad frame was skipped; keep capturing.
@@ -2897,7 +2910,10 @@ impl OverlayView {
             cx.notify();
             return;
         }
-        let nh = h as usize;
+        // 新 stitcher 已推入首帧：增长维度从它读取（横向为选区宽 w，旋转后
+        // 成为 snow 画布高），不能再沿用屏幕高 h —— 那会让 trim 与状态栏
+        // 停在首屏。首帧到达后 apply_long_done 还会按同一维度再 reset 一次。
+        let nh = stitcher.canvas_extent();
         if let Some(state) = self.long.as_mut() {
             // A fresh epoch invalidates the in-flight frame of the old axis and
             // hands the worker a new baseline, so the two axes can never mix
@@ -2917,6 +2933,7 @@ impl OverlayView {
             state.auto_scroll.set_enabled(false);
             state.segments = 1;
             state.total_height = nh;
+            state.trim = crate::longtrim::TrimRange::full(nh.max(1) as u32);
             state.status = long_status_hint(next);
         }
         crate::perf::log_diag(&format!("long-capture: axis switched to {}", next.label()));

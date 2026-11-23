@@ -600,6 +600,19 @@ pub(crate) fn snapshots(cx: &mut App, group: u64, mine: Option<TileSnapshot>) ->
 /// concurrent second `DoDragDrop` do not compose.
 static EXPORT_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Releases the drag gate on *every* exit path. A press that never crosses the
+/// threshold, a `GetCursorPos` failure and a compose/stage failure on the
+/// worker all previously left the gate stuck true for the rest of the process.
+/// The guard is moved into the drag thread so the gate stays held for the whole
+/// OLE loop and is dropped when that loop finishes.
+struct ExportDragGuard;
+
+impl Drop for ExportDragGuard {
+    fn drop(&mut self) {
+        EXPORT_DRAG_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
 /// The process-wide drag-export file retention. Leases live here because the
 /// gesture thread ends, but the staged file must survive until the receiver
 /// finishes its copy or the grace window closes.
@@ -1464,6 +1477,9 @@ impl PinView {
         {
             return;
         }
+        // Hold the gate until the OLE loop ends (the guard moves into its
+        // thread) or until any early return below drops it.
+        let gate = ExportDragGuard;
         // The system threshold decides when a press becomes a drag, matching
         // Qt's startDragDistance. Not yet past it: keep the gesture armed.
         let (dx, dy) = unsafe {
@@ -1487,6 +1503,9 @@ impl PinView {
         }
         let tiles = snapshots(cx, self.group(), self.snapshot(window));
         std::thread::spawn(move || {
+            // Keep the gate for the whole loop; compose/stage errors return
+            // early and must release it too.
+            let _gate = gate;
             let images: Vec<TileImage> = tiles
                 .iter()
                 .map(|t| TileImage {
@@ -1542,7 +1561,7 @@ impl PinView {
             );
             // A refused drop keeps its grace window too: the receiver may have
             // read the file mid-drop even though it refused the final effect.
-            EXPORT_DRAG_ACTIVE.store(false, Ordering::SeqCst);
+            // `_gate` drops here, releasing the gate after every path.
         });
     }
 

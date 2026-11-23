@@ -191,6 +191,13 @@ impl Drop for Handle {
     }
 }
 
+/// Removes CR/LF from an API Key before it is written into a WinHTTP header.
+/// A pasted key containing `\r\n` could otherwise terminate the Authorization
+/// line and inject extra headers into the request.
+fn header_safe_key(key: &str) -> String {
+    key.chars().filter(|c| *c != '\r' && *c != '\n').collect()
+}
+
 fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Result<String> {
     let wide: Vec<u16> = url.encode_utf16().chain([0]).collect();
     let mut parts = URL_COMPONENTS {
@@ -216,7 +223,12 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
 
     let mut headers = String::from("Content-Type: application/json\r\n");
     if !api_key.trim().is_empty() {
-        headers.push_str(&format!("Authorization: Bearer {}\r\n", api_key.trim()));
+        // Key 来自用户粘贴的文本框：其中的 CR/LF 会提前结束 Authorization
+        // 头并注入任意请求头，必须在拼接头之前剥掉。
+        let key = header_safe_key(api_key.trim());
+        if !key.is_empty() {
+            headers.push_str(&format!("Authorization: Bearer {key}\r\n"));
+        }
     }
 
     unsafe {
@@ -319,6 +331,16 @@ fn nul_terminated_from(s: &[u16]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_cannot_inject_extra_http_headers() {
+        assert_eq!(header_safe_key("sk-valid"), "sk-valid");
+        assert_eq!(
+            header_safe_key("sk-a\r\nX-Evil: 1\nX-Other: 2"),
+            "sk-aX-Evil: 1X-Other: 2"
+        );
+        assert_eq!(header_safe_key("\r\n"), "");
+    }
 
     #[test]
     fn detects_plaintext_http_endpoints() {

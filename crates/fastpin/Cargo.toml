@@ -14,6 +14,8 @@ name = "FastPin"
 path = "src/main.rs"
 
 [dependencies]
+# 本地翻译目前只有目录 / 下载 / 调度骨架，不引入 ort / tokenizers：仓库里没有
+# 模型与 tokenizer，运行时也会明确报「推理管线尚未实现」并回退到 API。
 gpui-kit = { version = "=0.8.0", default-features = false, features = ["component", "assets"] }
 gpui-component = { version = "=0.8.0", default-features = false }
 raw-window-handle = "0.6"

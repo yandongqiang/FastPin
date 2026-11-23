@@ -4,8 +4,7 @@
 //! The release source is the compile-time `GITHUB_REPO` constant below.
 
 use std::ffi::c_void;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,15 +12,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::core::PCWSTR;
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest, WinHttpSetTimeouts, URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-    WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_QUERY_CONTENT_LENGTH,
-    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
+    WinHttpQueryHeaders, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
+    URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::error::{Error, Result};
+// 下载进度与流式写入由 `net` 统一实现，模型下载与更新包共用同一套上限。
+pub use crate::net::DownloadProgress;
+use crate::net::{content_length_within_limit, stream_body_to_file, MAX_DOWNLOAD_BYTES};
 
 /// `owner/repo` of the GitHub project that publishes releases.
 const GITHUB_REPO: &str = "yandongqiang/FastPin";
@@ -208,29 +210,8 @@ fn get(url: &str) -> Result<String> {
     }
 }
 
-/// 512 MiB ceiling for a single downloaded asset.
-const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Body is pulled in 64 KiB pieces so progress can be reported per chunk.
-const DOWNLOAD_CHUNK_BYTES: u32 = 64 * 1024;
-
 /// GitHub asset URLs redirect to a CDN; allow a few hops, then give up.
 const MAX_DOWNLOAD_REDIRECTS: usize = 5;
-
-/// Streaming progress of one asset download.
-#[derive(Clone, Copy, Debug)]
-pub struct DownloadProgress {
-    pub received: u64,
-    pub total: Option<u64>,
-}
-
-impl DownloadProgress {
-    /// Whole percentage in `0..=100`, or `None` when the server did not send a
-    /// usable `Content-Length`.
-    pub fn percent(&self) -> Option<u32> {
-        progress_percent(self.received, self.total)
-    }
-}
 
 /// Strip surrounding whitespace and one leading `v`/`V` from a release tag.
 fn normalize_version(version: &str) -> String {
@@ -255,24 +236,6 @@ fn asset_file_name(version: &str) -> String {
 fn asset_download_url(version: &str) -> String {
     let v = normalize_version(version);
     format!("https://github.com/{GITHUB_REPO}/releases/download/v{v}/FastPin-v{v}-x64-setup.exe")
-}
-
-fn content_length_within_limit(total: Option<u64>, limit: u64) -> bool {
-    total.is_none_or(|n| n <= limit)
-}
-
-/// `None` on u64 overflow or when adding `chunk` would pass `limit`.
-fn checked_accumulate(received: u64, chunk: u64, limit: u64) -> Option<u64> {
-    let next = received.checked_add(chunk)?;
-    (next <= limit).then_some(next)
-}
-
-fn progress_percent(received: u64, total: Option<u64>) -> Option<u32> {
-    let total = total?;
-    if total == 0 {
-        return None;
-    }
-    Some((received.saturating_mul(100) / total).min(100) as u32)
 }
 
 fn is_redirect(status: u32) -> bool {
@@ -529,49 +492,6 @@ pub fn cleanup_downloads() {
     cleanup_part_files(&download_dir(), PART_MAX_AGE);
 }
 
-/// Read the response body in chunks, writing straight to `path` and reporting
-/// every chunk. Unlike `crate::net::read_response` this never buffers the whole
-/// asset in memory.
-fn stream_body_to_file(
-    request: *mut c_void,
-    path: &Path,
-    total: Option<u64>,
-    on_progress: &mut impl FnMut(DownloadProgress),
-) -> Result<()> {
-    let mut file = File::create(path)?;
-    let mut buf = vec![0u8; DOWNLOAD_CHUNK_BYTES as usize];
-    let mut received = 0u64;
-
-    on_progress(DownloadProgress { received, total });
-
-    loop {
-        let mut available = 0u32;
-        unsafe { WinHttpQueryDataAvailable(request, &mut available)? };
-        if available == 0 {
-            break;
-        }
-        let to_read = available.min(DOWNLOAD_CHUNK_BYTES);
-        let mut read = 0u32;
-        unsafe {
-            WinHttpReadData(request, buf.as_mut_ptr() as *mut c_void, to_read, &mut read)?;
-        }
-        if read == 0 {
-            break;
-        }
-        received =
-            checked_accumulate(received, read as u64, MAX_DOWNLOAD_BYTES).ok_or_else(|| {
-                Error::new(format!(
-                    "更新包过大（超过 {} MiB）",
-                    MAX_DOWNLOAD_BYTES / 1024 / 1024
-                ))
-            })?;
-        file.write_all(&buf[..read as usize])?;
-        on_progress(DownloadProgress { received, total });
-    }
-    file.flush()?;
-    Ok(())
-}
-
 /// Download the installer for `version` and return the path to a temporary
 /// file. No shell execution, extraction or installation happens here; the
 /// caller decides what to do with the returned path.
@@ -678,6 +598,7 @@ fn nul_terminated_from(s: &[u16]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::{checked_accumulate, progress_percent};
 
     #[test]
     fn version_compare_ignores_prefix_and_padding() {

@@ -4,6 +4,7 @@
 //! point of the Rust port, and a full async stack buys nothing for one POST.
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Security::Credentials::{PasswordCredential, PasswordVault};
@@ -25,9 +26,67 @@ const VAULT_ACCOUNT: &str = "apiKey";
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a translator. Output only the translation. Keep paragraph structure. Do not explain. Do not translate URLs, file paths, or code. Keep numbers and units.";
 
+/// 本地模型缺失 / 推理管线未实现时的固定文案。设置页用同一句话提示用户。
+const LOCAL_NOT_INSTALLED: &str = "本地翻译模型未安装：请将模型放入 models/translate 后使用";
+const LOCAL_NOT_IMPLEMENTED: &str = "本地翻译推理管线尚未实现";
+
+/// 本地服务的模型目录，按与 `ocr::resolve_models_dir` 相同的优先级解析：
+/// 配置覆盖 → exe 旁的 `models/translate` → 仓库副本（`cargo run` 场景）。
+/// 只读解析，不创建目录；下载时才由调用方建目录。
+pub fn local_model_dir(service_id: &str) -> Result<PathBuf> {
+    if service_id.trim().is_empty()
+        || service_id.contains('/')
+        || service_id.contains('\\')
+        || service_id.split(['/', '\\']).any(|p| p == "..")
+    {
+        return Err(Error::new("本地服务 id 无效"));
+    }
+    if let Some(dir) = config::get().translation.local_models_dir.clone() {
+        return Ok(dir.join("translate").join(service_id));
+    }
+    let exe = std::env::current_exe()?;
+    let base = exe
+        .parent()
+        .ok_or_else(|| Error::new("executable has no parent directory"))?;
+    let shipped = base.join("models").join("translate").join(service_id);
+    if shipped.is_dir() {
+        return Ok(shipped);
+    }
+    // 与 OCR 的仓库回退同理：`target\` 里没有打包目录，开发时指向仓库副本。
+    Ok(PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../models/translate"
+    ))
+    .join(service_id))
+}
+
+/// 本地翻译入口（骨架）。
+///
+/// 仓库里没有任何本地翻译模型，也没有 tokenizer / seq2seq 推理管线，所以
+/// 这里**从不返回译文**：模型不存在时报「未安装」，文件存在时报「管线尚未
+/// 实现」。`translate()` 捕获错误后回退到现有 API 路径，绝不假装本地可用。
+pub fn infer_local(_text: &str, service_id: &str) -> Result<String> {
+    let model = local_model_dir(service_id)?.join("model.onnx");
+    if !model.is_file() {
+        return Err(Error::new(LOCAL_NOT_INSTALLED));
+    }
+    Err(Error::new(LOCAL_NOT_IMPLEMENTED))
+}
+
 /// Blocking. Call it off the UI thread.
 pub fn translate(text: &str) -> Result<String> {
     let cfg = config::get().translation;
+    // 本地优先：只在实际产出译文时才返回；失败写日志后落到下面的 API 路径。
+    // 配置 / base_url 校验 / 凭据 / HTTP 闸门 / WinHTTP 逻辑全部保持不变。
+    if cfg.default_service != "api" {
+        match infer_local(text, &cfg.default_service) {
+            Ok(translated) => return Ok(translated),
+            Err(e) => crate::perf::log_app(&format!(
+                "本地翻译失败，回退 API：{}（服务 {}）",
+                e, cfg.default_service
+            )),
+        }
+    }
     if cfg.base_url.trim().is_empty() {
         let path = config::path()
             .map(|p| p.display().to_string())
@@ -383,6 +442,22 @@ mod tests {
             r#"{"error":{"message":"bad key"}}"#,
         ] {
             assert!(message_content(json).is_none(), "{json:?}");
+        }
+    }
+
+    #[test]
+    fn infer_local_reports_missing_model_honestly() {
+        // 这个 id 在任何候选目录里都不存在，因此必然命中「未安装」分支。
+        let err = infer_local("你好", "__fastpin_test_missing_model__")
+            .expect_err("骨架不能假装翻译成功");
+        assert_eq!(err.to_string(), LOCAL_NOT_INSTALLED);
+    }
+
+    #[test]
+    fn infer_local_rejects_path_traversal_ids() {
+        for id in ["", "..", "a/b", "a\\b", "a/../b"] {
+            assert!(infer_local("你好", id).is_err(), "{id:?}");
+            assert!(local_model_dir(id).is_err(), "{id:?}");
         }
     }
 }

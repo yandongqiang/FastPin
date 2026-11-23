@@ -98,9 +98,43 @@ pub struct Ocr {
     pub models_dir: Option<PathBuf>,
 }
 
+/// 设置页里的一张本地翻译服务卡片。`download_url` 为空表示暂无下载地址，
+/// UI 会提示用户手动把模型放进 `models/translate/<id>`。
+///
+/// 当前版本只把服务信息、模型目录和下载入口落成骨架；真实推理管线尚未实现。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LocalTranslateService {
+    pub id: String,
+    pub name: String,
+    pub languages: Vec<String>,
+    pub download_url: String,
+    pub download_mib: u32,
+    pub memory_mib: u32,
+    pub description: String,
+}
+
+/// 内置服务 id / 名称的常量。`String`、`Vec` 无法在 `const` 里填入非空值，
+/// 完整的服务对象由 [`default_local_translate_service`] 构造。
+pub const DEFAULT_LOCAL_SERVICE_ID: &str = "haidass-143m-fp16";
+pub const DEFAULT_LOCAL_SERVICE_NAME: &str = "Haidass Translate 143M · FP16";
+
+/// 目标图里的默认服务卡片。下载地址留空：仓库里没有模型包，也不假装能提供。
+pub fn default_local_translate_service() -> LocalTranslateService {
+    LocalTranslateService {
+        id: DEFAULT_LOCAL_SERVICE_ID.into(),
+        name: DEFAULT_LOCAL_SERVICE_NAME.into(),
+        languages: vec!["中文".into(), "英文".into()],
+        download_url: String::new(),
+        download_mib: 275,
+        memory_mib: 275,
+        description: "轻量中英互译模型，适合日常截图。".into(),
+    }
+}
+
 /// Defaults match the C# `AppConfig` so both builds behave the same when the
 /// file is missing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Translation {
     pub base_url: String,
@@ -112,6 +146,15 @@ pub struct Translation {
     /// plaintext HTTP. Confirmation is a two-click action in 设置 → 翻译; the
     /// runtime refuses to send a key over `http://` while this is false.
     pub allow_insecure_http: bool,
+    /// 本地模型根目录覆盖（仿 `ocr::models_dir`）。其下按 `translate/<服务 id>`
+    /// 分目录；`None` 时使用 exe 旁的 `models/translate`，再回退仓库副本。
+    pub local_models_dir: Option<PathBuf>,
+    /// 本地推理线程数。使用时按 `clamped_local_threads` 夹到 1..=16。
+    pub local_threads: u32,
+    /// `"api"` 走现有 API；其它值按 id 匹配 `local_services`。
+    pub default_service: String,
+    /// 设置页展示的本地服务；失败时一律回退到 API。
+    pub local_services: Vec<LocalTranslateService>,
 }
 
 impl Default for Translation {
@@ -123,7 +166,19 @@ impl Default for Translation {
             prompt: String::new(),
             timeout_seconds: 30,
             allow_insecure_http: false,
+            local_models_dir: None,
+            local_threads: 4,
+            default_service: "api".into(),
+            // 让用户能看到目标图那样的服务卡片；默认仍走 API。
+            local_services: vec![default_local_translate_service()],
         }
+    }
+}
+
+impl Translation {
+    /// 手改过的配置也不能把线程数推到区间外。
+    pub fn clamped_local_threads(&self) -> u32 {
+        self.local_threads.clamp(1, 16)
     }
 }
 
@@ -1389,6 +1444,67 @@ mod tests {
     }
 
     #[test]
+    fn local_translate_services_use_camel_case_and_roundtrip() {
+        let s = parse(
+            r#"{
+              "translation": {
+                "localModelsDir": "D:/models",
+                "localThreads": 8,
+                "defaultService": "haidass-143m-fp16",
+                "localServices": [{
+                  "id": "haidass-143m-fp16",
+                  "name": "Haidass Translate 143M · FP16",
+                  "languages": ["中文", "英文"],
+                  "downloadUrl": "",
+                  "downloadMib": 275,
+                  "memoryMib": 275,
+                  "description": "轻量中英互译模型，适合日常截图。"
+                }]
+              }
+            }"#,
+        );
+        assert_eq!(
+            s.translation.local_models_dir.as_deref(),
+            Some(std::path::Path::new("D:/models"))
+        );
+        assert_eq!(s.translation.local_threads, 8);
+        assert_eq!(s.translation.default_service, "haidass-143m-fp16");
+        assert_eq!(
+            s.translation.local_services,
+            vec![default_local_translate_service()]
+        );
+
+        let json = serde_json::to_string(&s.translation).expect("serializes");
+        for key in [
+            "localModelsDir",
+            "localThreads",
+            "defaultService",
+            "localServices",
+            "downloadUrl",
+            "downloadMib",
+            "memoryMib",
+        ] {
+            assert!(
+                json.contains(&format!("\"{key}\"")),
+                "{key} missing in {json}"
+            );
+        }
+        let back = parse(&format!(r#"{{"translation": {json}}}"#));
+        assert_eq!(back.translation, s.translation);
+    }
+
+    #[test]
+    fn local_threads_are_clamped_when_applied() {
+        for (raw, expected) in [(0, 1), (3, 3), (4, 4), (16, 16), (99, 16)] {
+            let t = Translation {
+                local_threads: raw,
+                ..Default::default()
+            };
+            assert_eq!(t.clamped_local_threads(), expected);
+        }
+    }
+
+    #[test]
     fn a_bad_field_does_not_discard_the_rest_of_the_file() {
         let s = parse(
             r#"{
@@ -1453,6 +1569,13 @@ mod tests {
         );
         // Fields absent from that old file fall back to the shipped defaults.
         assert_eq!(s.translation.model, "gpt-4o-mini");
+        assert_eq!(s.translation.default_service, "api");
+        assert_eq!(s.translation.local_threads, 4);
+        assert!(s.translation.local_models_dir.is_none());
+        assert_eq!(
+            s.translation.local_services,
+            vec![default_local_translate_service()]
+        );
         assert!(s.ocr.models_dir.is_none());
         assert!(s.screenshot.hidden_toolbar_items.is_empty());
         assert_eq!(
@@ -1544,14 +1667,33 @@ mod tests {
         let mut before = Settings::default();
         before.translation.base_url = "https://x/v1".into();
         before.translation.prompt = "be terse".into();
+        before.translation.local_models_dir = Some(PathBuf::from("D:/models"));
+        before.translation.local_threads = 8;
+        before.translation.default_service = DEFAULT_LOCAL_SERVICE_ID.into();
         before.screenshot.hidden_toolbar_items = vec!["text".into()];
         before.ocr.models_dir = Some(PathBuf::from("D:/models/v6"));
 
-        let after = parse(&serde_json::to_string_pretty(&before).expect("serializes"));
+        let json = serde_json::to_string_pretty(&before).expect("serializes");
+        // 新字段全部走 camelCase，和老字段保持同一套命名约定。
+        assert!(json.contains("\"localModelsDir\""), "{json}");
+        assert!(json.contains("\"localThreads\""), "{json}");
+        assert!(json.contains("\"defaultService\""), "{json}");
+        assert!(json.contains("\"localServices\""), "{json}");
+        let after = parse(&json);
 
         assert_eq!(after.translation.base_url, before.translation.base_url);
         assert_eq!(after.translation.prompt, before.translation.prompt);
         assert_eq!(after.translation.model, before.translation.model);
+        assert_eq!(
+            after.translation.local_models_dir,
+            before.translation.local_models_dir
+        );
+        assert_eq!(after.translation.local_threads, 8);
+        assert_eq!(after.translation.default_service, DEFAULT_LOCAL_SERVICE_ID);
+        assert_eq!(
+            after.translation.local_services,
+            before.translation.local_services
+        );
         assert_eq!(
             after.translation.timeout_seconds,
             before.translation.timeout_seconds

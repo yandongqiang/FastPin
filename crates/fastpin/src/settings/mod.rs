@@ -244,6 +244,9 @@ enum SelectId {
     ElementDetection,
     ToolbarPosition,
     PanelPosition,
+    // 翻译页：默认服务与本地推理线程数。
+    DefaultTranslateService,
+    LocalThreads,
 }
 
 /// 截屏页的布尔开关，共用一套「取反后写回」逻辑。
@@ -555,6 +558,8 @@ pub struct SettingsView {
     /// Guards against spawning more than one history polling task. The task
     /// clears it when the History page (or the whole window) is left.
     history_poll_running: bool,
+    /// 本地模型下载在后台线程执行；此标志防止重复点击。
+    model_downloading: bool,
     /// In-flight update check guards against double clicks.
     update_checking: bool,
     /// (version, url) of a newer release, when the last check found one.
@@ -1002,6 +1007,7 @@ impl SettingsView {
             )),
             history_revision_seen: crate::history::history_revision(),
             history_poll_running: false,
+            model_downloading: false,
             update_checking: false,
             update_available: None,
             update_downloading: false,
@@ -1913,6 +1919,104 @@ impl SettingsView {
         } else {
             cx.notify();
         }
+    }
+
+    fn default_service_label(&self) -> SharedString {
+        let id = self.settings.translation.default_service.trim();
+        if id.is_empty() || id == "api" {
+            return "API 翻译（OpenAI 兼容）".into();
+        }
+        self.settings
+            .translation
+            .local_services
+            .iter()
+            .find(|service| service.id == id)
+            .map(|service| SharedString::from(service.name.clone()))
+            .unwrap_or_else(|| SharedString::from(id))
+    }
+
+    fn set_default_service(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.open_select = None;
+        if self.settings.translation.default_service != id {
+            self.settings.translation.default_service = id.to_string();
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_local_threads(&mut self, threads: u32, cx: &mut Context<Self>) {
+        self.open_select = None;
+        let threads = threads.clamp(1, 16);
+        if self.settings.translation.local_threads != threads {
+            self.settings.translation.local_threads = threads;
+            self.persist(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// 自定义服务只给编辑入口，不在 UI 里写半个服务条目进 settings.json。
+    fn add_local_service(&mut self, cx: &mut Context<Self>) {
+        self.ok("自定义服务请编辑 settings.json 的 translation.localServices");
+        cx.notify();
+    }
+
+    /// 把模型包下载到 `models/translate/<id>/`。默认服务没有下载地址，
+    /// 只提示手动放置，不发起网络请求；真正的下载在后台线程流式写入。
+    fn download_local_model(&mut self, id: String, url: String, cx: &mut Context<Self>) {
+        if url.trim().is_empty() {
+            self.ok(format!(
+                "暂无下载地址，请手动将模型放入 models/translate/{id}"
+            ));
+            cx.notify();
+            return;
+        }
+        if self.model_downloading {
+            return;
+        }
+        let dir = match crate::translate::local_model_dir(&id) {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.fail(format!("模型目录不可用：{e}"));
+                cx.notify();
+                return;
+            }
+        };
+        let dest = dir.join(crate::net::download_file_name(&url));
+        self.model_downloading = true;
+        self.ok(format!("正在下载模型 {id}…"));
+        cx.notify();
+
+        enum Msg {
+            Done(std::result::Result<PathBuf, String>),
+        }
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        std::thread::spawn(move || {
+            let outcome = crate::net::download_url_to(&url, &dest, |_| {});
+            let _ = tx.send(Msg::Done(outcome.map_err(|e| e.to_string())));
+            flag.store(true, Ordering::Release);
+        });
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            while !finished.load(Ordering::Acquire) {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+            }
+            while let Ok(msg) = rx.try_recv() {
+                let _ = this.update(cx, |this, cx| {
+                    this.model_downloading = false;
+                    match msg {
+                        Msg::Done(Ok(path)) => this.ok(format!("模型已下载：{}", path.display())),
+                        Msg::Done(Err(e)) => this.fail(format!("模型下载失败：{e}")),
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn appearance_label(&self) -> SharedString {
@@ -3973,8 +4077,122 @@ impl SettingsView {
     }
 
     fn page_translate(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // 默认翻译服务：API + 每个本地服务；写入 default_service 并落盘。
+        let selected_service = self.settings.translation.default_service.clone();
+        let mut service_options: Vec<gpui::Stateful<gpui::Div>> = vec![widgets::select_option(
+            SharedString::from("default-service-api"),
+            "API 翻译（OpenAI 兼容）",
+            selected_service == "api",
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.set_default_service("api", cx)),
+        )];
+        for service in &self.settings.translation.local_services {
+            let id = service.id.clone();
+            let label = SharedString::from(service.name.clone());
+            let selected = selected_service == id;
+            service_options.push(
+                widgets::select_option(
+                    SharedString::from(format!("default-service-{id}")),
+                    label,
+                    selected,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_default_service(&id, cx)),
+                ),
+            );
+        }
+        let default_service = self.select_row(
+            cx,
+            SelectId::DefaultTranslateService,
+            "默认翻译服务",
+            "选择 API 翻译或本地服务；本地不可用时自动回退到 API。",
+            self.default_service_label(),
+            service_options,
+        );
+
+        // 我的服务：每张卡片显示元数据、安装状态与下载按钮。
+        let add_service = div().flex().flex_row().justify_end().mb(px(4.)).child(
+            widgets::button("add-translate-service", "添加服务").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.add_local_service(cx)),
+            ),
+        );
+        let mut cards: Vec<gpui::Div> = Vec::new();
+        for service in &self.settings.translation.local_services {
+            let installed = crate::translate::local_model_dir(&service.id)
+                .map(|dir| dir.join("model.onnx").is_file())
+                .unwrap_or(false);
+            let status: SharedString = if installed {
+                "已安装（model.onnx）".into()
+            } else if service.download_url.trim().is_empty() {
+                "未安装 / 暂无下载地址".into()
+            } else {
+                "未安装".into()
+            };
+            let id = service.id.clone();
+            let url = service.download_url.clone();
+            let download = widgets::button(
+                SharedString::from(format!("download-model-{}", service.id)),
+                if self.model_downloading {
+                    "下载中…"
+                } else {
+                    "下载"
+                },
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.download_local_model(id.clone(), url.clone(), cx);
+                }),
+            );
+            let mut card_rows = vec![
+                widgets::row(service.name.clone(), service.description.clone()),
+                widgets::row(
+                    "支持语言",
+                    format!(
+                        "{} 种语言：{}",
+                        service.languages.len(),
+                        service.languages.join(" / ")
+                    ),
+                ),
+                widgets::row(
+                    "下载与占用",
+                    format!(
+                        "下载约 {} MiB · 运行内存约 {} MiB",
+                        service.download_mib, service.memory_mib
+                    ),
+                ),
+                widgets::row("安装状态", status).child(widgets::control(download)),
+            ];
+            if service.download_url.trim().is_empty() && !installed {
+                card_rows.push(widgets::row(
+                    "来源",
+                    format!(
+                        "暂无下载地址，请手动将模型放入 models/translate/{}",
+                        service.id
+                    ),
+                ));
+            }
+            cards.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(widgets::rows(card_rows))
+                    .child(
+                        widgets::hint("使用所选模型离线翻译；任务结束后释放模型内存。")
+                            .px(px(20.))
+                            .pb(px(12.)),
+                    ),
+            );
+        }
+
+        // API 翻译设置：原有控件全部保留，只是收进自己的子分组。
         let current = self.settings.translation.target_language.clone();
-        let rows = LANGUAGES
+        let language_options = LANGUAGES
             .map(|(code, name)| {
                 widgets::select_option(code, format!("{name} ({code})"), current == code)
                     .on_mouse_down(
@@ -3990,7 +4208,7 @@ impl SettingsView {
             "目标语言",
             "翻译输出的语言。",
             self.language_label(),
-            rows,
+            language_options,
         );
 
         let prompt_summary = if self.settings.translation.prompt.trim().is_empty() {
@@ -4024,7 +4242,7 @@ impl SettingsView {
                 )
             });
 
-        let mut rows: Vec<_> = vec![
+        let mut api_rows: Vec<gpui::Div> = vec![
             widgets::stack(
                 "接口地址",
                 "OpenAI 兼容接口，例如 https://api.openai.com/v1；留空则翻译不可用。",
@@ -4054,7 +4272,7 @@ impl SettingsView {
             } else {
                 "我了解风险，仍要使用 HTTP"
             };
-            rows.insert(
+            api_rows.insert(
                 0,
                 widgets::row(
                     "明文 HTTP 警告",
@@ -4082,7 +4300,47 @@ impl SettingsView {
                 )),
             );
         }
-        widgets::rows(rows)
+
+        // 本地推理线程数：所有本地模型共用，下一次翻译生效。
+        let threads = self.settings.translation.local_threads.clamp(1, 16);
+        let thread_options: Vec<_> = [1u32, 2, 4, 8, 16]
+            .into_iter()
+            .map(|n| {
+                widgets::select_option(
+                    SharedString::from(format!("local-threads-{n}")),
+                    format!("{n} 线程"),
+                    n == threads,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_local_threads(n, cx)),
+                )
+            })
+            .collect();
+        let thread_row = self.select_row(
+            cx,
+            SelectId::LocalThreads,
+            "本地推理线程数",
+            "所有本地模型共用，下一次翻译生效。推荐 4 线程；增大线程数可能增加 CPU 占用，不一定更快。",
+            SharedString::from(format!("{threads} 线程")),
+            thread_options,
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .child(widgets::group_header("默认翻译服务"))
+            .child(widgets::rows(vec![default_service]))
+            .child(widgets::group_header("我的服务"))
+            .child(add_service)
+            .children(cards)
+            .child(widgets::group_header("API 翻译设置"))
+            .child(widgets::rows(api_rows))
+            .child(widgets::group_header("本地推理"))
+            .child(widgets::rows(vec![thread_row]))
+            .child(widgets::hint(
+                "本地翻译目前是骨架：模型未安装或推理管线未实现时，会自动回退到 API 翻译。",
+            ))
     }
 
     fn page_resources(&self, cx: &mut Context<Self>) -> impl IntoElement {

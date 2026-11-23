@@ -9,3 +9,6 @@ build.log
 # actually ships was vendored into crates/, so these are disposable.
 .snow-shot-src/
 .npmcache/
+
+# Downloaded translation models (fetched at runtime, not shipped in git).
+models/translate/

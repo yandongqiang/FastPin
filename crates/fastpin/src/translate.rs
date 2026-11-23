@@ -80,16 +80,27 @@ pub fn translate(text: &str) -> Result<String> {
     let cfg = config::get().translation;
     // 本地优先：只在实际产出译文时才返回；失败写日志后落到下面的 API 路径。
     // 配置 / base_url 校验 / 凭据 / HTTP 闸门 / WinHTTP 逻辑全部保持不变。
-    if cfg.default_service != "api" {
+    let using_local = cfg.default_service != "api";
+    if using_local {
         match infer_local(text, &cfg.default_service) {
             Ok(translated) => return Ok(translated),
-            Err(e) => crate::perf::log_app(&format!(
-                "本地翻译失败，回退 API：{}（服务 {}）",
-                e, cfg.default_service
-            )),
+            Err(e) => {
+                crate::perf::log_app(&format!(
+                    "本地翻译失败，回退 API：{}（服务 {}）",
+                    e, cfg.default_service
+                ));
+            }
         }
     }
     if cfg.base_url.trim().is_empty() {
+        // 本地服务下载完成但推理尚未实现时，通用的「翻译未配置」会让用户
+        // 误以为下载没生效——明确说明原因与出路。
+        if using_local {
+            return Err(Error::new(format!(
+                "本地服务「{}」的推理尚未实现，当前无法离线翻译；且未配置 API 翻译。请在 设置 → 翻译 中切换到「API 翻译」并填写 Base URL 与 Key，或等待本地推理支持。",
+                cfg.default_service
+            )));
+        }
         let path = config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_default();

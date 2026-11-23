@@ -1,7 +1,8 @@
 ; FastPin installer — build with:
 ;   "C:\Users\admin\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer\fastpin.iss
-; Payload mirrors the portable layout: FastPin.exe + DirectML.dll + models\v6,
-; which is exactly what ocr::models_dir expects next to the exe.
+; Payload mirrors the portable layout: FastPin.exe + DirectML.dll + models\v6
+; and themes\*, which is exactly what ocr::models_dir / init_themes expect next
+; to the exe.
 
 // release.yml injects /DAppVersion=<tag>; the fallback matches Cargo.toml.
 #ifndef AppVersion
@@ -44,6 +45,7 @@ Name: "autostart"; Description: "开机自动启动"; GroupDescription: "其他�
 Source: "..\target\release\FastPin.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\DirectML.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\models\v6\*"; DestDir: "{app}\models\v6"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\themes\*"; DestDir: "{app}\themes"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\FastPin"; Filename: "{app}\FastPin.exe"

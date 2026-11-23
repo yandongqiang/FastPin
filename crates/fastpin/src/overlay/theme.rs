@@ -11,8 +11,8 @@
 
 use std::sync::RwLock;
 
-use gpui::{hsla, rgb, Hsla, Pixels};
-use gpui_kit::component::{Theme, ThemeColor, ThemeMode};
+use gpui::{hsla, rgb, Hsla, Pixels, SharedString};
+use gpui_kit::component::{Theme, ThemeColor, ThemeMode, ThemeRegistry};
 
 /// Colours the chrome needs, already resolved from the theme's colour tokens.
 ///
@@ -126,11 +126,213 @@ pub fn apply_theme(theme: &Theme) {
     *guard = Some(palette);
 }
 
-/// Initializes gpui-kit (GPUI base, components and their globals) and applies
-/// the appearance persisted in `settings.json`. Call once per `App`, before
-/// any window opens.
+/// 磁盘上的一个 gpui-kit 主题族。族名写进设置文件（深色变体加 `-dark`），
+/// light/dark key 是族内变体在 gpui-kit registry 里的注册名。
+#[derive(Clone, Debug)]
+struct ThemeFamily {
+    /// 族名，如 "CitePix" / "Catppuccin"。
+    name: String,
+    /// 设置文件里的稳定 id，目前就是族名。
+    id: String,
+    /// 第一个浅色变体的注册名；族内没有浅色变体时为 None。
+    light_key: Option<String>,
+    /// 第一个深色变体的注册名；族内没有深色变体时为 None。
+    dark_key: Option<String>,
+    /// 全部变体注册名，允许 appearance 直接写变体名。
+    variants: Vec<String>,
+}
+
+/// 进程内的主题族映射。gpui-kit 的 registry 会丢掉族名，只按变体名注册，
+/// 族 → 变体的对应关系只能在这里自己维护。
+fn families() -> &'static RwLock<Vec<ThemeFamily>> {
+    static FAMILIES: RwLock<Vec<ThemeFamily>> = RwLock::new(Vec::new());
+    &FAMILIES
+}
+
+/// 从主题文件文本里读出族映射。用 `serde_json::Value` 而不是强类型
+/// `ThemeSet`：文件可能新增字段，这里只关心 name / themes[].name / mode。
+fn parse_family(text: &str) -> Option<ThemeFamily> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let name = value.get("name")?.as_str()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut light_key = None;
+    let mut dark_key = None;
+    let mut variants = Vec::new();
+    if let Some(themes) = value.get("themes").and_then(|v| v.as_array()) {
+        for variant in themes {
+            let Some(key) = variant.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if key.trim().is_empty() {
+                continue;
+            }
+            let dark = variant
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("dark"));
+            if dark {
+                dark_key.get_or_insert_with(|| key.to_string());
+            } else {
+                light_key.get_or_insert_with(|| key.to_string());
+            }
+            variants.push(key.to_string());
+        }
+    }
+    if variants.is_empty() {
+        return None;
+    }
+    Some(ThemeFamily {
+        id: name.clone(),
+        name,
+        light_key,
+        dark_key,
+        variants,
+    })
+}
+
+/// 主题文件查找路径：优先 exe 旁的 `themes/`（便携版），其次是当前工作
+/// 目录下的 `themes/`（源码目录直接运行时）。
+fn theme_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.join("themes"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let dir = cwd.join("themes");
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// 扫描主题目录，把每个族的所有变体注册进 gpui-kit 并记下族映射。
+/// 目录缺失、文件损坏或注册失败都静默降级到内置主题，绝不影响启动。
+pub fn init_themes(cx: &mut gpui::App) {
+    // 正常由 init() 在 gpui_kit::init 之后调用；单独调用时不 panic，静默跳过。
+    if !cx.has_global::<ThemeRegistry>() {
+        *families().write().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        return;
+    }
+    let mut loaded: Vec<ThemeFamily> = Vec::new();
+    for dir in theme_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut files: Vec<_> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            })
+            .collect();
+        files.sort();
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(family) = parse_family(&text) else {
+                continue;
+            };
+            if loaded
+                .iter()
+                .any(|known| known.id.eq_ignore_ascii_case(&family.id))
+            {
+                continue;
+            }
+            if let Err(e) = ThemeRegistry::global_mut(cx).load_themes_from_str(&text) {
+                eprintln!("主题 {} 注册失败：{e}", path.display());
+                continue;
+            }
+            loaded.push(family);
+        }
+        // 命中一个目录即可：exe 旁有主题时不再读工作目录的同名文件。
+        if !loaded.is_empty() {
+            break;
+        }
+    }
+    *families().write().unwrap_or_else(|e| e.into_inner()) = loaded;
+}
+
+/// 在已知主题族里解析 appearance id，返回 registry 里的变体注册名。
+/// 同时接受族 id（`Catppuccin` / `Catppuccin-dark`）与具体变体名
+///（`Catppuccin Mocha`），便于手工编辑设置文件。
+fn family_key_in(families: &[ThemeFamily], name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    for family in families {
+        if let Some(variant) = family
+            .variants
+            .iter()
+            .find(|key| key.to_ascii_lowercase() == lower)
+        {
+            return Some(variant.clone());
+        }
+        let (base, want_dark) = match lower.strip_suffix("-dark") {
+            Some(base) => (base, true),
+            None => (lower.as_str(), false),
+        };
+        if base == family.id.to_ascii_lowercase() {
+            let key = if want_dark {
+                family.dark_key.as_ref().or(family.light_key.as_ref())
+            } else {
+                family.light_key.as_ref().or(family.dark_key.as_ref())
+            };
+            if let Some(key) = key {
+                return Some(key.clone());
+            }
+        }
+    }
+    None
+}
+
+fn family_theme_key(name: &str) -> Option<String> {
+    let guard = families().read().unwrap_or_else(|e| e.into_inner());
+    family_key_in(&guard, name)
+}
+
+/// 设置页下拉用的 (id, 标签)：内置 10 项在前，随后是磁盘上发现的每个主题族。
+/// 族名直接作为标签；深色变体以 `-dark` 结尾并在标签后注明「深色」。
+pub fn available_themes() -> Vec<(String, String)> {
+    let mut options: Vec<(String, String)> = crate::config::APPEARANCES
+        .iter()
+        .map(|&id| {
+            (
+                id.to_string(),
+                crate::config::appearance_label(id).to_string(),
+            )
+        })
+        .collect();
+    let guard = families().read().unwrap_or_else(|e| e.into_inner());
+    for family in guard.iter() {
+        if family.light_key.is_some() {
+            options.push((family.id.clone(), family.name.clone()));
+        }
+        if family.dark_key.is_some() {
+            options.push((
+                format!("{}-dark", family.id),
+                format!("{}（深色）", family.name),
+            ));
+        }
+    }
+    options
+}
+
+/// Initializes gpui-kit (GPUI base, components and their globals), loads the
+/// shipped theme families, and applies the appearance persisted in
+/// `settings.json`. Call once per `App`, before any window opens.
 pub fn init(cx: &mut gpui::App) {
     gpui_kit::init(cx);
+    init_themes(cx);
     set_appearance(cx, &crate::config::get().appearance);
 }
 
@@ -175,15 +377,45 @@ fn themed_colors(name: &str) -> ThemeColor {
 /// Switches appearance at runtime through the component theme, refreshes the
 /// snapshot, and asks every window (settings included) to repaint.
 ///
-/// `Theme::change` loads the mode's registered palette, so the accent edit has
-/// to happen in a second `Theme::update` or it would be overwritten. Its second
-/// argument is an unused `Option<&mut Window>`, not a colour.
+/// A loaded theme family is applied with `Theme::apply_config`: it sets mode,
+/// colours and tokens in one step, so no built-in tint may be layered on top.
+/// Built-in appearances keep the old `Theme::change` + accent-edit path; the
+/// accent edit has to happen in a second `Theme::update` or it would be
+/// overwritten. `Theme::change`'s second argument is an unused
+/// `Option<&mut Window>`, not a colour.
 pub fn set_appearance(cx: &mut gpui::App, name: &str) {
+    if let Some(key) = family_theme_key(name) {
+        let cfg = ThemeRegistry::global(cx)
+            .themes()
+            .get(&SharedString::from(key))
+            .cloned();
+        if let Some(cfg) = cfg {
+            Theme::update(cx, |t| t.apply_config(&cfg));
+            let theme = Theme::global(cx).clone();
+            apply_theme(&theme);
+            cx.refresh_windows();
+            return;
+        }
+    }
+
     let mode = if crate::config::appearance_dark(name) {
         ThemeMode::Dark
     } else {
         ThemeMode::Light
     };
+    // 从主题族切回内置主题时先清掉族写入的 light/dark 配置，否则
+    // Theme::change 会按当前 mode 再把上一次的族主题加载回来。
+    let (light, dark) = {
+        let registry = ThemeRegistry::global(cx);
+        (
+            registry.default_light_theme().clone(),
+            registry.default_dark_theme().clone(),
+        )
+    };
+    Theme::update(cx, |t| {
+        t.light_theme = light;
+        t.dark_theme = dark;
+    });
     Theme::change(mode, None, cx);
     let colors = themed_colors(name);
     Theme::update(cx, |t| t.colors = colors);
@@ -531,5 +763,76 @@ mod tests {
         assert_eq!(p.accent_hover, tokens.primary_hover);
         assert_eq!(p.accent_pressed, tokens.primary_active);
         assert_eq!(p.danger_hover, tokens.danger_hover);
+    }
+
+    /// 族映射的纯逻辑测试：不依赖 cx，也不触碰进程内的注册表。
+    #[test]
+    fn parses_theme_family_from_json() {
+        let text = r#"{
+            "name": "Catppuccin",
+            "themes": [
+                {"name": "Catppuccin Latte", "mode": "light"},
+                {"name": "Catppuccin Frappe", "mode": "dark"},
+                {"name": "Catppuccin Mocha", "mode": "dark"}
+            ]
+        }"#;
+        let family = parse_family(text).expect("parses family");
+        assert_eq!(family.name, "Catppuccin");
+        assert_eq!(family.id, "Catppuccin");
+        assert_eq!(family.light_key.as_deref(), Some("Catppuccin Latte"));
+        assert_eq!(family.dark_key.as_deref(), Some("Catppuccin Frappe"));
+        assert_eq!(family.variants.len(), 3);
+        // 缺字段、空族和坏 JSON 都不能产生映射。
+        assert!(parse_family(r#"{"themes": []}"#).is_none());
+        assert!(parse_family(r#"{"name": "X"}"#).is_none());
+        assert!(parse_family("not json").is_none());
+    }
+
+    #[test]
+    fn family_ids_and_variant_names_resolve_to_registry_keys() {
+        let families = vec![
+            parse_family(
+                r#"{
+                    "name": "Catppuccin",
+                    "themes": [
+                        {"name": "Catppuccin Latte", "mode": "light"},
+                        {"name": "Catppuccin Frappe", "mode": "dark"}
+                    ]
+                }"#,
+            )
+            .unwrap(),
+            parse_family(
+                r#"{
+                    "name": "Adventure",
+                    "themes": [{"name": "Adventure", "mode": "dark"}]
+                }"#,
+            )
+            .unwrap(),
+        ];
+        // 族 id 按 mode 选变体；只有深色变体时浅色 id 也回落到它。
+        assert_eq!(
+            family_key_in(&families, "Catppuccin").as_deref(),
+            Some("Catppuccin Latte")
+        );
+        assert_eq!(
+            family_key_in(&families, "Catppuccin-dark").as_deref(),
+            Some("Catppuccin Frappe")
+        );
+        assert_eq!(
+            family_key_in(&families, "  catppuccin-DARK  ").as_deref(),
+            Some("Catppuccin Frappe")
+        );
+        // 变体名与空白、大小写都接受。
+        assert_eq!(
+            family_key_in(&families, "catppuccin frappe").as_deref(),
+            Some("Catppuccin Frappe")
+        );
+        assert_eq!(
+            family_key_in(&families, " Adventure ").as_deref(),
+            Some("Adventure")
+        );
+        // 内置 id 不能误命中主题族。
+        assert_eq!(family_key_in(&families, "light"), None);
+        assert_eq!(family_key_in(&families, ""), None);
     }
 }

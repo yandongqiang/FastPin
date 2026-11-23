@@ -25,6 +25,9 @@ jobs:
           Copy-Item LICENSE $dir
           New-Item -ItemType Directory -Force "$dir/models/v6" | Out-Null
           Copy-Item models/v6/* "$dir/models/v6"
+          # themes/ 必须放在 exe 旁，init_themes 会优先从 exe 所在目录加载主题族。
+          New-Item -ItemType Directory -Force "$dir/themes" | Out-Null
+          Copy-Item themes\* "$dir/themes"
           Compress-Archive -Path $dir -DestinationPath "dist/FastPin-${{ github.ref_name }}-x64.zip"
       # Build the installer on the runner so every released artifact is
       # reproducible from the tagged commit (a SignPath requirement).

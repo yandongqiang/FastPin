@@ -22,11 +22,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpui::{
-    actions, canvas, div, hsla, img, prelude::*, px, size, white, App, Bounds, Context,
-    CursorStyle, DispatchPhase, ElementInputHandler, EntityInputHandler, FocusHandle, Focusable,
-    ImageSource, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point as GpuiPoint, Render, RenderImage, ScrollDelta, ScrollWheelEvent,
-    UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
+    actions, canvas, div, img, prelude::*, px, size, App, Bounds, Context, CursorStyle,
+    DispatchPhase, ElementInputHandler, EntityInputHandler, FocusHandle, Focusable, ImageSource,
+    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point as GpuiPoint, Render, RenderImage, ScrollDelta, ScrollWheelEvent, UTF16Selection, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
@@ -42,6 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::geom::{Point, Rect};
 use crate::overlay::annotate::{self, TextDraft, TextLayer};
 use crate::overlay::editor::{Element, PressKind, Shape, Tool};
+use crate::overlay::theme;
 use crate::pin_edit;
 use crate::pin_snap::{
     are_adjacent, compose, find_snap, flatten_gaps, rounded_rect, zoom_rect, IRect, Side,
@@ -1842,7 +1843,7 @@ impl Render for PinView {
             .occlude()
             .rounded_md()
             .border_1()
-            .border_color(hsla(0., 0., 1., 0.7))
+            .border_color(theme::border().opacity(0.7))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -1877,8 +1878,8 @@ impl Render for PinView {
                         .top(px(6.))
                         .left(px(6.))
                         .rounded_md()
-                        .bg(hsla(0., 0., 0., 0.7))
-                        .text_color(white())
+                        .bg(theme::elevated_surface().opacity(0.85))
+                        .text_color(theme::primary_fg())
                         .text_size(px(12.))
                         .child("合成中…"),
                 )
@@ -1886,7 +1887,7 @@ impl Render for PinView {
             // A close affordance that does not cover small pins: under 48
             // logical px on either side, Esc / double-click remain the way out.
             .children(close_here.then(|| {
-                round_button("pin-close", 6.0, "✕", hsla(0.02, 0.7, 0.5, 0.9))
+                round_button("pin-close", 6.0, "✕", theme::danger(), theme::on_danger())
                     .right(px(6.))
                     .on_mouse_up(
                         MouseButton::Left,
@@ -1897,7 +1898,7 @@ impl Render for PinView {
                     )
             }))
             .children(stitch_at.map(|(x, y)| {
-                round_button("pin-stitch", y, "✓", hsla(0.38, 0.6, 0.4, 0.95))
+                round_button("pin-stitch", y, "✓", theme::accent(), theme::on_accent())
                     .left(px(x))
                     .on_mouse_up(
                         MouseButton::Left,
@@ -1918,6 +1919,7 @@ fn round_button(
     y: f32,
     label: &'static str,
     hover_bg: gpui::Hsla,
+    hover_fg: gpui::Hsla,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -1929,11 +1931,11 @@ fn round_button(
         .flex()
         .items_center()
         .justify_center()
-        .bg(hsla(0., 0., 0., 0.55))
-        .text_color(white())
+        .bg(theme::surface().opacity(0.85))
+        .text_color(theme::primary_fg())
         .text_size(px(12.))
         .cursor(CursorStyle::PointingHand)
-        .hover(move |s| s.bg(hover_bg))
+        .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })

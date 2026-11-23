@@ -465,6 +465,8 @@ enum HistoryViewMode {
 pub struct SettingsView {
     page: Page,
     settings: Settings,
+    /// 外观下拉的全部选项（内置主题 + 磁盘上的主题族），开窗时取样一次。
+    theme_options: Vec<(String, String)>,
     status: SharedString,
     status_error: bool,
     open_select: Option<SelectId>,
@@ -590,6 +592,7 @@ impl SettingsView {
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = crate::config::get();
+        let theme_options = theme::available_themes();
         let t = settings.translation.clone();
         let saved_api_key = crate::translate::api_key().unwrap_or_default();
 
@@ -944,6 +947,7 @@ impl SettingsView {
         Self {
             page: Page::General,
             settings,
+            theme_options,
             status: SharedString::default(),
             status_error: false,
             open_select: None,
@@ -1913,12 +1917,19 @@ impl SettingsView {
     }
 
     fn appearance_label(&self) -> SharedString {
-        crate::config::appearance_label(&self.settings.appearance).into()
+        let id = self.settings.appearance.trim();
+        self.theme_options
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(id))
+            .map(|(_, label)| SharedString::from(label.clone()))
+            // 手工编辑的设置值没有对应选项时，沿用内置标签的浅色回退。
+            .unwrap_or_else(|| crate::config::appearance_label(id).into())
     }
 
     /// Appearance switch: save first, then push the theme into gpui-kit and
     /// refresh every window so the toolbar and this window repaint together.
-    fn set_appearance(&mut self, name: &'static str, cx: &mut Context<Self>) {
+    /// `name` 可以是内置 id，也可以是磁盘主题族的 id / 变体名。
+    fn set_appearance(&mut self, name: &str, cx: &mut Context<Self>) {
         self.open_select = None;
         if !self.settings.appearance.eq_ignore_ascii_case(name) {
             self.settings.appearance = name.to_string();
@@ -3896,17 +3907,21 @@ impl SettingsView {
 
     fn page_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.settings.appearance.trim();
-        let rows = crate::config::APPEARANCES
+        let rows = self
+            .theme_options
             .iter()
-            .map(|&name| {
+            .map(|(id, label)| {
+                // 监听器要求 'static，把借用自 self 的 id / 标签各克隆一份。
+                let id = id.clone();
+                let label = label.clone();
                 widgets::select_option(
-                    SharedString::from(format!("appearance-{name}")),
-                    crate::config::appearance_label(name),
-                    current.eq_ignore_ascii_case(name),
+                    SharedString::from(format!("appearance-{id}")),
+                    label,
+                    current.eq_ignore_ascii_case(&id),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.set_appearance(name, cx)),
+                    cx.listener(move |this, _, _, cx| this.set_appearance(&id, cx)),
                 )
             })
             .collect();

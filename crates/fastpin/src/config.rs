@@ -21,10 +21,11 @@ pub struct Settings {
     pub screenshot: Screenshot,
     pub history: History,
     pub hotkeys: Hotkeys,
-    /// UI appearance: `"light"` (default), `"dark"`, or a tinted variant such
-    /// as `"blue"` / `"blue-dark"`. A plain string keeps the file hand-editable,
-    /// same rationale as the hotkey strings; an unknown value falls back to
-    /// light instead of failing the whole file.
+    /// UI appearance: `"light"` (default), `"dark"`, a tinted variant such as
+    /// `"blue"` / `"blue-dark"`, or a loaded theme family such as
+    /// `"Catppuccin"` / `"Catppuccin-dark"`. A plain string keeps the file
+    /// hand-editable, same rationale as the hotkey strings; an unknown value
+    /// falls back to light instead of failing the whole file.
     pub appearance: String,
 }
 
@@ -41,7 +42,8 @@ pub const APPEARANCE_GREEN_DARK: &str = "green-dark";
 pub const APPEARANCE_PURPLE_DARK: &str = "purple-dark";
 pub const APPEARANCE_ORANGE_DARK: &str = "orange-dark";
 
-/// Every value the appearance dropdown offers, in display order.
+/// Built-in values of [`Settings::appearance`], in display order. Theme
+/// families discovered on disk are appended by `overlay::theme::available_themes`.
 pub const APPEARANCES: [&str; 10] = [
     APPEARANCE_LIGHT,
     APPEARANCE_DARK,
@@ -55,20 +57,12 @@ pub const APPEARANCES: [&str; 10] = [
     APPEARANCE_ORANGE_DARK,
 ];
 
-/// Whether a stored appearance uses the dark base palette. The tinted variants
-/// carry a `-dark` suffix; anything unrecognised (including an empty or
-/// hand-edited value) reads as light.
+/// Whether a stored appearance uses the dark base palette. Every tinted variant
+/// and every loaded theme family carries a `-dark` suffix; anything else
+/// (including an empty or hand-edited value) reads as light.
 pub fn appearance_dark(name: &str) -> bool {
     let name = name.trim();
-    name.eq_ignore_ascii_case(APPEARANCE_DARK)
-        || [
-            APPEARANCE_BLUE_DARK,
-            APPEARANCE_GREEN_DARK,
-            APPEARANCE_PURPLE_DARK,
-            APPEARANCE_ORANGE_DARK,
-        ]
-        .iter()
-        .any(|v| name.eq_ignore_ascii_case(v))
+    name.eq_ignore_ascii_case(APPEARANCE_DARK) || name.to_ascii_lowercase().ends_with("-dark")
 }
 
 /// Chinese label shown in the settings dropdown. Unknown values read as light,
@@ -1566,6 +1560,30 @@ mod tests {
         assert!(!appearance_dark("nonsense"));
         assert_eq!(appearance_label("nonsense"), "浅色");
         assert_eq!(appearance_label(""), "浅色");
+    }
+
+    #[test]
+    fn theme_family_ids_use_the_dark_suffix() {
+        // 主题族名直接写入 appearance；深色变体在族名后加 -dark。
+        for family in ["Catppuccin", "CitePix", "macOS Classic"] {
+            assert!(!appearance_dark(family), "{family}");
+            let dark = format!("{family}-dark");
+            assert!(appearance_dark(&dark), "{dark}");
+            // 手工编辑的大小写与空白不能改变判定。
+            assert!(appearance_dark(&format!(
+                "  {}  ",
+                dark.to_ascii_uppercase()
+            )));
+
+            let settings = Settings {
+                appearance: dark.clone(),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&settings).expect("serializes");
+            let back = parse(&json);
+            assert_eq!(back.appearance, dark);
+            assert!(back.dark());
+        }
     }
 
     #[test]

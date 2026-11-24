@@ -482,6 +482,13 @@ enum HistoryViewMode {
 pub struct SettingsView {
     page: Page,
     settings: Settings,
+    /// 上一次由本页落盘时的配置基线。`persist()` 逐字段比较 `settings` 与它，
+    /// 差异即为本页真正改过的字段；相同字段保留其它窗口写入的最新值。
+    /// 每次保存成功后前移，避免「改回原值」被误判成从未编辑过。
+    baseline: Settings,
+    /// 重置本页 / 全部设置时置位：默认配置可能恰好等于开窗基线，此时逐字段
+    /// 差异无法区分「重置」与「没碰过」，必须强制整份采用快照让重置落盘。
+    force_snapshot: bool,
     /// 外观下拉的全部选项（gpui-kit registry 里的主题名，默认两项在前），开窗时取样一次。
     theme_options: Vec<(String, String)>,
     status: SharedString,
@@ -970,7 +977,9 @@ impl SettingsView {
 
         Self {
             page: Page::General,
+            baseline: settings.clone(),
             settings,
+            force_snapshot: false,
             theme_options,
             status: SharedString::default(),
             status_error: false,
@@ -1075,10 +1084,20 @@ impl SettingsView {
 
     fn persist(&mut self, cx: &mut Context<Self>) {
         // self.settings 是开窗时的快照，拼图 / 切图窗口期间可能已各自保存过
-        // 自己的字段。直接落盘会把那些改动整体回滚，因此从最新配置出发合并。
-        let merged = settings_persist_merge(&crate::config::get(), &self.settings);
+        // 自己的字段。从最新配置出发，只把本页改过的字段换成快照值；没改过的
+        // 共享字段（collage / pdf / export / appearance / split）一律保留 latest。
+        let merged = settings_persist_merge(
+            &crate::config::get(),
+            &self.settings,
+            &self.baseline,
+            self.force_snapshot,
+        );
         match crate::config::save(&merged) {
             Ok(()) => {
+                // 保存成功才前移基线并撤销重置强制：失败时保留现场，下次
+                // 重试仍应把重置的默认值写下去。
+                self.baseline = self.settings.clone();
+                self.force_snapshot = false;
                 self.status = SharedString::default();
                 self.status_error = false;
             }
@@ -1241,6 +1260,9 @@ impl SettingsView {
             if self.page == Page::Hotkey {
                 self.reapply_hotkeys();
             }
+            // 重置值可能恰好等于基线（本来就是默认的字段），显式强制整份
+            // 采用快照，否则这些字段会从 latest 读回外部写入的旧值。
+            self.force_snapshot = true;
             self.persist(cx);
             if self.page == Page::Resources {
                 // 模型目录被重置，缓存的引擎快照与已加载引擎都必须同步失效。
@@ -1265,6 +1287,8 @@ impl SettingsView {
         self.sync_inputs(cx);
         self.reapply_hotkeys();
         self.confirm_reset_all = false;
+        // 全局重置包含 split 等由其它窗口写入的字段，必须整份落盘。
+        self.force_snapshot = true;
         self.persist(cx);
         // 全局重置也会清掉 OCR 模型目录，刷新状态页快照并让旧引擎立即失效。
         crate::ocr::invalidate_engine();
@@ -5019,26 +5043,208 @@ impl SettingsView {
     }
 }
 
-/// 设置页落盘前的合并：从最新配置出发，只覆盖本页拥有的字段。
+/// 共享字段的逐字段合并：本页改过（快照与上次落盘基线不同）才用快照值，
+/// 没改过的一律保留其它窗口写入的最新值。`force` 供重置使用——默认值可能
+/// 恰好等于基线，此时不看差异也必须整份采用快照。
+fn keep_edited<T: PartialEq + Clone>(dst: &mut T, snapshot: &T, baseline: &T, force: bool) {
+    if force || snapshot != baseline {
+        *dst = snapshot.clone();
+    }
+}
+
+/// 设置页落盘前的合并：从最新配置出发，只覆盖本页真正改过的字段。
 ///
-/// 设置窗口持有的是打开时的快照，切图窗口期间可能已经保存过 split。
-/// 直接保存快照会把这些改动整体回滚。screenshot 内部只有 split 由切图窗口
-/// 拥有，保留最新值；collage / pdf 在本页有完整控件（含下拉写回与重置），
-/// 归本页用快照值——否则这些控件只改内存、落盘时被 latest 覆盖回去，完全
-/// 无效，重置回默认也会被旧值盖掉。export 的格式 / 质量 / 文件名 / 自动
-/// 保存 / 自动复制同样在本页有控件，用快照值。其余字段同样归本页。
-fn settings_persist_merge(latest: &Settings, snapshot: &Settings) -> Settings {
+/// ocr / translation / history / hotkeys 与截屏页的显示项、水印只有本页写，
+/// 沿用快照（与旧行为一致）。collage / pdf / export / appearance 同时被拼图
+/// 窗口、切图窗口和主题回写修改：`baseline` 是上次本页落盘时的值，逐字段
+/// 比较即可知道本页是否改过，没改过的字段保留 latest，不再被陈旧快照整体
+/// 回滚。split 本页没有控件，只有全局重置才会改，因此仅在 `force` 时取快照。
+fn settings_persist_merge(
+    latest: &Settings,
+    snapshot: &Settings,
+    baseline: &Settings,
+    force: bool,
+) -> Settings {
     let mut merged = latest.clone();
     merged.ocr = snapshot.ocr.clone();
     merged.translation = snapshot.translation.clone();
     merged.history = snapshot.history.clone();
     merged.hotkeys = snapshot.hotkeys.clone();
-    merged.appearance = snapshot.appearance.clone();
 
-    let mut screenshot = snapshot.screenshot.clone();
-    // 只有切图窗口拥有的 split 保留最新值，避免回滚切图期间的改动。
-    screenshot.split = latest.screenshot.split.clone();
+    // 从 latest 出发：共享字段未编辑时自然保留其它窗口的写入。本页独占的
+    // 显示类字段整份用快照覆盖；共享字段再用 keep_edited 逐字段判断。
+    let mut screenshot = latest.screenshot.clone();
+    let (s, b) = (&snapshot.screenshot, &baseline.screenshot);
+    screenshot.hidden_toolbar_items = s.hidden_toolbar_items.clone();
+    screenshot.save_dir = s.save_dir.clone();
+    screenshot.annotation = s.annotation.clone();
+    screenshot.watermark = s.watermark.clone();
+    screenshot.smart_selection = s.smart_selection;
+    screenshot.auto_scroll = s.auto_scroll.clone();
+    keep_edited(
+        &mut screenshot.collage.direction,
+        &s.collage.direction,
+        &b.collage.direction,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.collage.sizing,
+        &s.collage.sizing,
+        &b.collage.sizing,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.collage.border,
+        &s.collage.border,
+        &b.collage.border,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.collage.spacing,
+        &s.collage.spacing,
+        &b.collage.spacing,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.collage.background_rgba,
+        &s.collage.background_rgba,
+        &b.collage.background_rgba,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.collage.rows,
+        &s.collage.rows,
+        &b.collage.rows,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.collage.columns,
+        &s.collage.columns,
+        &b.collage.columns,
+        force,
+    );
+
+    keep_edited(
+        &mut screenshot.pdf.stitching_method,
+        &s.pdf.stitching_method,
+        &b.pdf.stitching_method,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.template_type,
+        &s.pdf.template_type,
+        &b.pdf.template_type,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.spacing_mm,
+        &s.pdf.spacing_mm,
+        &b.pdf.spacing_mm,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.paper_size,
+        &s.pdf.paper_size,
+        &b.pdf.paper_size,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.orientation,
+        &s.pdf.orientation,
+        &b.pdf.orientation,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.custom_width_mm,
+        &s.pdf.custom_width_mm,
+        &b.pdf.custom_width_mm,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.custom_height_mm,
+        &s.pdf.custom_height_mm,
+        &b.pdf.custom_height_mm,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.margin_top_mm,
+        &s.pdf.margin_top_mm,
+        &b.pdf.margin_top_mm,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.margin_bottom_mm,
+        &s.pdf.margin_bottom_mm,
+        &b.pdf.margin_bottom_mm,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.margin_left_mm,
+        &s.pdf.margin_left_mm,
+        &b.pdf.margin_left_mm,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.margin_right_mm,
+        &s.pdf.margin_right_mm,
+        &b.pdf.margin_right_mm,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.export_mode,
+        &s.pdf.export_mode,
+        &b.pdf.export_mode,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.pdf.image_quality,
+        &s.pdf.image_quality,
+        &b.pdf.image_quality,
+        force,
+    );
+
+    keep_edited(
+        &mut screenshot.export.format,
+        &s.export.format,
+        &b.export.format,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.export.quality,
+        &s.export.quality,
+        &b.export.quality,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.export.filename_template,
+        &s.export.filename_template,
+        &b.export.filename_template,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.export.auto_save,
+        &s.export.auto_save,
+        &b.export.auto_save,
+        force,
+    );
+    keep_edited(
+        &mut screenshot.export.auto_copy,
+        &s.export.auto_copy,
+        &b.export.auto_copy,
+        force,
+    );
+
+    if force {
+        // 全局重置才会动 split：此时必须落默认配置，平时保留切图窗口的最新值。
+        screenshot.split = s.split.clone();
+    }
     merged.screenshot = screenshot;
+    keep_edited(
+        &mut merged.appearance,
+        &snapshot.appearance,
+        &baseline.appearance,
+        force,
+    );
     merged
 }
 
@@ -5162,43 +5368,66 @@ mod tests {
         assert_eq!(&*snapshot.dir, "未找到");
     }
 
-    /// 设置页保存时：拼图 / PDF 是设置页自己的控件，要用快照值；切图由切图
-    /// 窗口单独拥有，要保留最新值，不能被快照回滚。
+    /// 设置页保存时，其它窗口在开窗期间写入的 collage / pdf / export /
+    /// appearance 必须保留；只有本页真正编辑过的字段才用快照值覆盖。
     #[test]
-    fn persist_merge_uses_snapshot_for_collage_pdf_and_latest_for_split() {
+    fn persist_merge_keeps_untouched_shared_fields_from_latest() {
         let mut latest = Settings::default();
-        latest.screenshot.collage.spacing = 33;
+        latest.screenshot.collage.spacing = 33; // 拼图窗口写入
+        latest.screenshot.collage.border = 7; // 拼图窗口写入
         latest.screenshot.pdf.paper_size = crate::config::PaperSize::Letter;
-        latest.screenshot.split.count = 9;
-        latest.screenshot.export.format = crate::config::ImageFormat::Webp;
+        latest.screenshot.pdf.image_quality = 77;
+        latest.screenshot.export.format = crate::config::ImageFormat::Webp; // 切图窗口写入
+        latest.screenshot.export.quality = 88; // 切图窗口写入
+        latest.screenshot.export.filename_template = "Shot_{date}".into();
+        latest.screenshot.split.count = 9; // 切图窗口写入
+        latest.appearance = "Tokyo Moon".into(); // 主题回写
 
-        let mut snapshot = Settings::default();
-        snapshot.translation.base_url = "https://snapshot/v1".into();
+        // 基线 = 开窗 / 上次落盘时的配置，这里用默认值模拟。
+        let baseline = Settings::default();
+        let mut snapshot = baseline.clone();
+        // 本页只改了 collage.spacing 与 pdf.paper_size。
         snapshot.screenshot.collage.spacing = 11;
         snapshot.screenshot.pdf.paper_size = crate::config::PaperSize::A5;
-        snapshot.screenshot.split.count = 2;
-        snapshot.screenshot.export.quality = 42;
+        // 本页独占字段不受合并影响，始终用快照。
+        snapshot.translation.base_url = "https://snapshot/v1".into();
         snapshot.screenshot.watermark.text = "机密".into();
         snapshot.hotkeys.region = "Ctrl+Shift+1".into();
 
-        let merged = settings_persist_merge(&latest, &snapshot);
-        // collage / pdf 在本页有控件：改过的值必须来自快照，能真正落盘。
+        let merged = settings_persist_merge(&latest, &snapshot, &baseline, false);
+        // 本页改过的字段：用快照值，控件才能真正落盘。
         assert_eq!(merged.screenshot.collage.spacing, 11);
         assert_eq!(
             merged.screenshot.pdf.paper_size,
             crate::config::PaperSize::A5
         );
-        // split 由切图窗口拥有：保留最新值，不被快照回滚。
-        assert_eq!(merged.screenshot.split.count, 9);
-        // 设置页拥有的顶层字段与 export 用快照值。
-        assert_eq!(merged.translation.base_url, "https://snapshot/v1");
+        // 未编辑的共享字段：保留 latest，不再回滚其它窗口的改动。
+        assert_eq!(merged.screenshot.collage.border, 7);
+        assert_eq!(merged.screenshot.pdf.image_quality, 77);
         assert_eq!(
             merged.screenshot.export.format,
-            crate::config::ImageFormat::Png
+            crate::config::ImageFormat::Webp
         );
-        assert_eq!(merged.screenshot.export.quality, 42);
+        assert_eq!(merged.screenshot.export.quality, 88);
+        assert_eq!(merged.screenshot.export.filename_template, "Shot_{date}");
+        assert_eq!(merged.screenshot.split.count, 9);
+        assert_eq!(merged.appearance, "Tokyo Moon");
+        // 本页独占字段仍用快照。
+        assert_eq!(merged.translation.base_url, "https://snapshot/v1");
         assert_eq!(merged.screenshot.watermark.text, "机密");
         assert_eq!(merged.hotkeys.region, "Ctrl+Shift+1");
+
+        // 重置：默认值可能恰好等于基线，也必须整份采用快照，否则重置不落盘。
+        let reset = settings_persist_merge(&latest, &baseline, &baseline, true);
+        assert_eq!(reset.screenshot.collage.spacing, 0);
+        assert_eq!(reset.screenshot.collage.border, 0);
+        assert_eq!(
+            reset.screenshot.export.format,
+            crate::config::ImageFormat::Png
+        );
+        assert_eq!(reset.screenshot.export.quality, 90);
+        assert_eq!(reset.appearance, crate::config::DEFAULT_APPEARANCE);
+        assert_eq!(reset.screenshot.split.count, 2);
     }
 
     #[test]

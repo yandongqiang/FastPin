@@ -192,7 +192,7 @@ UI 依赖 `gpui-kit = "=0.8.0"`，它把 `gpui-pre` 重导出为 `gpui`。仓库
 
 ```bash
 cargo build --release    # 产出 target/release/FastPin.exe
-cargo test -p fastpin    # 单元测试
+cargo test --workspace    # 单元测试（CI 用 --workspace，覆盖整个工作区）
 cargo fmt --all -- --check    # CI 同款格式检查
 cargo clippy --workspace --all-targets --locked -- -D warnings   # CI 同款检查
 ```

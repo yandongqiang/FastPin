@@ -501,8 +501,6 @@ struct ImageEntry {
     image: Arc<RenderImage>,
     /// Ledger reservation for the RenderImage copy; released when the entry
     /// (and with it the image) is removed or the window closes.
-    /// Held only for its Drop: releases the global reservation when the image
-    /// is removed or the window closes.
     #[allow(dead_code)]
     permit: Option<crate::image_budget::MemoryPermit>,
 }

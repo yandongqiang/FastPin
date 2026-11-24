@@ -1270,27 +1270,10 @@ fn tile_premult_layer(
 /// configured path is used verbatim.
 fn load_watermark_image(wm: &Watermark) -> Option<(Vec<u8>, u32, u32)> {
     let path = wm.image_path.as_ref()?;
-    let Ok(meta) = path.metadata() else {
-        return None;
-    };
-    if !meta.is_file() {
-        return None;
-    }
-    // A file bigger than the budget can never decode to an in-budget bitmap:
-    // refuse it before the decoder inflates it.
-    BUDGET.checked_len(meta.len()).ok()?;
-    // Peek at the header too, so a tiny but huge (zip-bomb) image is rejected
-    // before `to_rgba8` allocates the decoded buffer.
-    let (header_w, header_h) = image::image_dimensions(path).ok()?;
-    BUDGET.checked_dims(header_w as u64, header_h as u64).ok()?;
-
-    let img = image::open(path).ok()?.to_rgba8();
+    // 文件大小 / 头部尺寸 / 解码后尺寸的三重检查统一在
+    // `codec::decode_image_budgeted`，bad asset 仍只是让水印跳过。
+    let img = crate::codec::decode_image_budgeted(path)?;
     let (w, h) = img.dimensions();
-    if w == 0 || h == 0 {
-        return None;
-    }
-    // Final check on the decoded dimensions, then a budgeted fallible output.
-    BUDGET.checked_dims(w as u64, h as u64).ok()?;
     let src = img.into_raw();
     let mut out = BUDGET.alloc_rgba(w as u64, h as u64).ok()?;
     for i in 0..(w as usize * h as usize) {

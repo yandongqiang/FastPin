@@ -1128,27 +1128,7 @@ fn export_pixels(
     )
 }
 
-/// Same export, but the caller already holds the buffer behind an `Arc`.
-///
-/// The long-capture preview window keeps the stitched pixels alive for its own
-/// rendering, so it can hand the same allocation here instead of cloning what
-/// can be a 16384 px tall buffer on the UI thread. Long captures start from a
-/// region selection, so their records carry the `region` source tag.
-/// Kept as the non-reporting wrapper; callers that need a completion signal use
-/// `export_pixels_shared_reported`.
-#[allow(dead_code)]
-pub(crate) fn export_pixels_shared(
-    px: std::sync::Arc<Vec<u8>>,
-    cw: u32,
-    ch: u32,
-    stride: u32,
-    write_file: bool,
-    copy: bool,
-) -> Result<()> {
-    export_pixels_shared_with_source(px, cw, ch, stride, write_file, copy, "region", None)
-}
-
-/// 与 [`export_pixels_shared`] 相同的导出，但写盘线程结束后通过 `done` 把真实
+/// 与 [`export_pixels`] 相同的导出，但写盘线程结束后通过 `done` 把真实
 /// 结果回传给调用方（长截图预览用它把"保存中…"更新成"已保存"或显示失败）。
 /// 同步失败（路径预留 / 编码 / 剪贴板）也在返回前回传一次，保证调用方一定能
 /// 收到一个终态消息。
@@ -1179,7 +1159,7 @@ pub(crate) fn export_pixels_shared_reported(
     outcome
 }
 
-/// Same as [`export_pixels_shared`] with an explicit capture-origin tag for the
+/// Same as [`export_pixels`] with an explicit capture-origin tag for the
 /// per-source history filter. `&'static str` because every caller passes a
 /// literal, which also keeps the tag safe to move into the export threads.
 #[allow(clippy::too_many_arguments)]

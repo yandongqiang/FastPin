@@ -103,16 +103,11 @@ pub fn encode_png_bgra(pixels: &[u8], width: u32, height: u32, stride: u32) -> R
     encode_bgra(ImageFormat::Png, 90, pixels, width, height, stride)
 }
 
-/// Decode an image file into a tight BGRA buffer suitable for the clipboard DIB.
-///
-/// Image files are decoded as RGBA, so the R and B channels are swapped to reach
-/// FastPin's internal BGRA convention. Returns `(bgra, width, height)`, or
-/// `None` when the file cannot be decoded or has zero dimensions. Shared by the
-/// history gallery, the settings grid, the collage and the image-split tools so
-/// the channel order stays identical everywhere.
-pub fn decode_bgra(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
-    // 与水印解码同一套三重检查：文件大小 → 头部声明的尺寸 → 解码后的实际
-    // 尺寸。否则一张小文件的「图片炸弹」能让 `to_rgba8` 在预算外分配。
+/// 按统一预算把图片解码成 RGBA：文件大小 → 头部声明尺寸 → 解码后的真实尺寸
+/// 三重检查都在这一处完成，输出缓冲也走 `BUDGET` 的可失败分配。历史缩略图、
+/// 水印和剪贴板解码原先各自抄了一份同样的检查，现在共用这一份；任一关失败
+/// 都返回 `None`，由调用方按原路径降级。
+pub fn decode_image_budgeted(path: &Path) -> Option<image::RgbaImage> {
     let meta = path.metadata().ok()?;
     if !meta.is_file() {
         return None;
@@ -127,6 +122,22 @@ pub fn decode_bgra(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
         return None;
     }
     BUDGET.checked_dims(w as u64, h as u64).ok()?;
+    let mut rgba = BUDGET.alloc_rgba(w as u64, h as u64).ok()?;
+    rgba.copy_from_slice(decoded.as_raw());
+    image::RgbaImage::from_raw(w, h, rgba)
+}
+
+/// Decode an image file into a tight BGRA buffer suitable for the clipboard DIB.
+///
+/// Image files are decoded as RGBA, so the R and B channels are swapped to reach
+/// FastPin's internal BGRA convention. Returns `(bgra, width, height)`, or
+/// `None` when the file cannot be decoded or has zero dimensions. Shared by the
+/// history gallery, the settings grid, the collage and the image-split tools so
+/// the channel order stays identical everywhere.
+pub fn decode_bgra(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+    // 三重检查在 `decode_image_budgeted` 里统一做；这里只负责 RGBA → BGRA。
+    let decoded = decode_image_budgeted(path)?;
+    let (w, h) = decoded.dimensions();
     let src = decoded.into_raw();
     // 第二次拷贝（RGBA → BGRA）同样走预算，不能用 infallible `vec!`。
     let mut bgra = BUDGET.alloc_rgba(w as u64, h as u64).ok()?;

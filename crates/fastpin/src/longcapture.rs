@@ -1047,12 +1047,15 @@ pub fn slide_stitch_rows(
     })
 }
 
+/// 两处变化检测共用的亮度差阈值（超过它才算变化）。
+const CHANGE_DELTA: u8 = 24;
+/// 两处变化检测共用的采样步长（每隔 4 个像素取一个）。
+const STEP: usize = 4;
+
 /// Sampled fraction of pixels that changed by more than `CHANGE_DELTA` levels.
 /// Used only to tell "the page moved but too fast to align" from "nothing
 /// happened"; sampling every 4th pixel keeps it cheap on the reject path.
 pub fn frame_change_ratio(previous: &[u8], current: &[u8]) -> f64 {
-    const CHANGE_DELTA: u8 = 24;
-    const STEP: usize = 4;
     if previous.len() != current.len() || previous.is_empty() {
         return 0.0;
     }
@@ -1109,8 +1112,6 @@ const MIN_UNIFORM_BANDS: usize = 4;
 /// [`frame_change_ratio`]. Inconclusive inputs (empty, mismatched sizes) are
 /// reported as *not* local, so a possible real scroll is never hidden.
 pub fn change_is_local(previous: &[u8], current: &[u8], width: usize, height: usize) -> bool {
-    const CHANGE_DELTA: u8 = 24;
-    const SAMPLE_STEP: usize = 4;
     if width == 0
         || height == 0
         || previous.len() != current.len()
@@ -1127,7 +1128,7 @@ pub fn change_is_local(previous: &[u8], current: &[u8], width: usize, height: us
         let mut total = 0u64;
         for y in y0..y1 {
             let row = y * width;
-            for x in (0..width).step_by(SAMPLE_STEP) {
+            for x in (0..width).step_by(STEP) {
                 total += 1;
                 if previous[row + x].abs_diff(current[row + x]) > CHANGE_DELTA {
                     changed += 1;

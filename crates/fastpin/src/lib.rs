@@ -3,6 +3,8 @@
 // keep resolving. This is a crate alias, not a glob import.
 extern crate gpui_kit as gpui;
 
+// Modules are public for the CLI entry point, examples and tests; the root
+// re-exports below are the intended external surface.
 pub mod app;
 pub mod black;
 pub mod brand_icon;
@@ -53,8 +55,8 @@ pub use app::{once_capture, run};
 pub use error::{Error, Result};
 
 /// Product name shown to users (window titles, brand, about page, installer).
-/// Paths and storage identifiers use the same name; `migrate` moves the data a
-/// pre-rebrand build left behind on first start. Every internal identifier —
+/// 历史路径使用固定的 `FastPin` 目录名，而不是从本常量拼出来；`migrate` moves
+/// the data a pre-rebrand build left behind on first start. Every internal identifier —
 /// crate name, window classes, `WM_FASTPIN_*` messages, the settings text-input
 /// element id and the GitHub repository — now uses the FastPin name too.
 pub const APP_NAME: &str = "FastPin";

@@ -18,7 +18,7 @@
 //! opening the window copies the stitched buffer once. Everything after that
 //! shares one `Arc`: the export actions hand that same allocation to the
 //! worker thread instead of copying a buffer that can be hundreds of
-//! megabytes (see `app::export_pixels_shared`).
+//! megabytes (see `app::export_pixels_shared_reported`).
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};

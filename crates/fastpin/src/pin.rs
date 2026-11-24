@@ -789,7 +789,9 @@ pub struct PinView {
     /// Tight BGRA at native size, kept for compositing a group.
     pixels: Arc<Vec<u8>>,
     /// Process-wide ledger reservation for the two buffers held by this pin.
-    permit: crate::image_budget::MemoryPermit,
+    /// `Option` so `replace_pixels` can hand the old permit back to the ledger
+    /// before reserving the new one, without losing it if the reserve fails.
+    permit: Option<crate::image_budget::MemoryPermit>,
     /// Physical pixel size of the flattened crop.
     pixel_size: (u32, u32),
     zoom: f32,
@@ -824,7 +826,7 @@ impl PinView {
             id,
             image,
             pixels,
-            permit,
+            permit: Some(permit),
             pixel_size: (w.max(1), h.max(1)),
             zoom: 1.0,
             layout_rect: None,
@@ -878,14 +880,20 @@ impl PinView {
             return;
         };
         let held = (pixels.len() as u64).saturating_mul(2);
+        // 先把旧许可归还账本再预留新额度，避免两份预留同时生效时的瞬时双倍计费。
+        // 旧额度按旧像素缓冲的大小记下：新额度若失败，尽力把它补回来，失败的
+        // 编辑仍保持原有像素与渲染图不变。
+        let old_bytes = (self.pixels.len() as u64).saturating_mul(2);
+        drop(self.permit.take());
         let permit = match crate::image_budget::try_reserve(held) {
             Ok(permit) => permit,
             Err(e) => {
                 crate::perf::log_app(&format!("pin edit refused: {e}"));
+                self.permit = crate::image_budget::try_reserve(old_bytes).ok();
                 return;
             }
         };
-        self.permit = permit; // releases the old reservation
+        self.permit = Some(permit);
         self.pixels = pixels;
         self.image = image;
         self.pixel_size = (w.max(1), h.max(1));

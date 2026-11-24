@@ -13,7 +13,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -231,24 +231,17 @@ fn forget(id: u64) {
 /// images (not the BGRA screenshot buffers), so — like `settings::brand_logo` —
 /// the R and B channels are swapped for GPUI's B8G8R8A8 atlas.
 #[allow(clippy::chunks_exact_to_as_chunks)]
-pub(crate) fn load_thumb(path: &PathBuf) -> Option<Arc<RenderImage>> {
-    // 与水印 / 剪贴板解码一致的三重检查：先拒绝超大文件，再用头部尺寸挡住
-    // 「小文件声明巨大画布」的图片炸弹，最后复核解码后的真实尺寸。
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    BUDGET.checked_len(meta.len()).ok()?;
-    let (header_w, header_h) = image::image_dimensions(path).ok()?;
-    BUDGET.checked_dims(header_w as u64, header_h as u64).ok()?;
-
-    let decoded = image::open(path).ok()?.thumbnail(THUMB_SIZE, THUMB_SIZE);
-    let (w, h) = decoded.dimensions();
+pub(crate) fn load_thumb(path: &Path) -> Option<Arc<RenderImage>> {
+    // 三重检查（文件大小 / 头部尺寸 / 解码后尺寸）统一由
+    // `codec::decode_image_budgeted` 完成，和水印、剪贴板解码共用一套规则。
+    let decoded = crate::codec::decode_image_budgeted(path)?;
+    let thumb = image::DynamicImage::ImageRgba8(decoded).thumbnail(THUMB_SIZE, THUMB_SIZE);
+    let (w, h) = thumb.dimensions();
     if w == 0 || h == 0 {
         return None;
     }
     BUDGET.checked_dims(w as u64, h as u64).ok()?;
-    let src = decoded.to_rgba8();
+    let src = thumb.to_rgba8();
     // 输出缓冲也走统一预算，缩略图路径不再使用无界 `into_raw()`。
     let mut rgba = BUDGET.alloc_rgba(w as u64, h as u64).ok()?;
     rgba.copy_from_slice(src.as_raw());

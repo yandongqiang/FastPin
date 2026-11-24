@@ -47,6 +47,11 @@ pub fn start_recording() {
     // leave two recorders swallowing the same keys.
     unhook_recorder();
     uninstall_ll_hook();
+    // 兜底模式下 RegisterHotKey 的 id 1..3 还会把同一个组合投递成 WM_HOTKEY。
+    // 只卸 LL hook 不够：录制时 record_proc 记录组合的同时，hidden_proc 会立刻
+    // 执行截图 / 写剪贴板。录制期间必须把整条动作通路断开，id 9（紧急退出）
+    // 不在这里，仍然保持可用；stop_recording() 负责对称恢复。
+    unregister_fallback_bindings(hook_target());
     unsafe {
         match SetWindowsHookExW(WH_KEYBOARD_LL, Some(record_proc), None, 0) {
             Ok(h) => {

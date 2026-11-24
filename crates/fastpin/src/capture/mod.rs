@@ -39,7 +39,6 @@ pub struct CapturedDesktop {
     pub sdr_white_nits: f32,
     pub hdr: bool,
     pub used_dxgi_dup: bool,
-    pub exclusive: bool,
 }
 
 enum WgcOutcome {
@@ -203,7 +202,6 @@ pub fn capture_for_action(
     let mut used_dxgi = false;
     // 每块 piece 带上自己显示器的 SDR 白点，合成时各自 white-lift。
     let mut pieces: Vec<(i32, i32, ID3D11Texture2D, bool, f32)> = Vec::new();
-    let mut saw_exclusive = false;
 
     for (slot, &idx) in target_indices.iter().enumerate() {
         let mon = &monitors[idx];
@@ -248,9 +246,6 @@ pub fn capture_for_action(
                 ));
             }
         }
-
-        // 独占状态按本屏汇总：预判（含整机 QUNS + 本屏前台覆盖）或本屏 WGC 近黑。
-        saw_exclusive |= is_exclusive_fullscreen(*hints);
 
         if let Some((tex, hdr)) = got {
             pieces.push((mon.x, mon.y, tex, hdr, mon.sdr_white_nits));
@@ -317,7 +312,6 @@ pub fn capture_for_action(
         sdr_white_nits: sdr_white,
         hdr: any_hdr,
         used_dxgi_dup: used_dxgi,
-        exclusive: saw_exclusive,
     })
 }
 

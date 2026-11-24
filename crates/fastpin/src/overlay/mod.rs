@@ -737,6 +737,13 @@ const HOVER_PREVIEW_WIDTH: u32 = 640;
 /// drops the preview and the capture resumes.
 const HOVER_PREVIEW_WAIT: Duration = Duration::from_millis(400);
 
+/// 延迟清 passthrough 洞的守卫。设备复位后清洞被推迟到下一个任务，期间用户
+/// 可能已经开启新的长截图会话并设置了新的洞；只有会话序号没前进、且当前没有
+/// 新会话占用洞时才允许清，否则会把新会话刚挖的洞一起抹掉。
+fn should_clear_long_passthrough(captured_seq: u64, current_seq: u64, new_session: bool) -> bool {
+    captured_seq == current_seq && !new_session
+}
+
 /// Click-through for the selection while a long capture runs: the wheel must
 /// reach the app underneath, not the overlay. HTTRANSPARENT from a WM_NCHITTEST
 /// subclass does not do this -- it only walks windows of the same thread -- and
@@ -3052,6 +3059,9 @@ impl OverlayView {
         if self.long.take().is_none() {
             return;
         }
+        // 捕获被中止会话的序号：下面的清洞任务被推迟执行，届时新会话可能
+        // 已经调用 set_long_passthrough(Some(rect))。用序号把旧任务挡掉。
+        let seq = self.long_seq;
         self.phase = Phase::Active;
         self.show_panel(
             "显示设备已重置",
@@ -3064,7 +3074,10 @@ impl OverlayView {
         cx.spawn(async move |_this, cx| {
             cx.update(|cx| {
                 if let Some(handle) = OVERLAY_WINDOW.with(|s| *s.borrow()) {
-                    let _ = handle.update(cx, |_view, window, _cx| {
+                    let _ = handle.update(cx, |view, window, _cx| {
+                        if !should_clear_long_passthrough(seq, view.long_seq, view.long.is_some()) {
+                            return;
+                        }
                         set_long_passthrough(crate::platform::hwnd_of(window), None);
                     });
                 }
@@ -5062,6 +5075,16 @@ mod tests {
         };
         let cut = hole_clear_of_bar(tiny, 90, 134);
         assert!(cut.top <= cut.bottom, "{cut:?}");
+    }
+
+    /// 设备复位后的延迟清洞任务不能误清新会话刚设置的 passthrough 洞：
+    /// 序号前进或已有新会话时都必须跳过。
+    #[test]
+    fn delayed_passthrough_clear_skips_a_new_long_session() {
+        assert!(should_clear_long_passthrough(7, 7, false));
+        assert!(!should_clear_long_passthrough(7, 8, false));
+        assert!(!should_clear_long_passthrough(7, 7, true));
+        assert!(!should_clear_long_passthrough(7, 8, true));
     }
 
     /// A stall, a pause or a static edge is a state the bar reflects; the poll

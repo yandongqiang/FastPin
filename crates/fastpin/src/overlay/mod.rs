@@ -72,6 +72,16 @@ fn complete_export_flags() -> (bool, bool) {
     (export.auto_save, export.auto_copy)
 }
 
+/// 仅复制（Ctrl+Alt+W 快速截图）无论「输出」页的两个开关如何，都只写剪贴板：
+/// 关掉 auto_copy 后不能让热键什么都不做，开启 auto_save 后也不能偷偷写文件。
+fn export_flags_for(copy_only: bool) -> (bool, bool) {
+    if copy_only {
+        (false, true)
+    } else {
+        complete_export_flags()
+    }
+}
+
 /// C# RegionCaptureWindow: dash {5,5}, offset = elapsed * -15.
 pub const ANTS_DASH: [f32; 2] = [5.0, 5.0];
 pub const ANTS_SPEED: f32 = -15.0;
@@ -1853,7 +1863,7 @@ impl OverlayView {
         if w < 2 || h < 2 {
             return None;
         }
-        let (write_file, copy) = complete_export_flags();
+        let (write_file, copy) = export_flags_for(self.copy_only);
         Some(OverlayResult {
             confirmed: true,
             write_file,
@@ -1957,7 +1967,7 @@ impl OverlayView {
         self.finish(result, window, cx);
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) {
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut result) = self.result_from_current() else {
             return;
         };
@@ -1967,6 +1977,9 @@ impl OverlayView {
         if let Some(cap) = self.cap.as_ref() {
             crate::app::export_annotated_region(cx, cap, &result, source);
         }
+        // 「保存」即结束本次截图：不 finish 的话覆盖层保持可见、BUSY 不清，
+        // 用户随后点「完成」会再导出一次同一张图，写两份文件。
+        self.finish(empty_result(), window, cx);
     }
 
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2093,7 +2106,7 @@ impl OverlayView {
             toolbar::TRANSLATE => self.run_translate(cx),
             toolbar::PIN => self.pin(window, cx),
             toolbar::LONG_CAPTURE => self.start_long_capture(window, cx),
-            toolbar::SAVE => self.save(cx),
+            toolbar::SAVE => self.save(window, cx),
             toolbar::COMPLETE => self.confirm(window, cx),
             toolbar::CANCEL => self.cancel(window, cx),
             _ => {}
@@ -5170,6 +5183,19 @@ mod tests {
         let default = crate::config::Export::default();
         assert!(!default.auto_save);
         assert!(default.auto_copy);
+    }
+
+    #[test]
+    fn copy_only_always_copies_and_never_writes_a_file() {
+        // 快捷截图（Ctrl+Alt+W）的结果不能被「输出」页开关改写：关掉 auto_copy
+        // 后热键必须仍然复制到剪贴板，开启 auto_save 后也不能写文件。
+        assert_eq!(export_flags_for(true), (false, true));
+        // 普通截图仍完全遵循配置。
+        let export = crate::config::get().screenshot.export;
+        assert_eq!(
+            export_flags_for(false),
+            (export.auto_save, export.auto_copy)
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@ mod wgc;
 pub use d3d::{drop_gpu_resources, texture_desc, Gpu, GpuShaders, RestoreGpu};
 pub use monitors::{
     dxgi_allowed, enumerate_monitors, foreground_covers_monitor, monitor_from_foreground,
-    query_monitor_exclusive, virtual_desktop, MonitorInfo, VirtualDesktop,
+    query_d3d_fullscreen_notification, query_monitor_exclusive, virtual_desktop, MonitorInfo,
+    VirtualDesktop,
 };
 pub use wgc::{start_live, WgcLive};
 
@@ -53,9 +54,9 @@ pub struct PreparedCapture {
     monitors: Vec<MonitorInfo>,
     target_indices: Vec<usize>,
     capture_all: bool,
-    exclusive_guess: bool,
-    covers: bool,
-    dxgi_exclusive: bool,
+    /// 每个 target 一份独占预判（per-monitor），capture 阶段再用本屏的 WGC 近黑
+    /// 信号补充。不能用一个全局 guess 决定所有屏是否跳过 WGC。
+    exclusive_hints: Vec<ExclusiveHints>,
     any_hdr: bool,
     sdr_white: f32,
     overlay_luid: (u32, i32),
@@ -82,18 +83,13 @@ pub fn prepare_capture(
     }
     let fg_idx = monitor_from_foreground(&monitors);
     let focus_idx = fg_idx.unwrap_or(0);
-    let focus = &monitors[focus_idx];
 
-    let covers = foreground_covers_monitor(focus);
-    let dxgi_exclusive = query_monitor_exclusive(focus);
-    let exclusive_hint = ExclusiveHints {
-        foreground_covers_monitor: covers,
-        dxgi_output_exclusive: dxgi_exclusive,
-        wgc_frame_near_black: false,
-    };
-    let exclusive_guess = is_exclusive_fullscreen(exclusive_hint);
+    // QUNS 是整机标志：任意屏的全屏游戏都会置位，不能据此跳过所有屏的 WGC。
+    // 这里只记录一次，是否算本屏独占由每 target 的 ExclusiveHints 决定。
+    let d3d_fs = query_d3d_fullscreen_notification();
 
-    let capture_all = region && !exclusive_guess;
+    // 独占现在逐 target 处理，不能因为一块屏独占就把整个虚拟桌面降级成单屏捕获。
+    let capture_all = region;
     // A region hint that lands fully inside one monitor only needs that monitor:
     // long-capture polls this every 450 ms, and capturing the whole virtual
     // desktop each tick just to crop it back down is wasted WGC/composite work.
@@ -112,20 +108,42 @@ pub fn prepare_capture(
         vec![focus_idx]
     };
 
+    // 每个 target 独立探测：本屏 DXGI 输出脱离桌面是直接证据；整机 QUNS 只有
+    // 在本屏被前台窗口覆盖时才参与判断。
+    let exclusive_hints: Vec<ExclusiveHints> = target_indices
+        .iter()
+        .map(|&i| {
+            let mon = &monitors[i];
+            ExclusiveHints {
+                dxgi_output_detached: query_monitor_exclusive(mon),
+                d3d_fullscreen_notification: d3d_fs,
+                foreground_covers_monitor: foreground_covers_monitor(mon),
+                wgc_frame_near_black: false,
+            }
+        })
+        .collect();
+
     let any_hdr = target_indices.iter().any(|&i| monitors[i].hdr);
+    // 多 HDR 屏的 SDR 白点可能不同。每个 SDR piece 的 white-lift 会按自己那块屏
+    // 的 sdr_white_nits 做；最终 tonemap 作用于整张合成图，只能取一个值，这里取
+    // 所有目标 HDR 屏的最大值以保留亮部、避免整体偏暗（取舍说明见 capture_for_action）。
     let sdr_white = target_indices
         .iter()
         .map(|&i| &monitors[i])
-        .find(|m| m.hdr)
+        .filter(|m| m.hdr)
         .map(|m| m.sdr_white_nits)
-        .unwrap_or(REFERENCE_WHITE_NITS);
+        .fold(REFERENCE_WHITE_NITS, f32::max);
 
     let want_hdr = any_hdr;
     let mut wgc: Vec<WgcOutcome> = Vec::with_capacity(target_indices.len());
     let mut joins = Vec::new();
 
     for (slot, &idx) in target_indices.iter().enumerate() {
-        if exclusive_guess {
+        if is_exclusive_fullscreen(exclusive_hints[slot])
+            && dxgi_allowed(&monitors[idx], overlay_luid)
+        {
+            // 只跳过这一块屏的 WGC，改走 DXGI 独占捕获；其它屏照常 WGC。
+            // DXGI 被 LUID 挡住时仍让 WGC 试一次，免得直接留下黑块。
             wgc.push(WgcOutcome::Missing);
             continue;
         }
@@ -151,9 +169,7 @@ pub fn prepare_capture(
         monitors,
         target_indices,
         capture_all,
-        exclusive_guess,
-        covers,
-        dxgi_exclusive,
+        exclusive_hints,
         any_hdr,
         sdr_white,
         overlay_luid,
@@ -175,9 +191,7 @@ pub fn capture_for_action(
         monitors,
         target_indices,
         capture_all,
-        exclusive_guess,
-        covers,
-        dxgi_exclusive,
+        mut exclusive_hints,
         any_hdr,
         sdr_white,
         overlay_luid,
@@ -187,19 +201,22 @@ pub fn capture_for_action(
     let want_hdr = any_hdr;
 
     let mut used_dxgi = false;
-    let mut pieces: Vec<(i32, i32, ID3D11Texture2D, bool)> = Vec::new();
-    let mut saw_exclusive = exclusive_guess;
+    // 每块 piece 带上自己显示器的 SDR 白点，合成时各自 white-lift。
+    let mut pieces: Vec<(i32, i32, ID3D11Texture2D, bool, f32)> = Vec::new();
+    let mut saw_exclusive = false;
 
     for (slot, &idx) in target_indices.iter().enumerate() {
         let mon = &monitors[idx];
+        let hints = &mut exclusive_hints[slot];
         let mut got: Option<(ID3D11Texture2D, bool)> = None;
-        let mut wgc_black = false;
 
         if let WgcOutcome::Ready(ready) = std::mem::replace(&mut wgc[slot], WgcOutcome::Missing) {
             if let Ok(frame) = ready.into_owned(&gpu, ctx) {
-                // A near-black frame means WGC missed an exclusive-fullscreen app.
-                wgc_black = gpu.texture_is_near_black(ctx, &frame.texture);
-                if !wgc_black {
+                // A near-black frame means WGC missed an exclusive-fullscreen app
+                // on **this** monitor; the global QUNS flag alone must not decide.
+                if gpu.texture_is_near_black(ctx, &frame.texture) {
+                    hints.wgc_frame_near_black = true;
+                } else {
                     got = Some((frame.texture, frame.hdr));
                 }
             }
@@ -217,11 +234,6 @@ pub fn capture_for_action(
                 match dxgi_dup::capture_monitor(&gpu, ctx, mon, want_hdr, overlay_luid) {
                     Ok((tex, hdr)) => {
                         used_dxgi = true;
-                        saw_exclusive = is_exclusive_fullscreen(ExclusiveHints {
-                            foreground_covers_monitor: covers,
-                            dxgi_output_exclusive: dxgi_exclusive,
-                            wgc_frame_near_black: wgc_black,
-                        });
                         got = Some((tex, hdr));
                     }
                     Err(e) => {
@@ -237,8 +249,11 @@ pub fn capture_for_action(
             }
         }
 
+        // 独占状态按本屏汇总：预判（含整机 QUNS + 本屏前台覆盖）或本屏 WGC 近黑。
+        saw_exclusive |= is_exclusive_fullscreen(*hints);
+
         if let Some((tex, hdr)) = got {
-            pieces.push((mon.x, mon.y, tex, hdr));
+            pieces.push((mon.x, mon.y, tex, hdr, mon.sdr_white_nits));
         }
     }
     perf.mark("T3");
@@ -270,11 +285,13 @@ pub fn capture_for_action(
         0,
     )?;
 
-    for (mx, my, tex, piece_hdr) in &pieces {
+    for (mx, my, tex, piece_hdr, piece_white) in &pieces {
         let dst_x = (*mx - origin_x).max(0) as u32;
         let dst_y = (*my - origin_y).max(0) as u32;
         if any_hdr && !*piece_hdr {
-            gpu.white_lift_into(ctx, tex, &composite, dst_x, dst_y, sdr_white)?;
+            // 每块 SDR piece 用自己那块屏的白点做 white-lift。以前所有 piece 共用
+            // 第一块 HDR 屏的 sdr_white_nits，多 HDR 屏白点不同时颜色会错。
+            gpu.white_lift_into(ctx, tex, &composite, dst_x, dst_y, *piece_white)?;
         } else {
             unsafe {
                 ctx.CopySubresourceRegion(&composite, 0, dst_x, dst_y, 0, tex, 0, None);
@@ -283,6 +300,8 @@ pub fn capture_for_action(
     }
     perf.mark("T4");
 
+    // 最终 tonemap 作用于整张合成图，只能用一个白点；与 prepare_capture 中的
+    // sdr_white 计算保持一致（目标 HDR 屏白点的最大值）。
     let sdr_display = gpu.to_sdr_bgra(ctx, &composite, sdr_white)?;
     perf.mark("T5");
 

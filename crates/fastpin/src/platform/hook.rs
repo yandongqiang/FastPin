@@ -54,7 +54,14 @@ pub fn start_recording() {
             }
             Err(e) => {
                 eprintln!("hotkey recording unavailable: {e}");
-                let _ = install_ll_hook();
+                // 录制钩子装不上就必须把动作通路恢复：先装回 LL，LL 也失败时
+                // 用当前 target/bindings 注册 RegisterHotKey 兜底，否则设置页
+                // 里按什么都没有反应。
+                if install_ll_hook().is_ok() {
+                    unregister_fallback_bindings(hook_target());
+                } else {
+                    register_fallback_for_target();
+                }
             }
         }
     }
@@ -67,7 +74,27 @@ pub fn stop_recording() {
     if !unhook_recorder() {
         return;
     }
-    let _ = install_ll_hook();
+    if install_ll_hook().is_ok() {
+        // LL 恢复后清掉可能残留的 1..3 兜底注册，避免同一次按键既产生
+        // WM_FASTPIN_HOTKEY 又产生 WM_HOTKEY（双截图/双剪贴板写入）。
+        // 紧急退出 id 不在这里，托盘不可用模式仍然保留它。
+        unregister_fallback_bindings(hook_target());
+    } else {
+        // 以前这里静默忽略失败：取消/超时路径不会走 apply_bindings，LL 与
+        // fallback 会同时缺席，热键从此全部失效。立即注册兜底保底。
+        register_fallback_for_target();
+    }
+}
+
+/// 用当前 target/bindings 注册 RegisterHotKey 兜底。BINDINGS 由
+/// `set_hook_target` 在启动时写入，settings 的 apply_bindings 也会更新。
+fn register_fallback_for_target() {
+    let hwnd = hook_target();
+    let bindings = BINDINGS.lock().ok().and_then(|g| *g);
+    match bindings {
+        Some(bindings) => register_fallback_hotkeys(hwnd, &bindings),
+        None => eprintln!("hotkey fallback unavailable: no target/bindings set"),
+    }
 }
 
 /// Returns whether a recorder was actually taken down.
@@ -282,11 +309,18 @@ pub fn register_emergency_quit(hwnd: HWND) {
     ));
 }
 
-pub fn unregister_fallback_hotkeys(hwnd: HWND) {
+/// 只注销 1..3 的绑定兜底热键，保留托盘不可用模式注册的紧急退出热键。
+fn unregister_fallback_bindings(hwnd: HWND) {
     unsafe {
         let _ = UnregisterHotKey(Some(hwnd), 1);
         let _ = UnregisterHotKey(Some(hwnd), 2);
         let _ = UnregisterHotKey(Some(hwnd), 3);
+    }
+}
+
+pub fn unregister_fallback_hotkeys(hwnd: HWND) {
+    unregister_fallback_bindings(hwnd);
+    unsafe {
         let _ = UnregisterHotKey(Some(hwnd), EMERGENCY_QUIT_ID);
     }
 }

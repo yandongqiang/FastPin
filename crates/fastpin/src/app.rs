@@ -661,7 +661,19 @@ fn run_tray() -> Result<()> {
     let _instance = match SingleInstance::acquire() {
         Ok(i) => i,
         Err(_) => {
-            eprintln!("FastPin is already running");
+            // 第二实例以前静默退出，用户以为程序没启动成功。给一个可见提示，
+            // 不引入 IPC：告诉用户热键已可用、设置从已有实例的托盘打开。
+            crate::perf::log_app("second instance exited: FastPin is already running");
+            let text = wide("FastPin 已在运行，热键可直接截图；设置请从托盘打开。\0");
+            let title = wide("FastPin\0");
+            unsafe {
+                let _ = MessageBoxW(
+                    None,
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+                );
+            }
             return Ok(());
         }
     };
@@ -986,7 +998,13 @@ fn take_shot(action: HotkeyAction) -> Result<ShotFlow> {
             let (x, y, w, h) = (0, 0, cap.width, cap.height);
             let (px, cw, ch, stride) = with_gpui_app(|cx| crop_from_app(cx, &cap, x, y, w, h))
                 .unwrap_or_else(|| Err(Error::new("GPUI app unavailable")))?;
-            export_pixels(px, cw, ch, stride, true, true, "fullscreen")?;
+            // 全屏截图同样遵循「输出」页的 auto_save / auto_copy 开关。
+            // 全屏没有选区、也不会进入覆盖层，所以必须保证至少一种输出：
+            // 两个开关都关掉时退回复制到剪贴板，避免按下 PrtSc 毫无反应。
+            let export = crate::config::get().screenshot.export;
+            let write_file = export.auto_save;
+            let copy = export.auto_copy || !write_file;
+            export_pixels(px, cw, ch, stride, write_file, copy, "fullscreen")?;
             let _ = perf.write_log();
             Ok(ShotFlow::Finished)
         }

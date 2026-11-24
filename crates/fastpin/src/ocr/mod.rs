@@ -160,6 +160,16 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Engine>> {
     ENGINE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 丢弃已缓存的引擎并唤醒空闲线程，使下一次 `recognize` 按当前的模型目录重建。
+/// 模型目录被修改 / 清空、或设置被重置后必须调用：否则已加载的 `ENGINE` 最长
+/// 60 秒内仍会用旧模型识别，用户换了目录却看不到变化。
+pub fn invalidate_engine() {
+    *lock() = None;
+    // 让正在 wait_timeout 的空闲线程立刻醒来（它看到 None 会重新等待），
+    // 避免旧的等待状态与新引擎相互干扰。
+    IDLE.notify_all();
+}
+
 fn build() -> Result<OAROCR> {
     let dir = models_dir()?;
     for file in [DET_MODEL, REC_MODEL, DICT] {

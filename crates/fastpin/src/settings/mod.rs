@@ -120,10 +120,15 @@ pub fn open(cx: &mut App) {
             handle
                 .update(cx, |view, window, cx| {
                     view.load_history_on_open(cx);
+                    // 关窗即通知安装包下载任务收尾：轮询任务立刻退出，worker
+                    // 在每次进度回调里跳过上报。闭包持有与 view 同一个 Arc，
+                    // 覆盖窗口打开之后才启动的下载。
+                    let download_cancel = view.update_download_cancel.clone();
                     // 点过热键输入框后直接关窗也要立刻收钩子：否则录制钩子会
                     // 继续吞掉可绑定的按键，直到 10 秒超时才被撤下。递增代号让
                     // 旧超时任务发现失效，不再碰新窗口的录制状态。
-                    window.on_window_should_close(cx, |_, cx| {
+                    window.on_window_should_close(cx, move |_, cx| {
+                        download_cancel.store(true, Ordering::Release);
                         crate::platform::stop_recording();
                         RECORDING_SEQ.fetch_add(1, Ordering::SeqCst);
                         cx.refresh_windows();
@@ -548,6 +553,9 @@ pub struct SettingsView {
     history_thumb_mtime: HashMap<String, u64>,
     history_thumb_seq: u64,
     history_status: SharedString,
+    /// index.json 读取失败的原因。非空时历史图片可能仍在磁盘上，页面不能
+    /// 显示成空历史；状态栏和空态提示都会据此给出可见的损坏说明。
+    history_index_error: Option<String>,
     /// Incremented on every history status change so an older auto-fade timer
     /// cannot clear a newer message.
     history_status_seq: u64,
@@ -576,6 +584,9 @@ pub struct SettingsView {
     update_available: Option<(String, String)>,
     /// In-app installer download state, polled from a worker's progress channel.
     update_downloading: bool,
+    /// 关窗时置位的取消标志，与下载 worker、轮询任务共享同一个 Arc：窗口
+    /// 销毁后 UI 收不到进度，后台不该继续为已经消失的窗口干活。
+    update_download_cancel: Arc<AtomicBool>,
     update_progress: Option<crate::update::DownloadProgress>,
     downloaded_installer: Option<PathBuf>,
     _subscriptions: Vec<Subscription>,
@@ -1003,6 +1014,7 @@ impl SettingsView {
             history_thumb_mtime: HashMap::new(),
             history_thumb_seq: 0,
             history_status: SharedString::default(),
+            history_index_error: None,
             history_status_seq: 0,
             history_selected: None,
             history_confirm_delete: false,
@@ -1019,6 +1031,7 @@ impl SettingsView {
             update_checking: false,
             update_available: None,
             update_downloading: false,
+            update_download_cancel: Arc::new(AtomicBool::new(false)),
             update_progress: None,
             downloaded_installer: None,
             _subscriptions: subscriptions,
@@ -1230,7 +1243,8 @@ impl SettingsView {
             }
             self.persist(cx);
             if self.page == Page::Resources {
-                // 模型目录被重置，缓存的引擎状态快照必须同步刷新。
+                // 模型目录被重置，缓存的引擎快照与已加载引擎都必须同步失效。
+                crate::ocr::invalidate_engine();
                 self.refresh_engine_status(true, cx);
             }
             self.ok(format!("已重置「{}」", self.page.title()));
@@ -1252,7 +1266,8 @@ impl SettingsView {
         self.reapply_hotkeys();
         self.confirm_reset_all = false;
         self.persist(cx);
-        // 全局重置也会清掉 OCR 模型目录，刷新状态页的缓存快照。
+        // 全局重置也会清掉 OCR 模型目录，刷新状态页快照并让旧引擎立即失效。
+        crate::ocr::invalidate_engine();
         self.refresh_engine_status(true, cx);
         match autostart_error {
             Some(e) => self.fail(format!("所有设置已恢复默认，但关闭开机启动失败：{e}")),
@@ -1524,10 +1539,35 @@ impl SettingsView {
     /// Refresh the embedded history grid from disk. Called whenever the user
     /// opens the History page or changes its contents.
     fn reload_history(&mut self, cx: &mut Context<Self>) {
-        self.history_records = self
-            .history_store()
-            .and_then(|s| s.list().ok())
-            .unwrap_or_default();
+        match self.history_store() {
+            None => {
+                self.history_records.clear();
+                self.history_index_error = Some("历史目录不可用".to_string());
+                self.set_history_status("历史目录不可用，无法读取历史记录", true, cx);
+            }
+            Some(store) => match store.list() {
+                Ok(records) => {
+                    let was_corrupt = self.history_index_error.is_some();
+                    self.history_records = records;
+                    self.history_index_error = None;
+                    // 索引恢复正常时撤掉之前的损坏提示；用户刚做的删除 / 清空
+                    // 提示是别的状态文案，不要误伤。
+                    if was_corrupt {
+                        self.history_status = SharedString::default();
+                        self.history_status_seq = self.history_status_seq.wrapping_add(1);
+                    }
+                }
+                Err(e) => {
+                    self.history_records.clear();
+                    self.history_index_error = Some(e.to_string());
+                    self.set_history_status(
+                        format!("历史索引损坏，图片仍在磁盘：{e}。可从「打开文件夹」查看原图。"),
+                        true,
+                        cx,
+                    );
+                }
+            },
+        }
         if self
             .history_selected
             .as_ref()
@@ -1710,13 +1750,21 @@ impl SettingsView {
             return;
         }
         self.history_confirm_delete = false;
-        match self.history_store().and_then(|s| s.remove(&id).ok()) {
-            Some(()) => {
+        let removed = match self.history_store() {
+            Some(store) => store.remove(&id).map_err(|e| e.to_string()),
+            None => Err("历史目录不可用".to_string()),
+        };
+        match removed {
+            Ok(()) => {
                 self.set_history_status("已删除", false, cx);
                 self.history_selected = None;
                 self.reload_history(cx);
             }
-            None => self.set_history_status("删除失败", false, cx),
+            Err(e) => self.set_history_status(
+                format!("删除失败：{e}。若为索引损坏，图片仍在磁盘。"),
+                false,
+                cx,
+            ),
         }
     }
 
@@ -2212,6 +2260,8 @@ impl SettingsView {
                 // 用的是缓存快照（不是每次渲染重算），所以改完必须主动刷新。
                 self.settings.ocr.models_dir = Some(dir);
                 self.persist(cx);
+                // 已加载的引擎最长会缓存 60 秒旧模型，换目录必须立刻失效。
+                crate::ocr::invalidate_engine();
                 self.refresh_engine_status(true, cx);
             }
             Err(e) => {
@@ -2224,6 +2274,8 @@ impl SettingsView {
     fn clear_models_dir(&mut self, cx: &mut Context<Self>) {
         if self.settings.ocr.models_dir.take().is_some() {
             self.persist(cx);
+            // 清除目录后下一次识别必须重新按默认位置加载，不能用缓存的旧模型。
+            crate::ocr::invalidate_engine();
             self.refresh_engine_status(true, cx);
         } else {
             cx.notify();
@@ -2311,6 +2363,9 @@ impl SettingsView {
         self.update_downloading = true;
         self.update_progress = None;
         self.downloaded_installer = None;
+        // 新一次下载重置上次的取消标记；关窗回调持有的是同一个 Arc。
+        self.update_download_cancel.store(false, Ordering::Release);
+        let cancel = self.update_download_cancel.clone();
         cx.notify();
 
         enum Msg {
@@ -2320,8 +2375,19 @@ impl SettingsView {
         let (tx, rx) = mpsc::channel::<Msg>();
         let finished = Arc::new(AtomicBool::new(false));
         let flag = finished.clone();
+        let worker_cancel = cancel.clone();
         std::thread::spawn(move || {
+            if worker_cancel.load(Ordering::Acquire) {
+                flag.store(true, Ordering::Release);
+                return;
+            }
             let outcome = crate::update::download_release_asset(&version, |progress| {
+                // 关窗后不再有接收方：跳过进度上报，别再堆积消息。
+                // net 层的回调是 FnMut(DownloadProgress) 且无返回值，
+                // 无法从这里直接中断 WinHTTP 读取，只能等它自己收尾。
+                if worker_cancel.load(Ordering::Acquire) {
+                    return;
+                }
                 let _ = tx.send(Msg::Progress(progress));
             });
             let _ = tx.send(Msg::Done(outcome.map_err(|e| e.to_string())));
@@ -2329,45 +2395,59 @@ impl SettingsView {
         });
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
-            while !finished.load(Ordering::Acquire) {
+            while !finished.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
                 while let Ok(msg) = rx.try_recv() {
-                    let _ = this.update(cx, |this, cx| {
-                        match msg {
-                            Msg::Progress(p) => this.update_progress = Some(p),
-                            Msg::Done(Ok(path)) => {
-                                this.update_downloading = false;
-                                this.update_progress = None;
-                                this.downloaded_installer = Some(path);
-                                this.ok("安装包已下载");
+                    if this
+                        .update(cx, |this, cx| {
+                            match msg {
+                                Msg::Progress(p) => this.update_progress = Some(p),
+                                Msg::Done(Ok(path)) => {
+                                    this.update_downloading = false;
+                                    this.update_progress = None;
+                                    this.downloaded_installer = Some(path);
+                                    this.ok("安装包已下载");
+                                }
+                                Msg::Done(Err(e)) => {
+                                    this.update_downloading = false;
+                                    this.update_progress = None;
+                                    this.fail(format!("下载失败：{e}"));
+                                }
                             }
-                            Msg::Done(Err(e)) => {
-                                this.update_downloading = false;
-                                this.update_progress = None;
-                                this.fail(format!("下载失败：{e}"));
-                            }
-                        }
-                        cx.notify();
-                    });
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        // 窗口已销毁：轮询任务立刻退出，不再每 150ms 空转。
+                        return;
+                    }
                 }
                 cx.background_executor()
                     .timer(Duration::from_millis(150))
                     .await;
             }
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
             // Drain the final Done message after the worker set its flag.
             while let Ok(msg) = rx.try_recv() {
-                let _ = this.update(cx, |this, cx| {
-                    if let Msg::Done(Ok(path)) = msg {
-                        this.update_downloading = false;
-                        this.update_progress = None;
-                        this.downloaded_installer = Some(path);
-                        this.ok("安装包已下载");
-                    } else if let Msg::Done(Err(e)) = msg {
-                        this.update_downloading = false;
-                        this.update_progress = None;
-                        this.fail(format!("下载失败：{e}"));
-                    }
-                    cx.notify();
-                });
+                if this
+                    .update(cx, |this, cx| {
+                        if let Msg::Done(Ok(path)) = msg {
+                            this.update_downloading = false;
+                            this.update_progress = None;
+                            this.downloaded_installer = Some(path);
+                            this.ok("安装包已下载");
+                        } else if let Msg::Done(Err(e)) = msg {
+                            this.update_downloading = false;
+                            this.update_progress = None;
+                            this.fail(format!("下载失败：{e}"));
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
             }
         })
         .detach();
@@ -2700,7 +2780,7 @@ impl SettingsView {
             cx,
             SelectId::CaptureMode,
             "截屏模式",
-            "选择截屏时使用的捕获方式。自动模式会根据系统环境选择最佳方式。",
+            "长截图使用的捕获方式；普通截图自动选择最佳方式。",
             self.settings.screenshot.capture_mode,
             &CaptureMode::ALL,
             CaptureMode::id,
@@ -4533,10 +4613,17 @@ impl SettingsView {
 
         let gallery = if visible.is_empty() {
             let (title, hint) = if self.history_records.is_empty() {
-                (
-                    "还没有截图历史。",
-                    "保存截图或将截图复制到剪贴板后会自动记录到这里。",
-                )
+                if self.history_index_error.is_some() {
+                    (
+                        "历史索引损坏，图片仍在磁盘。",
+                        "请从「打开文件夹」查看原图，或检查 index.json 后刷新重试。",
+                    )
+                } else {
+                    (
+                        "还没有截图历史。",
+                        "保存截图或将截图复制到剪贴板后会自动记录到这里。",
+                    )
+                }
             } else {
                 ("当前筛选下没有图片。", "试试将来源筛选切换为“全部来源”。")
             };

@@ -528,9 +528,14 @@ pub fn startup_maintenance() {
     if let Ok(dir) = settings.history.store_dir() {
         let store = HistoryStore::new(dir);
         // 即使当前关闭了历史也要回收上次删除留下的目录，用户随时可能重新开启。
-        let _ = store.cleanup_pending();
+        // 索引损坏（未知版本 / 坏 JSON）时这些操作会失败，记到日志里，不再静默跳过。
+        if let Err(e) = store.cleanup_pending() {
+            crate::perf::log_app(&format!("history cleanup failed: {e}"));
+        }
         if settings.history.enabled {
-            let _ = store.prune(&settings.history.retention());
+            if let Err(e) = store.prune(&settings.history.retention()) {
+                crate::perf::log_app(&format!("history prune failed: {e}"));
+            }
         }
     }
 }

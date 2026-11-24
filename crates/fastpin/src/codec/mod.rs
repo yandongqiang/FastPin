@@ -8,7 +8,7 @@ use std::ptr;
 use std::slice;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{BITMAPINFOHEADER, BI_RGB};
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_ContainerFormatJpeg, GUID_ContainerFormatPng,
@@ -146,6 +146,20 @@ pub fn decode_bgra(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
     Some((bgra, w, h))
 }
 
+/// `GlobalLock` / `GlobalUnlock` 的 RAII 配对。HGLOBAL 最终交给
+/// `CreateStreamOnHGlobal(..., true)` 释放（内部 `GlobalFree`），若在
+/// 编码后的拷贝/预算检查/分配失败路径上提前返回而忘了 `GlobalUnlock`，
+/// 这块仍被锁定的内存就释放不掉。guard 保证任何退出路径都解锁。
+struct LockedGlobal(HGLOBAL);
+
+impl Drop for LockedGlobal {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = GlobalUnlock(self.0);
+        }
+    }
+}
+
 /// Encodes a BGRA buffer in `format`. `quality` is 1..=100 and only affects the
 /// lossy formats; PNG ignores it.
 ///
@@ -213,6 +227,8 @@ pub fn encode_bgra(
         if ptr.is_null() {
             return Err(Error::new("GlobalLock failed for image stream"));
         }
+        // 之后任何 `?` / 提前返回都由 guard 负责解锁。
+        let _unlock = LockedGlobal(hg);
         let size = GlobalSize(hg);
         // The encoded bytes of an in-budget image fit the budget; the copy out
         // of the HGLOBAL is fallible instead of an aborting `to_vec`.
@@ -222,7 +238,6 @@ pub fn encode_bgra(
             .try_reserve_exact(size)
             .map_err(|_| BudgetError::AllocFailed { bytes: size as u64 })?;
         bytes.extend_from_slice(slice::from_raw_parts(ptr as *const u8, size));
-        let _ = GlobalUnlock(hg);
         Ok(match format {
             // WIC pads PNG to a block boundary with zero bytes past IEND.
             ImageFormat::Png => trim_png(bytes),
@@ -373,6 +388,23 @@ pub fn dib_bytes(width: u32, height: u32) -> Option<usize> {
     budget.checked_len(image as u64 + header as u64).ok()
 }
 
+/// `OpenClipboard` 重试：资源管理器、输入法等程序会瞬时占用剪贴板，只试一次
+/// 就把失败弹成错误框对用户是假故障。5 次、每次 30 ms；全部失败才返回错误。
+fn open_clipboard_with_retry() -> windows::core::Result<()> {
+    const ATTEMPTS: usize = 5;
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        match unsafe { OpenClipboard(Some(HWND::default())) } {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+    Err(last.expect("clipboard open has at least one attempt"))
+}
+
 pub fn set_clipboard_dib(pixels: &[u8], width: u32, height: u32, stride: u32) -> Result<()> {
     let budget = BUDGET;
     // Checked before the `u32` math below: `width * 4 * height` used to wrap,
@@ -413,7 +445,7 @@ pub fn set_clipboard_dib(pixels: &[u8], width: u32, height: u32, stride: u32) ->
         }
         let _ = GlobalUnlock(hg);
 
-        if let Err(e) = OpenClipboard(Some(HWND::default())) {
+        if let Err(e) = open_clipboard_with_retry() {
             let _ = GlobalFree(Some(hg));
             return Err(e.into());
         }
@@ -454,7 +486,7 @@ pub fn set_clipboard_png(png: &[u8]) -> Result<()> {
         }
         std::ptr::copy_nonoverlapping(png.as_ptr(), ptr, png.len());
         let _ = GlobalUnlock(hg);
-        if let Err(e) = OpenClipboard(Some(HWND::default())) {
+        if let Err(e) = open_clipboard_with_retry() {
             let _ = GlobalFree(Some(hg));
             return Err(e.into());
         }
@@ -486,7 +518,7 @@ pub fn set_clipboard_text(text: &str) -> Result<()> {
         std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr, utf16.len());
         let _ = GlobalUnlock(hg);
 
-        if let Err(e) = OpenClipboard(Some(HWND::default())) {
+        if let Err(e) = open_clipboard_with_retry() {
             let _ = GlobalFree(Some(hg));
             return Err(e.into());
         }

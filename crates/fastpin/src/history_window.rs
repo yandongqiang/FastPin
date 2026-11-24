@@ -78,8 +78,19 @@ fn card_height(record: &HistoryRecord) -> f32 {
     2.0 * CARD_PAD + thumb_height(record.width, record.height) + 2.0
 }
 
-/// 空历史提示（宫格 / 列表共用）。
-fn empty_hint() -> impl IntoElement {
+/// 空历史提示（宫格 / 列表共用）。索引读取失败时不能假装是空历史——图片
+/// 其实还在磁盘上，必须明确告知用户原因和下一步。
+fn empty_hint(index_error: Option<&str>) -> impl IntoElement {
+    let (title, detail): (SharedString, SharedString) = match index_error {
+        Some(e) => (
+            "历史索引损坏，图片仍在磁盘。".into(),
+            format!("请从「打开文件夹」查看原图，或检查 index.json 后刷新。索引错误：{e}").into(),
+        ),
+        None => (
+            "还没有截图历史。".into(),
+            "保存截图后会自动记录到这里。".into(),
+        ),
+    };
     div()
         .w_full()
         .py(px(80.))
@@ -92,13 +103,13 @@ fn empty_hint() -> impl IntoElement {
             div()
                 .text_size(px(13.))
                 .text_color(theme::secondary_fg())
-                .child("还没有截图历史。"),
+                .child(title),
         )
         .child(
             div()
                 .text_size(px(11.))
                 .text_color(theme::secondary_fg())
-                .child("保存截图后会自动记录到这里。"),
+                .child(detail),
         )
 }
 
@@ -143,8 +154,10 @@ pub fn show_history_window(cx: &mut App) {
         }
     };
     let store = HistoryStore::new(dir);
+    let mut index_error = None;
     let records = store.list().unwrap_or_else(|e| {
         crate::perf::log_app(&format!("history window: index read failed: {e}"));
+        index_error = Some(e.to_string());
         Vec::new()
     });
 
@@ -161,7 +174,7 @@ pub fn show_history_window(cx: &mut App) {
             window_min_size: Some(size(px(640.), px(480.))),
             ..gpui_kit::component::TitleBar::window_options()
         },
-        |_, cx| cx.new(|cx| HistoryWindowView::new(cx, store, records)),
+        |_, cx| cx.new(|cx| HistoryWindowView::new(cx, store, records, index_error)),
     );
     let handle = match opened {
         Ok(h) => h,
@@ -276,6 +289,9 @@ pub struct HistoryWindowView {
     thumb_seq: u64,
     selected: Option<String>,
     status: SharedString,
+    /// index.json 读取失败的原因。非空表示历史可能仍在磁盘上，UI 不能把它
+    /// 显示成「还没有截图历史」，复制 / 删除 / 清空也因此不可用。
+    index_error: Option<String>,
     /// Last history index revision this window loaded. A 400ms poll compares
     /// it with `history_revision()` so a capture saved elsewhere shows up
     /// without the user pressing 刷新.
@@ -288,7 +304,16 @@ pub struct HistoryWindowView {
 }
 
 impl HistoryWindowView {
-    fn new(cx: &mut Context<Self>, store: HistoryStore, records: Vec<HistoryRecord>) -> Self {
+    fn new(
+        cx: &mut Context<Self>,
+        store: HistoryStore,
+        records: Vec<HistoryRecord>,
+        index_error: Option<String>,
+    ) -> Self {
+        let status = match &index_error {
+            Some(e) => format!("历史索引损坏，图片仍在磁盘：{e}").into(),
+            None => SharedString::default(),
+        };
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             store,
@@ -297,7 +322,8 @@ impl HistoryWindowView {
             thumbs_mtime: HashMap::new(),
             thumb_seq: 0,
             selected: None,
-            status: SharedString::default(),
+            status,
+            index_error,
             revision_seen: crate::history::history_revision(),
             view_mode: HistoryViewMode::Grid,
             container_width: Rc::new(Cell::new(1000.0)),
@@ -368,10 +394,21 @@ impl HistoryWindowView {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        self.records = self.store.list().unwrap_or_else(|e| {
-            self.status = format!("读取历史失败：{e}").into();
-            Vec::new()
-        });
+        match self.store.list() {
+            Ok(records) => {
+                let was_corrupt = self.index_error.is_some();
+                self.records = records;
+                self.index_error = None;
+                if was_corrupt {
+                    self.status = SharedString::default();
+                }
+            }
+            Err(e) => {
+                self.records.clear();
+                self.index_error = Some(e.to_string());
+                self.status = format!("历史索引损坏，图片仍在磁盘：{e}").into();
+            }
+        }
         if self
             .selected
             .as_ref()
@@ -812,7 +849,7 @@ impl HistoryWindowView {
             .p(px(16.));
 
         if self.records.is_empty() {
-            scroll = scroll.child(empty_hint());
+            scroll = scroll.child(empty_hint(self.index_error.as_deref()));
         } else {
             match self.view_mode {
                 HistoryViewMode::Grid => {

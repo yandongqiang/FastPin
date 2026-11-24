@@ -70,7 +70,11 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
     }
     struct EnumeratedOutput {
         output: IDXGIOutput,
-        rect: RECT,
+        /// `DXGI_OUTPUT_DESC::DeviceName`，与 GDI 的 `MONITORINFOEXW::szDevice`
+        /// 是同一个 `\\.\DISPLAYn` 命名空间，是跨 API 的稳定配对键。
+        name: String,
+        /// `GetDesc().Monitor`：设备名取不到时的回退键。
+        monitor: HMONITOR,
         hdr: bool,
         adapter_luid: Option<(u32, i32)>,
     }
@@ -98,7 +102,8 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
             let hdr = output_is_hdr(&output).unwrap_or(false);
             outputs.push(EnumeratedOutput {
                 output,
-                rect: desc.DesktopCoordinates,
+                name: wide_to_string(&desc.DeviceName),
+                monitor: desc.Monitor,
                 hdr,
                 adapter_luid,
             });
@@ -115,19 +120,27 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
         let mut hdr = false;
         let mut output = None;
         let mut adapter_luid = None;
+        let name = device_name(handle);
         for o in &outputs {
-            if o.rect.left == rect.left && o.rect.top == rect.top {
+            // GDI 的 MONITORINFOEXW.szDevice 与 DXGI 的 DeviceName 都是
+            // `\\.\DISPLAYn`，是稳定键。克隆/复制模式下两块输出共享原点，
+            // DPI 取整也可能让 DesktopCoordinates 与 GDI rect 差几个像素，
+            // 因此不再按原点精确相等配对；Monitor 句柄作为回退。
+            if name.as_deref() == Some(o.name.as_str())
+                || (!o.monitor.0.is_null() && o.monitor == handle)
+            {
                 hdr = o.hdr;
                 output = Some(o.output.clone());
                 adapter_luid = o.adapter_luid;
                 break;
             }
         }
-        let sdr_white_nits = device_name(handle)
+        let sdr_white_nits = name
+            .as_deref()
             .and_then(|name| {
                 white_levels
                     .iter()
-                    .find(|(dev, _)| *dev == name)
+                    .find(|(dev, _)| dev.as_str() == name)
                     .map(|(_, nits)| *nits)
             })
             .unwrap_or(REFERENCE_WHITE_NITS);
@@ -267,6 +280,21 @@ pub fn foreground_covers_monitor(mon: &MonitorInfo) -> bool {
     }
 }
 
+/// 整机级 D3D 全屏通知（`QUNS_RUNNING_D3D_FULL_SCREEN`）。任意显示器进入
+/// 全屏独占都会置位，所以只能作辅助信号：是否作用于某块屏由
+/// `crate::exclusive::is_exclusive_fullscreen` 结合该屏的前台覆盖情况决定。
+pub fn query_d3d_fullscreen_notification() -> bool {
+    unsafe {
+        SHQueryUserNotificationState()
+            .ok()
+            .map(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN)
+            .unwrap_or(false)
+    }
+}
+
+/// 每显示器独占判据：只有本输出的 `AttachedToDesktop == false`（脱离 DWM 桌面）
+/// 才算独占。以前把整机 QUNS 标志直接 OR 进来，导致显示器 1 运行全屏游戏时
+/// 显示器 2 也被误判为独占、WGC 全部跳过并采到黑帧。
 pub fn query_monitor_exclusive(mon: &MonitorInfo) -> bool {
     let attached = mon
         .output
@@ -274,13 +302,7 @@ pub fn query_monitor_exclusive(mon: &MonitorInfo) -> bool {
         .and_then(|o| unsafe { o.GetDesc().ok() })
         .map(|d| d.AttachedToDesktop.as_bool())
         .unwrap_or(true);
-    let d3d_fs = unsafe {
-        SHQueryUserNotificationState()
-            .ok()
-            .map(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN)
-            .unwrap_or(false)
-    };
-    dxgi_output_is_exclusive(attached, d3d_fs)
+    dxgi_output_is_exclusive(attached)
 }
 
 pub fn monitor_from_foreground(monitors: &[MonitorInfo]) -> Option<usize> {

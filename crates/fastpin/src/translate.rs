@@ -29,12 +29,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a translator. Output only the trans
 pub fn translate(text: &str) -> Result<String> {
     let cfg = config::get().translation;
     if cfg.base_url.trim().is_empty() {
-        let path = config::path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        return Err(Error::new(format!(
-            "翻译未配置：在 {path} 里填 translation.baseUrl"
-        )));
+        return Err(Error::new("翻译未配置：请在 设置 → 翻译 中填写 Base URL"));
     }
     let body = serde_json::json!({
         "model": cfg.model,

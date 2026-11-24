@@ -82,8 +82,9 @@ pub fn show_long_preview(cx: &mut App, pixels: Vec<u8>, w: u32, h: u32) {
     }
     bind_keys(cx);
     prune_closed(cx);
-    // 已有预览窗口时只激活它，不再重复开窗口：每次新开都要复制一份可能
-    // 上百 MB 的拼接缓冲，重复打开会成倍占用内存。
+    // 已有预览窗口时复用它，而不是再开一个：每次新开都要复制一份可能上百 MB
+    // 的拼接缓冲，重复打开会成倍占用内存。但也不能像以前那样「只激活就返回」
+    // ——那样这次新拼的 pixels 会被直接析构，用户看到的还是上一次的旧图。
     let last = PREVIEW_WINDOWS.with(|slot| slot.borrow().last().map(|(_, handle)| *handle));
     let active = last
         .and_then(|handle| {
@@ -92,11 +93,26 @@ pub fn show_long_preview(cx: &mut App, pixels: Vec<u8>, w: u32, h: u32) {
                 .ok()
         })
         .is_some();
-    if active {
-        return;
-    }
 
     let pixels = Arc::new(pixels);
+    if active {
+        if let Some(handle) = last {
+            // 只克隆 Arc（廉价），即使 handle 刚好失效、替换没执行，下面的
+            // 新建窗口流程仍持有原始 pixels，不会把这次的截图弄丢。
+            let replacement = pixels.clone();
+            let done = handle
+                .update(cx, |view, window, cx| {
+                    let fit = fit_zoom(window.viewport_size().width.into(), w as f32);
+                    view.replace_result(replacement, (w, h), fit, cx);
+                })
+                .is_ok();
+            if done {
+                return;
+            }
+            crate::perf::log_app("long preview: reuse failed, opening a new window");
+        }
+    }
+
     let Some((image, permit)) = render_image(&pixels, w, h) else {
         // A size mismatch means the buffer and the reported geometry disagree.
         // Exporting blind is worse than the old behaviour only if the image is
@@ -267,6 +283,36 @@ impl LongPreviewView {
             saving: false,
             save_error: None,
         }
+    }
+
+    /// 复用已有预览窗口时，把新一次拼接的结果整体换进来。旧的 `RenderImage`、
+    /// 显存预算 `permit` 和像素 `Arc` 都在这次赋值里被 drop，不会泄漏；缩放、
+    /// 保存状态一起重置，避免用户看到上一次的缩放比例或「已保存」提示。
+    fn replace_result(
+        &mut self,
+        pixels: Arc<Vec<u8>>,
+        pixel_size: (u32, u32),
+        zoom: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let (w, h) = pixel_size;
+        let Some((image, permit)) = render_image(&pixels, w, h) else {
+            // 尺寸对不上时退回历史路径：至少不把这次的截图静默丢掉。
+            crate::perf::log_app("long preview: pixel buffer size mismatch on replace");
+            let bytes = Arc::try_unwrap(pixels).unwrap_or_else(|arc| (*arc).clone());
+            crate::app::export_pin_pixels(bytes, w, h, true, true);
+            return;
+        };
+        self.image = image;
+        self.permit = permit; // 旧 permit 在此 drop，预算随之释放
+        self.pixels = pixels;
+        self.pixel_size = pixel_size;
+        self.zoom = zoom;
+        self.saved = false;
+        self.copied = false;
+        self.saving = false;
+        self.save_error = None;
+        cx.notify();
     }
 
     fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {

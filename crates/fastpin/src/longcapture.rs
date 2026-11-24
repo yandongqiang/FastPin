@@ -1658,13 +1658,24 @@ impl Stitcher {
         // Whole-canvas budget check: catches the side, pixel and byte limits
         // before touching the buffer.
         BUDGET.checked_bytes(self.width as u64, new_total as u64, 4)?;
+        // 先把 heights 的容量备好：此后再无「占着预算却没有数据行」的提前返回。
+        // 若放在 try_grow/permit 之后，heights.try_reserve 失败时容量与预留已
+        // 经增长，却不会 push segment，账目会在整个会话里虚高。
+        self.heights.try_reserve(1).map_err(|_| {
+            StitchError::Budget(BudgetError::AllocFailed {
+                bytes: std::mem::size_of::<usize>() as u64,
+            })
+        })?;
         // The headroom is spare capacity, not image: hold the physical buffer
         // to the same byte budget, and give the headroom back (one copy) when
         // it is the thing that would push the allocation over.
         let extra = new_rows * row_bytes;
         let physical = self.pixels.len().saturating_add(extra);
         if BUDGET.checked_len(physical as u64).is_err() {
-            self.drop_headroom();
+            let released = self.drop_headroom();
+            // 物理缓冲截短了 released 字节，预算账本必须同步收缩，
+            // 否则 permits 仍覆盖已归还的 headroom，LIVE_BYTES 全程高估。
+            self.resync_permits(released);
         }
         let permit = crate::image_budget::try_reserve(extra as u64)?;
         if let Err(e) = BUDGET.try_grow(&mut self.pixels, extra) {
@@ -1672,11 +1683,6 @@ impl Stitcher {
             return Err(e.into());
         }
         self.permits.push(permit);
-        self.heights.try_reserve(1).map_err(|_| {
-            StitchError::Budget(BudgetError::AllocFailed {
-                bytes: std::mem::size_of::<usize>() as u64,
-            })
-        })?;
         self.pixels
             .extend_from_slice(&frame_bgra[offset_y * row_bytes..frame_height * row_bytes]);
         self.heights.push(new_rows);
@@ -1795,13 +1801,14 @@ impl Stitcher {
         &self.pixels[self.head_bytes()..]
     }
 
-    /// Moves the image to offset 0 and gives the headroom back. Used when the
-    /// headroom would push the physical buffer past the byte budget, and by
-    /// `into_pixels`.
-    fn drop_headroom(&mut self) {
+    /// Moves the image to offset 0 and gives the headroom back. Returns the
+    /// number of bytes actually removed, so the caller can shrink the budget
+    /// ledger by the same amount. Used when the headroom would push the
+    /// physical buffer past the byte budget, and by `into_pixels`.
+    fn drop_headroom(&mut self) -> u64 {
         let head = self.head_bytes();
         if head == 0 {
-            return;
+            return 0;
         }
         self.pixels.copy_within(head.., 0);
         self.pixels.truncate(self.pixels.len() - head);
@@ -1809,6 +1816,22 @@ impl Stitcher {
         self.stats.compactions += 1;
         self.head_rows = 0;
         self.head_grant = 0;
+        head as u64
+    }
+
+    /// 物理缓冲被截短后重建预留，使账本总和重新等于实际字节数。
+    /// `MemoryPermit` 的字节数不可外部读取也不提供缩小接口，所以先释放整组旧
+    /// 预留，再按新的实际长度预留一次；截短后总量只会变小，通常必然成功。
+    /// 万一并发把余量占满，宁可少记也不能让账本虚高（虚高会让后续图片被误拒）。
+    fn resync_permits(&mut self, released: u64) {
+        let bytes = self.pixels.len() as u64;
+        self.permits.clear();
+        match crate::image_budget::try_reserve(bytes) {
+            Ok(permit) => self.permits.push(permit),
+            Err(e) => crate::perf::log_app(&format!(
+                "long capture: permit resync after releasing {released} bytes failed: {e}"
+            )),
+        }
     }
 
     /// Rows of headroom to grant for `need` new rows at `total_after` height:
@@ -1877,7 +1900,9 @@ impl Stitcher {
     /// the caller never sees the spare rows.
     pub fn into_pixels(mut self) -> (Vec<u8>, u32, u32) {
         let height = self.total_height() as u32;
-        self.drop_headroom();
+        // 会话到这里就结束了：截短像素后无需再 resync，self 一起 drop 时
+        // 整组 permit 会把预留（含已归还的 headroom）全部还给账本。
+        let _ = self.drop_headroom();
         (self.pixels, self.width as u32, height)
     }
 }

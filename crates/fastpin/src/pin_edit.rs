@@ -246,6 +246,18 @@ pub(crate) fn finish(
     leftover
 }
 
+/// 窗口被系统关闭（贴图窗口 Alt+F4、工具栏窗口关闭按钮）时调用。此时没有
+/// 「完成 / 取消」按钮可点，必须在这里撤掉编辑：否则 EDITS 里的 backdrop
+/// （可能是很大的合成图）和工具栏窗口一直留着，Pin 侧的 INFLIGHT_FINISHES
+/// 也会让后续 finish_edit_deferred 的等待循环永不归零。
+pub(crate) fn abort_group(cx: &mut App, group: u64) {
+    // finish(false) 移除 EDITS 并关闭工具栏；取消路径不写回像素，
+    // 已提交的标注不受影响。EDITS 里没有该 group 时是幂等的空操作。
+    let _ = finish(cx, group, false, Vec::new());
+    // EDITS 是这里的 thread_local，PENDING/FLUSHING/INFLIGHT 在 Pin 侧。
+    pin::clear_group_writes(group);
+}
+
 /// Ends an edit with `commit` on a worker thread. The cancel path has no pixel
 /// work and stays synchronous; only 完成 composes + rasterizes off-thread.
 /// Results are applied to every member handle on the UI thread, so the caller
@@ -409,7 +421,13 @@ fn open_toolbar(cx: &mut App, group: u64, bbox: IRect) -> Option<WindowHandle<Pi
             },
         )
         .ok()?;
-    let _ = handle.update(cx, |_, window, _| {
+    let _ = handle.update(cx, |_, window, cx| {
+        // 工具栏被系统关闭时也要撤销编辑，否则 EDITS 永久残留，
+        // is_editing(group) 一直为真，贴图窗口再也进不了编辑模式。
+        window.on_window_should_close(cx, move |_, cx| {
+            abort_group(cx, group);
+            true
+        });
         let hwnd = crate::platform::hwnd_of(window);
         let scale = window.scale_factor().max(0.01) as f64;
         unsafe {

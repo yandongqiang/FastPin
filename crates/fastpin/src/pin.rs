@@ -369,6 +369,11 @@ pub fn show_pin(
         view.attach_to_screen(window, screen_x, screen_y);
         window.focus(&view.focus_handle, cx);
         window.on_window_should_close(cx, move |_, cx| {
+            let group = group_of(id).unwrap_or(id);
+            // 系统级关闭（Alt+F4 / 任务栏）不走 Esc、双击那条 finish 路径。
+            // 先按 group 撤销编辑：否则 EDITS 里的 backdrop 和工具栏窗口会
+            // 一直留着，Pin 侧的 INFLIGHT_FINISHES 也会让后续完成无限等待。
+            pin_edit::abort_group(cx, group);
             forget(&[id]);
             cx.refresh_windows();
             true
@@ -473,7 +478,20 @@ fn detach(id: u64) {
 }
 
 fn forget(ids: &[u64]) {
+    // 先记下这批窗口所属的 group，再把条目移除；否则就拿不到 group 了。
+    let groups: HashSet<u64> = PINS.with(|slot| {
+        slot.borrow()
+            .iter()
+            .filter(|e| ids.contains(&e.id))
+            .map(|e| e.group)
+            .collect()
+    });
     PINS.with(|slot| slot.borrow_mut().retain(|e| !ids.contains(&e.id)));
+    // 正常路径是先 finish 再 forget，队列此时已空，这里是幂等的收尾；
+    // 系统关闭等异常路径则靠这里清掉残留的 PENDING/INFLIGHT 账本。
+    for group in groups {
+        clear_group_writes(group);
+    }
 }
 
 fn client_rect(hwnd: HWND) -> Option<IRect> {
@@ -609,6 +627,21 @@ fn begin_flush(group: u64) -> bool {
 /// 离开 `group` 的冲刷临界区。
 fn end_flush(group: u64) {
     FLUSHING_WRITES.with(|slot| slot.borrow_mut().remove(&group));
+}
+
+/// 丢弃一个 group 的全部写回账本。窗口被关闭后队列里的写回永远等不到收件人，
+/// 残留的 FLUSHING/INFLIGHT 标记更会让 finish_edit_deferred 的等待循环永不归零。
+/// 由 pin_edit::abort_group 与 forget 共同调用，二者都是幂等的。
+pub(crate) fn clear_group_writes(group: u64) {
+    PENDING_WRITES.with(|slot| {
+        slot.borrow_mut().remove(&group);
+    });
+    FLUSHING_WRITES.with(|slot| {
+        slot.borrow_mut().remove(&group);
+    });
+    INFLIGHT_FINISHES.with(|slot| {
+        slot.borrow_mut().remove(&group);
+    });
 }
 
 /// 取出 `group` 的待写回队列（按入队顺序）。单独抽出来便于单测验证 FIFO。

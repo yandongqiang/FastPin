@@ -80,6 +80,22 @@ pub fn show_long_preview(cx: &mut App, pixels: Vec<u8>, w: u32, h: u32) {
         crate::perf::log_app("long preview: empty image");
         return;
     }
+    bind_keys(cx);
+    prune_closed(cx);
+    // 已有预览窗口时只激活它，不再重复开窗口：每次新开都要复制一份可能
+    // 上百 MB 的拼接缓冲，重复打开会成倍占用内存。
+    let last = PREVIEW_WINDOWS.with(|slot| slot.borrow().last().map(|(_, handle)| *handle));
+    let active = last
+        .and_then(|handle| {
+            handle
+                .update(cx, |_, window, _| window.activate_window())
+                .ok()
+        })
+        .is_some();
+    if active {
+        return;
+    }
+
     let pixels = Arc::new(pixels);
     let Some((image, permit)) = render_image(&pixels, w, h) else {
         // A size mismatch means the buffer and the reported geometry disagree.
@@ -89,9 +105,6 @@ pub fn show_long_preview(cx: &mut App, pixels: Vec<u8>, w: u32, h: u32) {
         crate::app::export_pin_pixels(pixels.as_ref().clone(), w, h, true, true);
         return;
     };
-
-    bind_keys(cx);
-    prune_closed(cx);
 
     // Aim for the image at a comfortable width, then let the view fit-to-width
     // inside it. Very tall stitches still open at a readable width.

@@ -285,6 +285,10 @@ pub const TOOLBAR_ICONS: &[&str] = &[
     "toolbar/cancel.svg",
     "toolbar/propStroke.svg",
     "toolbar/propFill.svg",
+    "toolbar/propWidth1.svg",
+    "toolbar/propWidth2.svg",
+    "toolbar/propWidth4.svg",
+    "toolbar/propWidth8.svg",
     "toolbar/propArrowStart.svg",
     "toolbar/propArrowEnd.svg",
     "toolbar/propArrowBoth.svg",
@@ -295,6 +299,8 @@ pub const TOOLBAR_ICONS: &[&str] = &[
     "toolbar/propBadgeFilled.svg",
     "toolbar/propBadgeHollow.svg",
     "toolbar/propBadgeSquare.svg",
+    "toolbar/propAlphaMinus.svg",
+    "toolbar/propAlphaPlus.svg",
 ];
 
 pub fn icon_path(id: &str) -> Option<&'static str> {

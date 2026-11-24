@@ -17,12 +17,14 @@
 //! which shows a native popup menu and calls back with the chosen command.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
-    actions, canvas, div, img, prelude::*, px, size, App, Bounds, Context, CursorStyle,
+    actions, canvas, div, img, prelude::*, px, size, App, AsyncApp, Bounds, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, EntityInputHandler, FocusHandle, Focusable, ImageSource,
     KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point as GpuiPoint, Render, RenderImage, ScrollDelta, ScrollWheelEvent, UTF16Selection, Window,
@@ -74,9 +76,22 @@ struct PinEntry {
     handle: WindowHandle<PinView>,
 }
 
+/// 异步标注写回的一项：(tile id, BGRA, w, h, zoom)。
+type PendingWrite = (u64, Vec<u8>, u32, u32, f32);
+
 thread_local! {
     static PINS: RefCell<Vec<PinEntry>> = const { RefCell::new(Vec::new()) };
     static KEYS_BOUND: Cell<bool> = const { Cell::new(false) };
+    /// 一个 group 的标注像素在后台 flatten 完成后先入队，再按完成顺序写回。
+    /// 快速重开同一 group 时，后一笔的 tiles 必须包含前一笔的标注，
+    /// 否则两个后台任务谁最后返回谁就把先前那笔覆盖掉。
+    static PENDING_WRITES: RefCell<HashMap<u64, Vec<PendingWrite>>> = RefCell::new(HashMap::new());
+    /// 正在冲刷队列时的重入保护：写回会 notify，途中再次进入 snapshots
+    /// 只读现有 view，外层 flush 会把队列里剩下的部分继续应用完。
+    static FLUSHING_WRITES: Cell<bool> = const { Cell::new(false) };
+    /// group -> 仍在后台 flatten 的完成次数。大于 0 时新的完成必须等它归零
+    /// 再抓 tiles，否则 tiles 里还没有前一笔标注，仍会互相覆盖。
+    static INFLIGHT_FINISHES: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
 }
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -570,9 +585,95 @@ pub(crate) fn refresh_group(cx: &mut App, group: u64) {
     }
 }
 
+// ---- 异步标注写回的排序 ---------------------------------------------------
+
+/// flatten 在后台完成，先把像素按完成顺序放进 group 的队列，再由 flush 应用。
+pub(crate) fn enqueue_pending_writes(group: u64, writes: Vec<PendingWrite>) {
+    if writes.is_empty() {
+        return;
+    }
+    PENDING_WRITES.with(|slot| {
+        slot.borrow_mut().entry(group).or_default().extend(writes);
+    });
+}
+
+/// 按入队顺序把像素写回 tile view。正在冲刷时重入直接跳过，外层 flush 会
+/// 继续处理队列里剩下的项，保证同一 group 的写回永远是先进先出。
+pub(crate) fn flush_pending_writes(cx: &mut App, group: u64) {
+    if FLUSHING_WRITES.with(|f| f.replace(true)) {
+        return;
+    }
+    let writes = PENDING_WRITES
+        .with(|slot| slot.borrow_mut().remove(&group))
+        .unwrap_or_default();
+    for (id, px, w, h, zoom) in writes {
+        let Some(handle) = entry_handle(id) else {
+            continue;
+        };
+        // 和原来的 finish_async 一样，窗口若已被关闭就跳过；不能写回的项
+        // 不会阻塞队列里后面的项。
+        let _ = handle.update(cx, |view, _, cx| {
+            view.replace_pixels(px, w, h, zoom);
+            cx.notify();
+        });
+    }
+    FLUSHING_WRITES.with(|f| f.set(false));
+}
+
+/// pin_edit::finish_async 在生成后台任务前登记，写回完成后解除。
+pub(crate) fn begin_finish(group: u64) {
+    INFLIGHT_FINISHES.with(|slot| {
+        *slot.borrow_mut().entry(group).or_insert(0) += 1;
+    });
+}
+
+/// 无论 UI 更新成功与否都要解除在途标记，否则后续完成会被永久卡住。
+pub(crate) fn end_finish(group: u64) {
+    INFLIGHT_FINISHES.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(count) = slot.get_mut(&group) else {
+            return;
+        };
+        if *count <= 1 {
+            slot.remove(&group);
+        } else {
+            *count -= 1;
+        }
+    });
+}
+
+fn has_inflight_finish(group: u64) -> bool {
+    INFLIGHT_FINISHES.with(|slot| slot.borrow().get(&group).copied().unwrap_or(0) > 0)
+}
+
+/// 完成编辑：先等同一 group 之前启动的 flatten 全部写回，再抓 tiles。
+/// 直接抓会让后一笔的标注基于不含前一笔的像素，两个后台任务互相覆盖。
+/// 等在途任务归零后才在 UI 线程重新 snapshots，此时任何 view 都不在更新中，
+/// 因此可以不传 `mine`，把整个 group（含调用方那块）读全。
+pub(crate) fn finish_edit_deferred(cx: &mut App, group: u64, commit: bool) {
+    if !commit {
+        pin_edit::finish_async(cx, group, false, Vec::new());
+        return;
+    }
+    let executor = cx.background_executor().clone();
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        while has_inflight_finish(group) {
+            executor.timer(Duration::from_millis(1)).await;
+        }
+        cx.update(|cx: &mut App| {
+            let tiles = snapshots(cx, group, None);
+            pin_edit::finish_async(cx, group, true, tiles);
+        });
+    })
+    .detach();
+}
+
 /// Snapshots of every tile in `group` read through their windows; `mine` is
 /// the caller's own tile, which cannot be read while it is being updated.
 pub(crate) fn snapshots(cx: &mut App, group: u64, mine: Option<TileSnapshot>) -> Vec<TileSnapshot> {
+    // 先把已完成但还没写回 view 的像素按序应用：后续 flatten 必须基于
+    // 含上一次标注的 tiles，否则两笔标注会互相覆盖。
+    flush_pending_writes(cx, group);
     let skip = mine.as_ref().map(|t| t.id);
     let mut out: Vec<TileSnapshot> = mine.into_iter().collect();
     for e in group_entries(group) {
@@ -900,16 +1001,11 @@ impl PinView {
         cx.notify();
     }
 
-    fn finish_edit(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let group = self.group();
-        let tiles = if commit {
-            snapshots(cx, group, self.snapshot(window))
-        } else {
-            Vec::new()
-        };
-        // 完成 composites + rasterizes on a worker; the result is applied to
-        // every group member (including this view) back on the UI thread.
-        pin_edit::finish_async(cx, group, commit, tiles);
+    fn finish_edit(&mut self, commit: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        // 完成 composites + rasterizes on a worker。抓 tiles 的时机由
+        // finish_edit_deferred 统一控制：同 group 上一次 flatten 写回完成后
+        // 才抓，避免快速重开时两笔标注互相覆盖。
+        finish_edit_deferred(cx, self.group(), commit);
         self.edit_down = None;
         cx.notify();
     }
@@ -2208,6 +2304,24 @@ mod tests {
             top,
             bottom,
         }
+    }
+
+    /// 同一 group 的重开必须等所有在途 flatten 结束：计数要成对、互不串组。
+    #[test]
+    fn inflight_finish_counter_tracks_each_group_independently() {
+        assert!(!has_inflight_finish(41));
+        assert!(!has_inflight_finish(42));
+        begin_finish(42);
+        begin_finish(42);
+        assert!(has_inflight_finish(42));
+        assert!(!has_inflight_finish(41));
+        end_finish(42);
+        assert!(has_inflight_finish(42), "还有一次完成在途");
+        end_finish(42);
+        assert!(!has_inflight_finish(42));
+        end_finish(42); // 多余解除不能把别的组状态带坏
+        assert!(!has_inflight_finish(41));
+        assert!(!has_inflight_finish(42));
     }
 
     /// The eight hot zones: four sides, four corners, nothing inside.

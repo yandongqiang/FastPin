@@ -38,10 +38,11 @@ thread_local! {
     static KEYS_BOUND: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Generation of the hotkey-recording session. There is no window-close handler
-/// to stop a recorder, so the timeout must be able to check its own validity
-/// even after the view that armed it is gone — hence a shared counter rather
-/// than the view field alone. `SettingsView::recording_seq` mirrors it.
+/// Generation of the hotkey-recording session. Closing the settings window now
+/// stops the recorder explicitly, but its 10s timeout task may still be in
+/// flight, so it has to check its own validity even after the view that armed it
+/// is gone — hence a shared counter rather than the view field alone.
+/// `SettingsView::recording_seq` mirrors it.
 static RECORDING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Long enough to press any combo, short enough that a recorder left running by
@@ -117,7 +118,18 @@ pub fn open(cx: &mut App) {
             // Populate the embedded history grid up front so the History page
             // shows real thumbnails even when reached without a nav click.
             handle
-                .update(cx, |view, _, cx| view.load_history_on_open(cx))
+                .update(cx, |view, window, cx| {
+                    view.load_history_on_open(cx);
+                    // 点过热键输入框后直接关窗也要立刻收钩子：否则录制钩子会
+                    // 继续吞掉可绑定的按键，直到 10 秒超时才被撤下。递增代号让
+                    // 旧超时任务发现失效，不再碰新窗口的录制状态。
+                    window.on_window_should_close(cx, |_, cx| {
+                        crate::platform::stop_recording();
+                        RECORDING_SEQ.fetch_add(1, Ordering::SeqCst);
+                        cx.refresh_windows();
+                        true
+                    });
+                })
                 .ok();
             SETTINGS_WINDOW.with(|slot| *slot.borrow_mut() = Some(handle))
         }

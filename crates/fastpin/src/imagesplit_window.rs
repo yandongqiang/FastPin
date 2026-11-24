@@ -56,6 +56,18 @@ pub fn show_split_pixels(pixels: Arc<Vec<u8>>, width: u32, height: u32, cx: &mut
 fn open(cx: &mut App, initial: Option<(Arc<Vec<u8>>, u32, u32, String)>) {
     bind_keys(cx);
     prune_closed(cx);
+    // 已打开的窗口直接激活，重复点击入口不再叠加新窗口。
+    let last = SPLIT_WINDOWS.with(|slot| slot.borrow().last().map(|(_, handle)| *handle));
+    let active = last
+        .and_then(|handle| {
+            handle
+                .update(cx, |_, window, _| window.activate_window())
+                .ok()
+        })
+        .is_some();
+    if active {
+        return;
+    }
 
     let bounds = Bounds::centered(None, size(px(1020.), px(720.)), cx);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);

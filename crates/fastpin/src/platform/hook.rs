@@ -122,12 +122,26 @@ unsafe extern "system" fn record_proc(code: i32, wparam: WPARAM, lparam: LPARAM)
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-/// Re-applies a rebind to both paths at once. The LL hook reads `BINDINGS`, but
-/// the RegisterHotKey fallback holds its own copy in the desktop's table, so
-/// updating only one leaves the old shortcut live on the other.
+/// True while one of our keyboard hooks is still in the chain. The hooks
+/// deliver a combo as `WM_FASTPIN_HOTKEY`, the RegisterHotKey fallback as
+/// `WM_HOTKEY`; both being live makes `hidden_proc` post the same action twice
+/// (two fullscreen PNGs, two clipboard writes). Recording also counts: its hook
+/// is temporarily swapped in during a rebind, so the fallback must not sneak
+/// back in at that moment either.
+fn hook_chain_active() -> bool {
+    HOOK.load(Ordering::SeqCst) != 0 || RECORD_HOOK.load(Ordering::SeqCst) != 0
+}
+
+/// Re-applies a rebind to the active path. The LL hook reads `BINDINGS` directly,
+/// so when it (or the recorder) is installed there is nothing to refresh in the
+/// desktop hotkey table — registering the fallback as well would double-fire.
+/// Only in fallback mode does the desktop table need the new bindings.
 pub fn apply_bindings(bindings: HotkeyBindings) {
     let hwnd = hook_target();
     set_hook_target(hwnd, bindings);
+    if hook_chain_active() {
+        return;
+    }
     register_fallback_hotkeys(hwnd, &bindings);
 }
 

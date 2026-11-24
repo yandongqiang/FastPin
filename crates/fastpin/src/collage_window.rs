@@ -83,6 +83,18 @@ pub fn show_collage_pixels(pixels: Arc<Vec<u8>>, width: u32, height: u32, cx: &m
 fn open(cx: &mut App, initial: Option<(Arc<Vec<u8>>, u32, u32, String)>) {
     bind_keys(cx);
     prune_closed(cx);
+    // 已打开的窗口直接激活，重复点击入口不再叠加新窗口。
+    let last = COLLAGE_WINDOWS.with(|slot| slot.borrow().last().map(|(_, handle)| *handle));
+    let active = last
+        .and_then(|handle| {
+            handle
+                .update(cx, |_, window, _| window.activate_window())
+                .ok()
+        })
+        .is_some();
+    if active {
+        return;
+    }
 
     let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);

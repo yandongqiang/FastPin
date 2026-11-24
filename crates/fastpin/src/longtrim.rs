@@ -242,6 +242,14 @@ pub fn hit_test(y: f32, thumb_height: f32, range: TrimRange, canvas: u32) -> Tri
     TrimHit::None
 }
 
+/// 横向长截图的命中测试：`x` 是指针在缩略图上的水平坐标，`thumb_width` 是
+/// 缩略图的绘制宽度。stitch 轴横向时 `[0, L]` 必须映射到宽度而不是那条几乎
+/// 不变的屏幕高（否则长边被压成顶部一条细缝，手柄既画不出也点不中）。
+/// 几何与 [`hit_test`] 完全相同，这里只换一个传入的轴与尺寸，纵向继续用旧函数。
+pub fn hit_test_x(x: f32, thumb_width: f32, range: TrimRange, canvas: u32) -> TrimHit {
+    hit_test(x, thumb_width, range, canvas)
+}
+
 /// Converts a thumbnail-space drag into a canvas row, clamped to the canvas.
 /// Used by both handle drags and band drags.
 pub fn row_at(y: f32, thumb_height: f32, canvas: u32) -> u32 {
@@ -449,6 +457,31 @@ mod tests {
         assert_eq!(hit_test(40.0, thumb_h, range, canvas), TrimHit::Band);
         assert_eq!(hit_test(5.0, thumb_h, range, canvas), TrimHit::None);
         assert_eq!(hit_test(95.0, thumb_h, range, canvas), TrimHit::None);
+    }
+
+    /// 横向的命中测试按 x 轴、用缩略图宽度 dw 缩放；旧逻辑按 dh 会把
+    /// 长边 L 压成顶部细缝，宽画布上的手柄根本点不中。
+    #[test]
+    fn horizontal_hit_test_uses_the_thumbnail_width() {
+        let canvas = 1000u32; // 横向增长长边 L
+        let range = TrimRange {
+            top: 200,
+            bottom: 600,
+        };
+        let dw = 200.0f32; // 缩略图宽度；高度只有几十像素
+                           // 1 px = 5 列：两个手柄落在 x=40 / x=120，band 在两者之间。
+        assert_eq!(
+            hit_test_x(40.0, dw, range, canvas),
+            TrimHit::Handle(TrimEdge::Top)
+        );
+        assert_eq!(
+            hit_test_x(120.0, dw, range, canvas),
+            TrimHit::Handle(TrimEdge::Bottom)
+        );
+        assert_eq!(hit_test_x(80.0, dw, range, canvas), TrimHit::Band);
+        assert_eq!(hit_test_x(5.0, dw, range, canvas), TrimHit::None);
+        // 同一指针若误用 dh 作为尺寸，120 px 已在"画布"之外，什么都点不中。
+        assert_eq!(hit_test_x(120.0, 40.0, range, canvas), TrimHit::None);
     }
 
     #[test]

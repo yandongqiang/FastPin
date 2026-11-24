@@ -118,6 +118,22 @@ thread_local! {
 /// one control meant to show past images stops working exactly when a user
 /// wants to inspect or clear them.
 pub fn show_history_window(cx: &mut App) {
+    bind_keys(cx);
+    prune_closed(cx);
+    // 重复点击入口时只激活已打开的窗口，避免每个实例各起一个 400ms
+    // revision 轮询任务相互叠加；失效 handle 已由 prune_closed 清理。
+    let last = HISTORY_WINDOWS.with(|slot| slot.borrow().last().map(|(_, handle)| *handle));
+    let active = last
+        .and_then(|handle| {
+            handle
+                .update(cx, |_, window, _| window.activate_window())
+                .ok()
+        })
+        .is_some();
+    if active {
+        return;
+    }
+
     let settings = crate::config::get();
     let dir = match settings.history.store_dir() {
         Ok(d) => d,
@@ -131,8 +147,6 @@ pub fn show_history_window(cx: &mut App) {
         crate::perf::log_app(&format!("history window: index read failed: {e}"));
         Vec::new()
     });
-    bind_keys(cx);
-    prune_closed(cx);
 
     let bounds = Bounds::centered(None, size(px(1000.), px(700.)), cx);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);

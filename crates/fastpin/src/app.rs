@@ -393,7 +393,11 @@ fn self_test() -> Result<()> {
                 let bindings = HotkeyBindings::poc_defaults();
                 set_hook_target(hwnd, bindings);
                 let hook_ok = install_ll_hook().is_ok();
-                register_fallback_hotkeys(hwnd, &bindings);
+                // LL hook 可用时不装 RegisterHotKey 兜底：两条通路同时注册会让
+                // 同一次按键发出 WM_FASTPIN_HOTKEY 和 WM_HOTKEY，动作执行两次。
+                if !hook_ok {
+                    register_fallback_hotkeys(hwnd, &bindings);
+                }
                 let tray_ok = add_tray_icon(hwnd).is_ok();
                 perf.mark("T1");
                 let _ = perf.write_log();
@@ -714,10 +718,13 @@ fn boot_resident(
 
     let bindings = HotkeyBindings::from_settings(&crate::config::get().hotkeys);
     set_hook_target(hwnd, bindings);
+    // 只在这条主热键通路不可用时才注册 RegisterHotKey 兜底。两者并存时同一次
+    // 按键会分别产生 WM_FASTPIN_HOTKEY（hook）与 WM_HOTKEY（fallback），
+    // hidden_proc 对后者再次 post_action，全屏截图因此保存两份 PNG、剪贴板写两次。
     if let Err(e) = install_ll_hook() {
         eprintln!("LL hook failed ({e}); using RegisterHotKey fallback");
+        register_fallback_hotkeys(hwnd, &bindings);
     }
-    register_fallback_hotkeys(hwnd, &bindings);
     // Shell_NotifyIconW(NIM_ADD) can be denied by shell/Explorer state
     // (restart, UIPI, a stale icon entry). The LL hook and RegisterHotKey
     // fallback still deliver hotkeys, so the tray icon is optional infra:

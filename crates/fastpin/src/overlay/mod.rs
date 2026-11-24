@@ -98,6 +98,9 @@ actions!(
 
 thread_local! {
     static OVERLAY_WINDOW: RefCell<Option<WindowHandle<OverlayView>>> = const { RefCell::new(None) };
+    // 同一个覆盖层窗口会被后续截图复用，光比对句柄分不清新旧捕获。每开始一
+    // 张新图就换一代，finish 排的延迟隐藏只能作用于它自己那一代。
+    static OVERLAY_GENERATION: Cell<u64> = const { Cell::new(0) };
     static KEYS_BOUND: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -420,18 +423,20 @@ fn long_status_hint(axis: Axis) -> String {
 /// selected band and stays active until mouse-up, so the handle keeps following
 /// the pointer after it has moved away from the handle itself.
 struct TrimDrag {
+    /// stitch 轴：纵向读指针的 y，横向读 x，和绘制 / 命中测试保持同一轴。
+    axis: Axis,
     edge: crate::longtrim::TrimHit,
     /// Trim selection at press time. Every move recomputes from this instead of
     /// from the live range, so the pointer delta is never applied twice.
     start_range: crate::longtrim::TrimRange,
-    /// Pointer y in window-local logical pixels when the drag started. Moves
-    /// apply `current_y - start_ptr_y`, which is all a drag needs: the handlers
-    /// never learn the thumbnail's laid-out position, only its height.
-    start_ptr_y: f32,
-    /// Drawn thumbnail height in logical pixels: the canvas-to-thumbnail scale
-    /// for this drag. Captured at press time so a preview that grows mid-drag
-    /// cannot rescale the pointer delta under the user.
-    thumb_h: f32,
+    /// Pointer position along the stitch axis in window-local logical pixels
+    /// when the drag started. Moves apply `current - start_ptr`, which is all a
+    /// drag needs: the handlers never learn the thumbnail's laid-out position.
+    start_ptr: f32,
+    /// Drawn thumbnail extent along the stitch axis in logical pixels: dh for a
+    /// vertical capture, dw for a horizontal one. Captured at press time so a
+    /// preview that grows mid-drag cannot rescale the pointer delta.
+    thumb_extent: f32,
 }
 
 /// Wraps a tight BGRA thumbnail buffer in a GPUI `RenderImage`. The pixel
@@ -876,6 +881,9 @@ fn show_overlay_inner(
     copy_only: bool,
     smart_selection: crate::config::SmartSelectionMode,
 ) -> Result<Entity<OverlayView>> {
+    // 无论复用旧窗口还是新建窗口，这都是一张全新的截图；上一张 finish 时
+    // 挂起的延迟隐藏必须在回调里发现自己已经过期。
+    OVERLAY_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
     let swap = match cx.with_gpu_context(|device, context| {
         present_freeze_from_texture(
             device,
@@ -1619,11 +1627,15 @@ impl OverlayView {
         // to release, even after it leaves the thumbnail. Recomputing from the
         // press-time range keeps the pointer delta authoritative.
         if let Some(drag) = self.long.as_ref().and_then(|s| s.trim_drag.as_ref()) {
-            let pointer_y = f32::from(event.position.y) / window.scale_factor();
-            let delta = pointer_y - drag.start_ptr_y;
+            let pointer = f32::from(if drag.axis == Axis::Horizontal {
+                event.position.x
+            } else {
+                event.position.y
+            }) / window.scale_factor();
+            let delta = pointer - drag.start_ptr;
             let edge = drag.edge;
             let start_range = drag.start_range;
-            let thumb_h = drag.thumb_h;
+            let thumb_extent = drag.thumb_extent;
             if let Some(state) = self.long.as_mut() {
                 let canvas = state.total_height.max(1) as u32;
                 let next = match edge {
@@ -1635,11 +1647,11 @@ impl OverlayView {
                             crate::longtrim::TrimEdge::Bottom => start_range.bottom,
                         },
                         delta,
-                        thumb_h,
+                        thumb_extent,
                         canvas,
                     ),
                     crate::longtrim::TrimHit::Band => {
-                        crate::longtrim::dragged_band(start_range, delta, thumb_h, canvas)
+                        crate::longtrim::dragged_band(start_range, delta, thumb_extent, canvas)
                     }
                     crate::longtrim::TrimHit::None => None,
                 };
@@ -1974,8 +1986,14 @@ impl OverlayView {
         // capture survives in gpui's swap chain for the next one to flash. Hiding is
         // idempotent, and a full-screen topmost window that never goes away would be
         // far worse than a flash, so a timer hides it regardless if that frame never
-        // arrives.
-        window.on_next_frame(|window, _cx| {
+        // arrives. Both callbacks are bound to this capture's generation: if another
+        // screenshot has already started, they must not hide its (reused) window
+        // while that new view still thinks it is visible.
+        let gen = OVERLAY_GENERATION.with(|g| g.get());
+        window.on_next_frame(move |window, _cx| {
+            if OVERLAY_GENERATION.with(|g| g.get()) != gen {
+                return;
+            }
             let _ = window.wait_for_commit_completion();
             Self::hide_window(window);
         });
@@ -1984,6 +2002,9 @@ impl OverlayView {
                 .timer(Duration::from_millis(80))
                 .await;
             cx.update(|cx| {
+                if OVERLAY_GENERATION.with(|g| g.get()) != gen {
+                    return;
+                }
                 if let Some(handle) = OVERLAY_WINDOW.with(|s| *s.borrow()) {
                     let _ = handle.update(cx, |_view, window, _cx| {
                         Self::hide_window(window);
@@ -3474,18 +3495,28 @@ impl OverlayView {
             // Thumbnail geometry, in the same logical pixels GPUI reports mouse
             // positions in. The bar is placed at `pos` (capture coordinates,
             // divided by the scale factor to get logical pixels) and pads its
-            // content by 12px horizontally and 6px vertically, so the thumbnail
-            // starts one padding below the bar's top edge.
+            // content by 12px horizontally and 6px vertically.
+            const BAR_PAD_X: f32 = 12.0;
             const BAR_PAD_Y: f32 = 6.0;
+            let bar_left = pos.x as f32 / scale;
             let thumb_top = pos.y as f32 / scale + BAR_PAD_Y;
+            // 横向把缩略图靠左放置，左边缘因此是确定的，命中测试才能用 x。
+            // 纵向维持居中，只需要 top。
+            let horizontal = state.axis == Axis::Horizontal;
+            let thumb_left = bar_left + BAR_PAD_X;
+            // stitch 轴纵向是缩略图的高，横向是宽。total_height 在横向已经是
+            // 增长长边 L，必须映射到 dw；若映射到 dh（常量屏幕高），[0,L] 会
+            // 被压成顶部一条细缝，手柄既画不出也点不中。
+            let thumb_extent = if horizontal { dw } else { dh };
             let canvas = state.total_height.max(1) as u32;
             let trim = state.trim;
-            let trim_scale = dh / canvas as f32;
-            let top_y = trim.top as f32 * trim_scale;
-            let bottom_y = trim.bottom as f32 * trim_scale;
+            let trim_scale = thumb_extent / canvas as f32;
+            let near = trim.top as f32 * trim_scale;
+            let far = trim.bottom as f32 * trim_scale;
             div()
                 .flex()
-                .justify_center()
+                .when(!horizontal, |el| el.justify_center())
+                .when(horizontal, |el| el.justify_start())
                 .w_full()
                 .mb(px(6.))
                 .child(
@@ -3504,21 +3535,42 @@ impl OverlayView {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                let pointer_y = f32::from(event.position.y) / window.scale_factor();
-                                let y = pointer_y - thumb_top;
+                                let pointer = f32::from(if horizontal {
+                                    event.position.x
+                                } else {
+                                    event.position.y
+                                }) / window.scale_factor();
+                                let along =
+                                    pointer - (if horizontal { thumb_left } else { thumb_top });
                                 let Some(state) = this.long.as_mut() else {
                                     return;
                                 };
                                 let canvas = state.total_height.max(1) as u32;
-                                match crate::longtrim::hit_test(y, dh, state.trim, canvas) {
+                                let hit = if horizontal {
+                                    crate::longtrim::hit_test_x(
+                                        along,
+                                        thumb_extent,
+                                        state.trim,
+                                        canvas,
+                                    )
+                                } else {
+                                    crate::longtrim::hit_test(
+                                        along,
+                                        thumb_extent,
+                                        state.trim,
+                                        canvas,
+                                    )
+                                };
+                                match hit {
                                     crate::longtrim::TrimHit::None => {}
                                     hit => {
                                         cx.stop_propagation();
                                         state.trim_drag = Some(TrimDrag {
+                                            axis: state.axis,
                                             edge: hit,
                                             start_range: state.trim,
-                                            start_ptr_y: pointer_y,
-                                            thumb_h: dh,
+                                            start_ptr: pointer,
+                                            thumb_extent,
                                         });
                                         // A trim drag and the hover preview want
                                         // the same pointer: cropping wins, so
@@ -3543,7 +3595,11 @@ impl OverlayView {
                                 if state.trim_drag.is_some() {
                                     return;
                                 }
-                                let pointer_y = f32::from(event.position.y) / window.scale_factor();
+                                let pointer = f32::from(if horizontal {
+                                    event.position.x
+                                } else {
+                                    event.position.y
+                                }) / window.scale_factor();
                                 let canvas = state.total_height.max(1) as u32;
                                 // One viewport-tall band, along the stitch axis:
                                 // the height of a vertical capture, the width of a
@@ -3552,8 +3608,12 @@ impl OverlayView {
                                     Axis::Vertical => state.h,
                                     Axis::Horizontal => state.w,
                                 };
-                                let rows =
-                                    hover_rows_at(pointer_y - thumb_top, dh, canvas, viewport);
+                                let rows = hover_rows_at(
+                                    pointer - (if horizontal { thumb_left } else { thumb_top }),
+                                    thumb_extent,
+                                    canvas,
+                                    viewport,
+                                );
                                 if state.hover.hover() != rows {
                                     state.hover.set_cropping(false);
                                     state.hover.set_hover(rows);
@@ -3574,67 +3634,74 @@ impl OverlayView {
                             cx.notify();
                         }))
                         .child(img(ImageSource::Render(image.clone())).w(px(dw)).h(px(dh)))
-                        // Dim the rows the selection excludes: two translucent
-                        // bands, one above and one below the chosen range.
-                        .when(top_y > 0.5, |el| {
-                            el.child(
-                                div()
-                                    .absolute()
-                                    .top(px(0.))
-                                    .left(px(0.))
-                                    .w(px(dw))
-                                    .h(px(top_y))
-                                    .bg(theme::base().opacity(0.55)),
-                            )
+                        // Dim the rows / columns the selection excludes: two
+                        // translucent bands on either side of the range, laid
+                        // out along the stitch axis.
+                        .when(near > 0.5, |el| {
+                            let band = div().absolute().bg(theme::base().opacity(0.55));
+                            let band = if horizontal {
+                                band.left(px(0.)).top(px(0.)).w(px(near)).h(px(dh))
+                            } else {
+                                band.left(px(0.)).top(px(0.)).w(px(dw)).h(px(near))
+                            };
+                            el.child(band)
                         })
-                        .when(bottom_y < dh - 0.5, |el| {
-                            el.child(
-                                div()
-                                    .absolute()
-                                    .top(px(bottom_y))
-                                    .left(px(0.))
+                        .when(far < thumb_extent - 0.5, |el| {
+                            let band = div().absolute().bg(theme::base().opacity(0.55));
+                            let band = if horizontal {
+                                band.left(px(far))
+                                    .top(px(0.))
+                                    .w(px((thumb_extent - far).max(0.)))
+                                    .h(px(dh))
+                            } else {
+                                band.left(px(0.))
+                                    .top(px(far))
                                     .w(px(dw))
-                                    .h(px((dh - bottom_y).max(0.)))
-                                    .bg(theme::base().opacity(0.55)),
-                            )
+                                    .h(px((thumb_extent - far).max(0.)))
+                            };
+                            el.child(band)
                         })
                         // The two edges of the kept range, drawn as thin accent
                         // rules so the boundary is visible without a handle
-                        // glyph on so small a thumbnail.
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(top_y))
-                                .left(px(0.))
-                                .w(px(dw))
-                                .h(px(1.))
-                                .bg(theme::accent()),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px((bottom_y - 1.).max(0.)))
-                                .left(px(0.))
-                                .w(px(dw))
-                                .h(px(1.))
-                                .bg(theme::accent()),
-                        )
-                        // Hover band: the rows the pointer picked, outlined on the
-                        // thumbnail so the user can tell which part of the page
-                        // the floating preview belongs to.
-                        .when_some(state.hover_rows, |el, (h_top, h_bottom)| {
-                            let hy = h_top as f32 * trim_scale;
-                            let hh = ((h_bottom - h_top) as f32 * trim_scale).max(1.0);
-                            el.child(
-                                div()
-                                    .absolute()
-                                    .top(px(hy))
-                                    .left(px(0.))
+                        // glyph on so small a thumbnail: horizontal rules for a
+                        // vertical capture, vertical ones for a horizontal one.
+                        .child({
+                            let edge = div().absolute().bg(theme::accent());
+                            if horizontal {
+                                edge.left(px(near)).top(px(0.)).w(px(1.)).h(px(dh))
+                            } else {
+                                edge.left(px(0.)).top(px(near)).w(px(dw)).h(px(1.))
+                            }
+                        })
+                        .child({
+                            let edge = div().absolute().bg(theme::accent());
+                            if horizontal {
+                                edge.left(px((far - 1.).max(0.)))
+                                    .top(px(0.))
+                                    .w(px(1.))
+                                    .h(px(dh))
+                            } else {
+                                edge.left(px(0.))
+                                    .top(px((far - 1.).max(0.)))
                                     .w(px(dw))
-                                    .h(px(hh))
-                                    .border_1()
-                                    .border_color(theme::primary_fg()),
-                            )
+                                    .h(px(1.))
+                            }
+                        })
+                        // Hover band: the canvas interval the pointer picked,
+                        // outlined along the same stitch axis on the thumbnail.
+                        .when_some(state.hover_rows, |el, (h_top, h_bottom)| {
+                            let h_near = h_top as f32 * trim_scale;
+                            let h_len = ((h_bottom - h_top) as f32 * trim_scale).max(1.0);
+                            let band = div()
+                                .absolute()
+                                .border_1()
+                                .border_color(theme::primary_fg());
+                            let band = if horizontal {
+                                band.left(px(h_near)).top(px(0.)).w(px(h_len)).h(px(dh))
+                            } else {
+                                band.left(px(0.)).top(px(h_near)).w(px(dw)).h(px(h_len))
+                            };
+                            el.child(band)
                         }),
                 )
                 .into_any_element()

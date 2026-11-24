@@ -70,10 +70,6 @@ pub struct GroupEdit {
     pub preparing: bool,
     /// Identifies this session so a compose finishing after a cancel is ignored.
     epoch: u64,
-    /// Identifies the finish pass of this session, independent of the backdrop
-    /// `epoch`. Captured by the async finish so a result from an older session
-    /// can still be written back when a new session opened before it returned.
-    edit_epoch: u64,
     pub mask_cache: MaskCache,
     pub mosaic_cache: MosaicCache,
     toolbar: Option<WindowHandle<PinToolbar>>,
@@ -105,9 +101,6 @@ thread_local! {
 }
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
-/// Separate counter: a session's finish pass outlives its backdrop compose,
-/// so the two epochs must not be confused even though both use a `u64`.
-static NEXT_EDIT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub fn edit_for_group(group: u64) -> Option<Rc<RefCell<GroupEdit>>> {
     EDITS.with(|slot| slot.borrow().get(&group).cloned())
@@ -144,7 +137,6 @@ pub(crate) fn start(cx: &mut App, group: u64, tiles: &[TileSnapshot]) {
         })
         .collect();
     let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
-    let edit_epoch = NEXT_EDIT_EPOCH.fetch_add(1, Ordering::Relaxed);
     let edit = Rc::new(RefCell::new(GroupEdit {
         session: Session::new(),
         text: None,
@@ -156,7 +148,6 @@ pub(crate) fn start(cx: &mut App, group: u64, tiles: &[TileSnapshot]) {
         backdrop: Vec::new(),
         preparing: true,
         epoch,
-        edit_epoch,
         mask_cache: RefCell::new(None),
         mosaic_cache: RefCell::new(None),
         toolbar: None,
@@ -267,10 +258,6 @@ pub(crate) fn finish_async(cx: &mut App, group: u64, commit: bool, tiles: Vec<Ti
     let Some(edit) = EDITS.with(|slot| slot.borrow_mut().remove(&group)) else {
         return;
     };
-    // Remember which session this finish belongs to: if another session is
-    // opened before the worker returns, its epoch differs and our pixels must
-    // still reach the tile views (the new flatten builds on top of them).
-    let edit_epoch = edit.borrow().edit_epoch;
     let elements = {
         let mut e = edit.borrow_mut();
         if let Some(toolbar) = e.toolbar.take() {
@@ -284,32 +271,23 @@ pub(crate) fn finish_async(cx: &mut App, group: u64, commit: bool, tiles: Vec<Ti
         return;
     }
 
+    // 登记在途完成：同一 group 的后续完成必须等这次写回真正落到 view 上，
+    // 否则它抓到的 tiles 不含本次标注，两笔标注会互相覆盖。
+    pin::begin_finish(group);
     let task = cx
         .background_executor()
         .spawn(async move { flatten(&elements, &tiles) });
     cx.spawn(async move |cx: &mut AsyncApp| {
         let applied = task.await;
         cx.update(|cx: &mut App| {
-            // Only the *same* session may block this write-back (a duplicate
-            // finish). A newer session has taken over the group, but it will
-            // flatten from the tiles we are about to install, so skipping our
-            // pixels here silently lost the first annotation.
-            let current = EDITS.with(|slot| slot.borrow().get(&group).cloned());
-            if let Some(current) = current {
-                if current.borrow().edit_epoch == edit_epoch {
-                    return;
-                }
-            }
-            for (id, px, w, h, zoom) in applied {
-                if let Some(handle) = pin::entry_handle(id) {
-                    let _ = handle.update(cx, |view, _, cx| {
-                        view.replace_pixels(px, w, h, zoom);
-                        cx.notify();
-                    });
-                }
-            }
+            // 先入队再按序冲刷：写回顺序跟着完成顺序走，而不是让最后返回的
+            // 后台任务覆盖先返回的那笔。snapshots() 也会先冲刷同一队列。
+            pin::enqueue_pending_writes(group, applied);
+            pin::flush_pending_writes(cx, group);
             pin::refresh_group(cx, group);
         });
+        // 即使 UI 已关闭、cx.update 失败，也必须解除在途标记。
+        pin::end_finish(group);
     })
     .detach();
 }
@@ -516,8 +494,9 @@ impl PinToolbar {
         }
         match id {
             toolbar::COMPLETE | toolbar::CANCEL => {
-                let tiles = pin::snapshots(cx, self.group, None);
-                finish(cx, self.group, id == toolbar::COMPLETE, tiles);
+                // 走与画布上回车同一条异步路径：先等同一 group 上一次 flatten
+                // 写回完成再抓 tiles，避免快速重开时两笔标注互相覆盖。
+                pin::finish_edit_deferred(cx, self.group, id == toolbar::COMPLETE);
                 window.remove_window();
             }
             _ => {}
@@ -791,7 +770,6 @@ mod tests {
             backdrop: Vec::new(),
             preparing: false,
             epoch: 0,
-            edit_epoch: 0,
             mask_cache: RefCell::new(None),
             mosaic_cache: RefCell::new(None),
             toolbar: None,

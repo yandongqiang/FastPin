@@ -488,8 +488,12 @@ pub struct SettingsView {
     baseline: Settings,
     /// 仅全局重置时置位：默认配置可能恰好等于开窗基线，此时逐字段差异无法
     /// 区分「重置」与「没碰过」，必须强制整份采用快照让重置落盘。单页重置
-    /// 改为只把本页字段的基线前移到重置前的值，不置这个全局开关。
+    /// 改用 `force_page`，不置这个全局开关。
     force_snapshot: bool,
+    /// 单页重置时置为本页：`settings_persist_merge` 常规合并完成后，把本页
+    /// 字段无条件采用快照值。重置前的值恰好等于默认值时差异判断会失效，靠
+    /// 此强制让重置真正落盘；只覆盖本页字段，不回滚其它窗口的共享值。
+    force_page: Option<Page>,
     /// 外观下拉的全部选项（gpui-kit registry 里的主题名，默认两项在前），开窗时取样一次。
     theme_options: Vec<(String, String)>,
     status: SharedString,
@@ -981,6 +985,7 @@ impl SettingsView {
             baseline: settings.clone(),
             settings,
             force_snapshot: false,
+            force_page: None,
             theme_options,
             status: SharedString::default(),
             status_error: false,
@@ -1094,13 +1099,15 @@ impl SettingsView {
             &self.settings,
             &self.baseline,
             self.force_snapshot,
+            self.force_page,
         );
         let saved = match crate::config::save(&merged) {
             Ok(()) => {
                 // 保存成功才前移基线并撤销重置强制：失败时保留现场，下次
-                // 重试仍应把重置的默认值写下去。
+                // 重试仍应把重置的默认值写下去。force_page 同样只在成功时清除。
                 self.baseline = self.settings.clone();
                 self.force_snapshot = false;
+                self.force_page = None;
                 self.status = SharedString::default();
                 self.status_error = false;
                 true
@@ -1274,14 +1281,16 @@ impl SettingsView {
                 self.reapply_hotkeys();
             }
             // 不能置全局 force：那会让 collage / pdf / export / appearance /
-            // split 整份取开窗快照，回滚其它窗口共享的最新值。只把本页字段的
-            // 基线改成重置前的值，使快照（默认值）与之产生差异，keep_edited
-            // 自然采用快照；其它页的字段仍保留 latest。
+            // split 整份取开窗快照，回滚其它窗口共享的最新值。这里把本页字段
+            // 的基线改成重置前的值，并置本页强制：常规合并后由 force_page_fields
+            // 无条件采用本页快照，即使「重置前值 == 默认值」差异判断失效也能落盘。
             model::copy_page_fields(&mut self.baseline, &before_reset, self.page);
+            self.force_page = Some(self.page);
             let saved = self.persist(cx);
             if !saved {
                 // persist 已写入「设置保存失败」且未前移基线；撤销刚才的本页
                 // 标记，下次重试仍按原始基线判断，也不显示「已重置」成功提示。
+                // force_page 故意保留，下次保存仍会把本页重置值写下去。
                 self.baseline = baseline_before;
             }
             if self.page == Page::Resources {
@@ -1310,8 +1319,10 @@ impl SettingsView {
         self.reapply_hotkeys();
         self.confirm_reset_all = false;
         // 全局重置包含 split 等由其它窗口写入的字段，必须整份落盘（这里全局
-        // force 是语义所需，与单页重置不同）。
+        // force 是语义所需，与单页重置不同）。清掉可能残留的单页强制，语义
+        // 已由 force_snapshot 完整覆盖。
         self.force_snapshot = true;
+        self.force_page = None;
         let saved = self.persist(cx);
         // 全局重置也会清掉 OCR 模型目录，刷新状态页快照并让旧引擎立即失效。
         crate::ocr::invalidate_engine();
@@ -2261,7 +2272,12 @@ impl SettingsView {
         }
         self.persist(cx);
         self.reapply_hotkeys();
-        if self.status.is_empty() {
+        // fallback 模式（LL hook 装不上）下 RegisterHotKey 可能被别的程序占用：
+        // 旧代码丢弃 Result 仍提示绑定成功。这里把真实失败显示出来；LL 模式
+        // 没有走 RegisterHotKey，查询为 None，文案不变。
+        if let Some(detail) = hotkey::take_fallback_register_failure() {
+            self.fail(format!("热键被其它程序占用，未生效：{detail}"));
+        } else if self.status.is_empty() {
             self.ok(format!("已设为 {text}"));
         }
         cx.notify();
@@ -5072,8 +5088,8 @@ impl SettingsView {
 
 /// 共享字段的逐字段合并：本页改过（快照与上次落盘基线不同）才用快照值，
 /// 没改过的一律保留其它窗口写入的最新值。`force` 仅供全局重置使用——默认值
-/// 可能恰好等于基线，此时不看差异也必须整份采用快照。单页重置改为只把本页
-/// 字段的基线前移到重置前的值，仍走差异判断，不置全局 force。
+/// 可能恰好等于基线，此时不看差异也必须整份采用快照。单页重置不置全局 force，
+/// 由 `force_page` 在常规合并后强制本页字段采用快照。
 fn keep_edited<T: PartialEq + Clone>(dst: &mut T, snapshot: &T, baseline: &T, force: bool) {
     if force || snapshot != baseline {
         *dst = snapshot.clone();
@@ -5087,12 +5103,14 @@ fn keep_edited<T: PartialEq + Clone>(dst: &mut T, snapshot: &T, baseline: &T, fo
 /// appearance 同时被拼图窗口、切图窗口和主题回写修改：`baseline` 是上次本页
 /// 落盘时的值，逐字段比较即可知道本页是否改过，没改过的字段保留 latest，
 /// 不再被陈旧快照整体回滚。split 本页没有控件，只有全局重置才会改，因此仅
-/// 在 `force` 时取快照。
+/// 在 `force` 时取快照。`force_page` 用于单页重置：常规合并完成后把该页字段
+/// 无条件覆盖为快照值，解决「重置前值 == 默认值」时差异判断失效的问题。
 fn settings_persist_merge(
     latest: &Settings,
     snapshot: &Settings,
     baseline: &Settings,
     force: bool,
+    force_page: Option<Page>,
 ) -> Settings {
     let mut merged = latest.clone();
     merged.ocr = snapshot.ocr.clone();
@@ -5289,6 +5307,11 @@ fn settings_persist_merge(
         &baseline.appearance,
         force,
     );
+    // 单页重置：默认值可能恰好等于基线，差异判断识别不出「已重置」，常规
+    // 合并后无条件采用本页快照。只覆盖该页字段，其它页 / 窗口不受影响。
+    if let Some(page) = force_page {
+        model::force_page_fields(&mut merged, snapshot, page);
+    }
     merged
 }
 
@@ -5438,7 +5461,7 @@ mod tests {
         snapshot.screenshot.watermark.text = "机密".into();
         snapshot.hotkeys.region = "Ctrl+Shift+1".into();
 
-        let merged = settings_persist_merge(&latest, &snapshot, &baseline, false);
+        let merged = settings_persist_merge(&latest, &snapshot, &baseline, false, None);
         // 本页改过的字段：用快照值，控件才能真正落盘。
         assert_eq!(merged.screenshot.collage.spacing, 11);
         assert_eq!(
@@ -5462,7 +5485,7 @@ mod tests {
         assert_eq!(merged.hotkeys.region, "Ctrl+Shift+1");
 
         // 重置：默认值可能恰好等于基线，也必须整份采用快照，否则重置不落盘。
-        let reset = settings_persist_merge(&latest, &baseline, &baseline, true);
+        let reset = settings_persist_merge(&latest, &baseline, &baseline, true, None);
         assert_eq!(reset.screenshot.collage.spacing, 0);
         assert_eq!(reset.screenshot.collage.border, 0);
         assert_eq!(
@@ -5553,7 +5576,8 @@ mod tests {
         let baseline = Settings::default();
         let mut snapshot = baseline.clone();
         non_default_exclusive(&mut snapshot);
-        let merged = settings_persist_merge(&Settings::default(), &snapshot, &baseline, false);
+        let merged =
+            settings_persist_merge(&Settings::default(), &snapshot, &baseline, false, None);
         assert_eq!(
             merged.screenshot.capture_mode,
             crate::config::CaptureMode::Dxgi
@@ -5564,10 +5588,10 @@ mod tests {
         // 重置：快照已回默认，latest 里还留着非默认值也必须写回默认。
         let mut stale = Settings::default();
         non_default_exclusive(&mut stale);
-        let reset = settings_persist_merge(&stale, &baseline, &baseline, false);
+        let reset = settings_persist_merge(&stale, &baseline, &baseline, false, None);
         assert_exclusive(&reset, &baseline);
         // force=true（全局重置）同理。
-        let forced = settings_persist_merge(&stale, &baseline, &baseline, true);
+        let forced = settings_persist_merge(&stale, &baseline, &baseline, true, None);
         assert_exclusive(&forced, &baseline);
     }
 
@@ -5588,7 +5612,7 @@ mod tests {
         assert!(model::reset_page(&mut snapshot, Page::Data));
         let mut adjusted = baseline.clone();
         model::copy_page_fields(&mut adjusted, &baseline, Page::Data);
-        let merged = settings_persist_merge(&latest, &snapshot, &adjusted, false);
+        let merged = settings_persist_merge(&latest, &snapshot, &adjusted, false, None);
         assert_eq!(merged.screenshot.collage.spacing, 5);
         assert_eq!(merged.screenshot.pdf.image_quality, 77);
         assert_eq!(merged.screenshot.export.quality, 88);
@@ -5621,9 +5645,50 @@ mod tests {
         let mut latest = before.clone();
         latest.screenshot.collage.spacing = 5; // 其它窗口也写过，但本页重置优先
         latest.appearance = "Tokyo Moon".into(); // 主题回写
-        let merged = settings_persist_merge(&latest, &snapshot, &adjusted, false);
+        let merged = settings_persist_merge(&latest, &snapshot, &adjusted, false, None);
         assert_eq!(merged.screenshot.collage.spacing, 0, "本页重置值必须落盘");
         assert_eq!(merged.appearance, "Tokyo Moon", "其它页字段保留 latest");
+    }
+
+    /// 回归：开窗时 spacing 恰好就是默认值 0，拼图窗口改成 5，点「重置输出页」
+    /// 必须把 0 真正写盘。旧逻辑靠基线差异判断，此时 diff 为空而保留 latest=5，
+    /// 用户看到「已重置」但配置没变。force_page 只强制本页，不动其它页。
+    #[test]
+    fn page_reset_before_value_equals_default_still_lands() {
+        let snapshot = Settings::default(); // 开窗快照：spacing=0（默认值）
+        let baseline = snapshot.clone();
+        // 开窗后其它窗口写入的新值。
+        let mut latest = snapshot.clone();
+        latest.screenshot.collage.spacing = 5;
+        latest.screenshot.pdf.image_quality = 77;
+        latest.screenshot.export.quality = 88;
+        latest.appearance = "Tokyo Moon".into();
+        latest.screenshot.split.count = 9;
+
+        // 普通保存（force_page=None）：本页没编辑，仍保留 latest。
+        let normal = settings_persist_merge(&latest, &snapshot, &baseline, false, None);
+        assert_eq!(normal.screenshot.collage.spacing, 5);
+
+        let defaults = Settings::default();
+        let merged =
+            settings_persist_merge(&latest, &snapshot, &baseline, false, Some(Page::Output));
+        assert_eq!(
+            merged.screenshot.collage.spacing, 0,
+            "重置前是默认值也必须落盘"
+        );
+        assert_eq!(
+            merged.screenshot.pdf.image_quality, defaults.screenshot.pdf.image_quality,
+            "输出页字段随重置一起回默认"
+        );
+        assert_eq!(
+            merged.screenshot.export.quality, defaults.screenshot.export.quality,
+            "输出页字段随重置一起回默认"
+        );
+        assert_eq!(
+            merged.appearance, "Tokyo Moon",
+            "外观属于其它页，保留 latest"
+        );
+        assert_eq!(merged.screenshot.split.count, 9, "切图字段保留 latest");
     }
 
     /// 基线前移后，「把值改回默认值」也必须与基线产生差异，才能跨两次
@@ -5634,14 +5699,14 @@ mod tests {
         let mut snapshot = baseline.clone();
         snapshot.screenshot.collage.spacing = 5;
         let mut latest = Settings::default();
-        let first = settings_persist_merge(&latest, &snapshot, &baseline, false);
+        let first = settings_persist_merge(&latest, &snapshot, &baseline, false, None);
         assert_eq!(first.screenshot.collage.spacing, 5);
 
         // 第一次保存成功后基线前移为快照；本页再把 spacing 改回默认 0。
         let advanced = snapshot;
         let snapshot2 = Settings::default();
         latest.screenshot.collage.spacing = 5;
-        let second = settings_persist_merge(&latest, &snapshot2, &advanced, false);
+        let second = settings_persist_merge(&latest, &snapshot2, &advanced, false, None);
         assert_eq!(second.screenshot.collage.spacing, 0);
     }
 
@@ -5671,6 +5736,10 @@ mod tests {
             "单页重置不得整份 force"
         );
         assert!(
+            page.contains("self.force_page = Some(self.page)"),
+            "单页重置必须置本页强制"
+        );
+        assert!(
             all.contains("force_snapshot = true"),
             "全局重置仍整份 force"
         );
@@ -5685,6 +5754,36 @@ mod tests {
         assert!(
             body.find("self.force_snapshot = false").unwrap() > body.find("Ok(()) =>").unwrap(),
             "失败分支不得清除 force_snapshot"
+        );
+        assert!(
+            body.find("self.force_page = None").unwrap() > body.find("Ok(()) =>").unwrap(),
+            "失败分支不得清除 force_page，供下次重试"
+        );
+    }
+
+    /// Win32 注册本身无法纯单测，至少确认录制成功路径会查询并展示 fallback
+    /// 注册失败，而不是无条件显示「已设为 X」。LL 模式查询为 None，文案不变。
+    #[test]
+    fn hotkey_recording_reports_fallback_register_failure() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("fn hotkey_recorded(")
+            .expect("hotkey_recorded is defined");
+        let end = source
+            .find("fn set_autostart(")
+            .expect("set_autostart follows hotkey_recorded");
+        let body = &source[start..end];
+        assert!(
+            body.contains("take_fallback_register_failure()"),
+            "必须读取 fallback 注册失败"
+        );
+        assert!(
+            body.contains("热键被其它程序占用"),
+            "失败时不得仍提示已设为 X"
+        );
+        assert!(
+            body.find("take_fallback_register_failure()").unwrap() < body.find("已设为").unwrap(),
+            "先判断失败，再给出成功文案"
         );
     }
 

@@ -190,6 +190,19 @@ pub(crate) fn progress_percent(received: u64, total: Option<u64>) -> Option<u32>
     Some((received.saturating_mul(100) / total).min(100) as u32)
 }
 
+/// 仅在服务端给出了 Content-Length 时校验完整性；分块传输（total 为 None）
+/// 不校验，避免误判。调用方据此把截断的安装包当失败处理并删除临时文件。
+fn ensure_complete(received: u64, total: Option<u64>) -> Result<()> {
+    if let Some(expected) = total {
+        if received != expected {
+            return Err(Error::new(format!(
+                "下载不完整：期望 {expected} 字节，实际 {received} 字节"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Read the response body in chunks, writing straight to `path` and reporting
 /// every chunk. Unlike [`read_response`] this never buffers the whole asset in
 /// memory. Shared with `update::download_release_asset`.
@@ -233,6 +246,9 @@ pub(crate) fn stream_body_to_file(
         on_progress(DownloadProgress { received, total });
     }
     file.flush()?;
+    // 有 Content-Length 却提前结束（连接被截断）时不能报成功，否则
+    // 设置页会把半截安装包当成下载完成交付给用户。
+    ensure_complete(received, total)?;
     Ok(())
 }
 
@@ -286,5 +302,25 @@ mod tests {
         let short = redact_api_message(&long);
         assert!(short.chars().count() <= 301);
         assert!(short.ends_with('…'));
+    }
+
+    #[test]
+    fn download_completeness_only_checked_when_total_known() {
+        assert!(ensure_complete(100, Some(100)).is_ok());
+        // 分块传输没有 Content-Length：不管收到多少都不误判。
+        assert!(ensure_complete(100, None).is_ok());
+        assert!(ensure_complete(0, None).is_ok());
+
+        let short = ensure_complete(90, Some(100)).unwrap_err();
+        let msg = short.to_string();
+        assert!(msg.contains("下载不完整"), "{msg}");
+        assert!(msg.contains("100"), "{msg}");
+        assert!(msg.contains("90"), "{msg}");
+
+        // 收到比声明的更多同样视为异常。
+        assert!(ensure_complete(110, Some(100))
+            .unwrap_err()
+            .to_string()
+            .contains("下载不完整"));
     }
 }

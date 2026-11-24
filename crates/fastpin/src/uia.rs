@@ -18,7 +18,7 @@
 //! hover are dropped instead of being painted after the cursor moved.
 
 use std::cell::RefCell;
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -31,6 +31,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
 };
+use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, MSG, PM_REMOVE};
 
 /// Bounds the tree walk so a pathological accessibility tree cannot stall the
 /// picker. UIA calls cross COM, so each visit has a real cost.
@@ -40,6 +41,10 @@ const MAX_VISITS: usize = 96;
 const MIN_EXTENT: i32 = 6;
 /// UI 侧等待一次 UIA 查询的上限；超时即丢弃结果，UI 线程从不为 COM 阻塞。
 pub const UIA_QUERY_TIMEOUT: Duration = Duration::from_millis(200);
+/// STA 空闲时每轮等待请求的时长。远小于上面的查询超时，不会拖慢超时判定。
+const WORKER_IDLE_TICK: Duration = Duration::from_millis(50);
+/// 单轮最多派发的消息数，避免消息洪泛把 worker 永久占住。
+const MAX_MESSAGES_PER_TICK: usize = 16;
 
 thread_local! {
     // COM interfaces are apartment-bound, so a thread-local cache is the only
@@ -74,6 +79,17 @@ pub struct ElementRect {
 pub struct UiaReply {
     pub epoch: u64,
     pub rects: Vec<ElementRect>,
+}
+
+/// 异步查询句柄：`rx` 是回执通道，`failed_fast` 表示请求根本没能入队
+/// （工作线程队列满 / 已退出）。
+///
+/// 过去 `try_send` 失败会连 `reply_tx` 一起丢弃，UI 侧只看到一个立即断开的
+/// receiver，既不算超时也不触发熔断，卡死的 provider 会让每个鼠标像素都白发
+/// 请求。显式带出这个状态后，UI 侧可以把"入队失败"当成一次超时计数。
+pub struct UiaQuery {
+    pub rx: Receiver<UiaReply>,
+    pub failed_fast: bool,
 }
 
 /// 投递给 STA 工作线程的请求。
@@ -115,23 +131,47 @@ fn run_worker(rx: Receiver<UiaRequest>) {
     if sta.is_err() {
         return;
     }
-    while let Ok(req) = rx.recv() {
-        let window = HWND(req.window as *mut core::ffi::c_void);
-        let rects = elements_at_point(window, req.pt);
-        let _ = req.reply.try_send(UiaReply {
-            epoch: req.epoch,
-            rects,
-        });
+    loop {
+        // 不用阻塞式 recv：空闲时每 50ms 醒一次抽消息。依赖消息泵投递回调的
+        // provider 因此不会把 worker 卡死（STA 里没有消息循环是常见死锁源）。
+        match rx.recv_timeout(WORKER_IDLE_TICK) {
+            Ok(req) => {
+                let window = HWND(req.window as *mut core::ffi::c_void);
+                let rects = elements_at_point(window, req.pt);
+                let _ = req.reply.try_send(UiaReply {
+                    epoch: req.epoch,
+                    rects,
+                });
+            }
+            Err(RecvTimeoutError::Timeout) => pump_messages(),
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
+    // 投递端被丢弃（线程退出 / worker 重建）时走这里，STA 正常释放。
     unsafe { CoUninitialize() };
 }
 
-/// 在专用 STA 工作线程上查询 UIA 子.element，立即返回，绝不等待 COM。
+/// 非阻塞地抽掉 STA 消息队列里的 COM 回调 / 跨 apartment 调用。
+/// 限批次，既不占死 worker，也不引入同步 COM 等待。
+fn pump_messages() {
+    unsafe {
+        let mut msg = MSG::default();
+        for _ in 0..MAX_MESSAGES_PER_TICK {
+            if !PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                break;
+            }
+            let _ = DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// 在专用 STA 工作线程上查询 UIA 子元素，立即返回，绝不等待 COM。
 ///
-/// 返回的 receiver 恰好会收到一条 `UiaReply`（带 `epoch`）；调用方只应接受
-/// 与当前 epoch 相同的回执，过期的一律丢弃。任何失败都返回一个已断开的
-/// receiver，调用方按“无 UIA 候选”处理即可。
-pub fn elements_at_point_async(window: HWND, pt: POINT, epoch: u64) -> Receiver<UiaReply> {
+/// 成功入队时 `rx` 至多收到一条 `UiaReply`（带 `epoch`）；调用方只应接受与
+/// 当前 epoch 相同的回执，过期的一律丢弃。队列满 / 工作线程已退出时返回
+/// `failed_fast: true`，调用方要把它计为一次超时以驱动熔断，而不是静默当成
+/// “无 UIA 候选”——那是卡死 provider 下熔断永不触发的根因。
+pub fn elements_at_point_async(window: HWND, pt: POINT, epoch: u64) -> UiaQuery {
     let raw = window.0 as isize;
     let mut attempt = 0;
     loop {
@@ -143,14 +183,32 @@ pub fn elements_at_point_async(window: HWND, pt: POINT, epoch: u64) -> Receiver<
             reply: reply_tx,
         };
         let Some(tx) = worker_tx() else {
-            return reply_rx;
+            return UiaQuery {
+                rx: reply_rx,
+                failed_fast: true,
+            };
         };
         match tx.try_send(request) {
-            // 投递成功，或工作线程正忙（队列已满）：都不等待，直接返回。
-            Ok(()) | Err(TrySendError::Full(_)) => return reply_rx,
+            Ok(()) => {
+                return UiaQuery {
+                    rx: reply_rx,
+                    failed_fast: false,
+                }
+            }
+            // 队列满意味着 worker 已被前序请求占住。这里绝不等待，也不静默
+            // 丢请求；把失败状态显式交给 UI 侧计入超时/熔断。
+            Err(TrySendError::Full(_)) => {
+                return UiaQuery {
+                    rx: reply_rx,
+                    failed_fast: true,
+                }
+            }
             Err(TrySendError::Disconnected(_)) => {
                 if attempt >= 1 {
-                    return reply_rx;
+                    return UiaQuery {
+                        rx: reply_rx,
+                        failed_fast: true,
+                    };
                 }
                 // 工作线程意外退出：清掉缓存，下一轮重新拉起一个 STA。
                 attempt += 1;

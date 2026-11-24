@@ -40,21 +40,84 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// True when `latest` sorts after `current`. Component-wise numeric compare
-/// over dotted versions; a `v` prefix and `-beta` suffixes are ignored, which
-/// matches how release tags are written.
+/// True when `latest` sorts after `current`. SemVer 风格比较：先逐段比较
+/// 数字主版本（支持三/四段，缺失段按 0 补齐），主版本相同则正式版新于
+/// 预发布版，两边都是预发布时按 `.` 分段、数字段小于字符串段逐段比较。
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    fn parts(v: &str) -> [u64; 3] {
-        let mut out = [0u64; 3];
-        for (slot, piece) in out
-            .iter_mut()
-            .zip(v.trim_start_matches(['v', 'V']).split(['.', '-', '+']))
-        {
-            *slot = piece.parse().unwrap_or(0);
-        }
-        out
+    compare_versions(latest, current) == std::cmp::Ordering::Greater
+}
+
+struct ParsedVersion {
+    core: Vec<u64>,
+    pre: Option<String>,
+}
+
+impl ParsedVersion {
+    fn parse(v: &str) -> Self {
+        let v = v.trim().trim_start_matches(['v', 'V']);
+        // `+` 之后是构建元数据，semver 中不参与优先级比较。
+        let core_and_pre = v.split_once('+').map_or(v, |(left, _)| left);
+        // `-` 之后是预发布标识；没有 `-` 就是正式版。
+        let (core, pre) = match core_and_pre.split_once('-') {
+            Some((core, pre)) => (core, Some(pre.to_string())),
+            None => (core_and_pre, None),
+        };
+        let core = core
+            .split('.')
+            .map(|piece| piece.parse::<u64>().unwrap_or(0))
+            .collect();
+        Self { core, pre }
     }
-    parts(latest) > parts(current)
+}
+
+fn compare_versions(latest: &str, current: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering as Cmp;
+    let latest = ParsedVersion::parse(latest);
+    let current = ParsedVersion::parse(current);
+
+    // 逐段比较；段数不同时短的补 0，所以 0.3.0.1 > 0.3.0。
+    let segments = latest.core.len().max(current.core.len());
+    for i in 0..segments {
+        let a = latest.core.get(i).copied().unwrap_or(0);
+        let b = current.core.get(i).copied().unwrap_or(0);
+        if a != b {
+            return a.cmp(&b);
+        }
+    }
+
+    // 主版本相同：正式版 > 预发布版（0.3.0 > 0.3.0-beta.2）。
+    match (&latest.pre, &current.pre) {
+        (None, None) => Cmp::Equal,
+        (None, Some(_)) => Cmp::Greater,
+        (Some(_), None) => Cmp::Less,
+        (Some(a), Some(b)) => compare_prerelease(a, b),
+    }
+}
+
+/// 预发布比较：按 `.` 分段，数字段按数值比且小于非数字段，
+/// 非数字段按字典序比；前缀都相同则段数多者更新。
+fn compare_prerelease(latest: &str, current: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering as Cmp;
+    let mut a = latest.split('.');
+    let mut b = current.split('.');
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return Cmp::Equal,
+            (None, Some(_)) => return Cmp::Less,
+            (Some(_), None) => return Cmp::Greater,
+            (Some(x), Some(y)) => {
+                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(x), Ok(y)) => x.cmp(&y),
+                    (Ok(_), Err(_)) => Cmp::Less,
+                    (Err(_), Ok(_)) => Cmp::Greater,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if ord != Cmp::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
 }
 
 /// Blocking. Call it off the UI thread.
@@ -607,6 +670,23 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("v0.1.0", "0.1"));
         assert!(!is_newer("0.1.0-beta", "0.1.0"));
+    }
+
+    #[test]
+    fn version_compare_handles_prerelease_and_fourth_segment() {
+        // 常规升级必须正确提示。
+        assert!(is_newer("0.3.1", "0.3.0"));
+        assert!(is_newer("v0.3.1", "0.3.0"));
+        // 预发布版旧于对应正式版，不会反复提示更新。
+        assert!(!is_newer("0.3.0-beta.2", "0.3.0"));
+        assert!(!is_newer("0.3.0-alpha", "0.3.0-beta.2"));
+        // 同为预发布时按数字标识比较。
+        assert!(is_newer("0.3.0-beta.2", "0.3.0-beta.1"));
+        // 第四段参与比较，缺失段按 0 补齐。
+        assert!(is_newer("0.3.0.1", "0.3.0"));
+        assert!(!is_newer("0.3.0", "0.3.0.1"));
+        // 构建元数据不影响版本先后。
+        assert!(!is_newer("0.3.0+build.5", "0.3.0"));
     }
 
     #[test]

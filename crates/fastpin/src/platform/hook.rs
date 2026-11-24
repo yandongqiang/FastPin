@@ -42,6 +42,9 @@ pub fn hook_target() -> HWND {
 /// because gpui produces no keystroke at all for PrtSc, so the recorder needs
 /// raw virtual keys of its own.
 pub fn start_recording() {
+    // 新的录制会话丢弃此前（例如启动时紧急退出热键）的注册失败，避免把旧的
+    // 占用误报成这次录制的结果。
+    crate::hotkey::clear_fallback_register_failure();
     // Clicking a second hotkey field while one is already recording must not
     // strand the first hook: overwriting RECORD_HOOK would leak the handle and
     // leave two recorders swallowing the same keys.
@@ -267,16 +270,26 @@ pub fn action_from_wparam(wp: usize) -> Option<HotkeyAction> {
     }
 }
 
+/// RegisterHotKey 的失败不再被 `let _ =` 丢掉：记到 hotkey 模块，设置页录制
+/// 完成后取走并显示明确错误。
+fn record_register_result(name: &str, result: windows::core::Result<()>) {
+    if let Err(e) = result {
+        crate::hotkey::note_fallback_register_failure(&format!("{name}（{e}）"));
+    }
+}
+
 /// Desktop fallback if the LL hook cannot be installed.
 pub fn register_fallback_hotkeys(hwnd: HWND, bindings: &HotkeyBindings) {
+    // 每次（重）注册都从干净状态开始：只有本次的失败才该显示给用户。
+    crate::hotkey::clear_fallback_register_failure();
     unsafe {
         let _ = UnregisterHotKey(Some(hwnd), 1);
         let _ = UnregisterHotKey(Some(hwnd), 2);
         let _ = UnregisterHotKey(Some(hwnd), 3);
-        let _ = register_one(hwnd, 1, bindings.region);
-        let _ = register_one(hwnd, 2, bindings.copy_only);
-        let _ = register_one(hwnd, 3, bindings.fullscreen);
     }
+    record_register_result("区域截图", register_one(hwnd, 1, bindings.region));
+    record_register_result("仅复制", register_one(hwnd, 2, bindings.copy_only));
+    record_register_result("全屏截图", register_one(hwnd, 3, bindings.fullscreen));
 }
 
 fn register_one(hwnd: HWND, id: i32, hotkey: Hotkey) -> windows::core::Result<()> {
@@ -308,7 +321,11 @@ fn register_one(hwnd: HWND, id: i32, hotkey: Hotkey) -> windows::core::Result<()
 pub fn register_emergency_quit(hwnd: HWND) {
     const VK_Q: u32 = 0x51;
     let mods = MOD_CONTROL | MOD_ALT | HOT_KEY_MODIFIERS(0x0004) | MOD_NOREPEAT;
-    let ok = unsafe { RegisterHotKey(Some(hwnd), EMERGENCY_QUIT_ID, mods, VK_Q) }.is_ok();
+    let result = unsafe { RegisterHotKey(Some(hwnd), EMERGENCY_QUIT_ID, mods, VK_Q) };
+    let ok = result.is_ok();
+    if let Err(e) = result {
+        crate::hotkey::note_fallback_register_failure(&format!("紧急退出热键（{e}）"));
+    }
     crate::perf::log_app(&format!(
         "emergency quit hotkey Ctrl+Alt+Shift+Q registered={ok}"
     ));

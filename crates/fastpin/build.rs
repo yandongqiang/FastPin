@@ -28,9 +28,11 @@ fn generate_included_themes() {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
-                path.extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
             })
             .collect(),
         Err(e) => {

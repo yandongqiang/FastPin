@@ -21,8 +21,15 @@ impl From<windows::core::Error> for Error {
     fn from(e: windows::core::Error) -> Self {
         // 保留 HRESULT：诊断时据此区分设备丢失 / E_INVALIDARG / 权限不足等。
         // 结构是 tuple，不能在 source() 里挂原始错误，因此把代码并入消息。
-        let code = e.code();
-        Self(format!("{} (HRESULT 0x{:08X})", e, code.0 as u32))
+        // windows-rs 的 Display 通常已经带上了 "0x…"（HRESULT），重复追加会
+        // 让文案变成 "… (0x80070057) (HRESULT 0x80070057)"，这里跳过。
+        let msg = e.to_string();
+        if msg.contains("0x") || msg.contains("HRESULT") {
+            Self(msg)
+        } else {
+            let code = e.code();
+            Self(format!("{} (HRESULT 0x{:08X})", msg, code.0 as u32))
+        }
     }
 }
 

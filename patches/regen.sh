@@ -5,7 +5,7 @@ set -euo pipefail
 regen() {
     local NAME=$1 PRISTINE=$2 VENDORED=$3
     local PRISTINE_DIR
-    PRISTINE_DIR=$(echo "$HOME"/.cargo/registry/src/*/"$PRISTINE")
+    PRISTINE_DIR=$(find "$HOME/.cargo/registry/src" -maxdepth 2 -type d -name "$PRISTINE" -print -quit)
     if [ ! -d "$PRISTINE_DIR" ]; then
         echo "pristine $PRISTINE not in the cargo registry cache; run 'cargo fetch' first" >&2
         exit 1
@@ -26,12 +26,13 @@ regen() {
 
     rm -rf "$WORK"
     # grep -c '^+' also counts the per-file "+++"/"---" diff headers, so
-    # subtract those header lines to get the real added/removed counts.
+    # subtract only those header lines (with trailing space) to get the real
+    # added/removed counts; content lines starting with "+++" are kept.
     local ADDED REMOVED
     ADDED=$(grep -c '^+' "$OUT")
-    ADDED=$((ADDED - $(grep -c '^+++' "$OUT")))
+    ADDED=$((ADDED - $(grep -c '^+++ ' "$OUT")))
     REMOVED=$(grep -c '^-' "$OUT")
-    REMOVED=$((REMOVED - $(grep -c '^---' "$OUT")))
+    REMOVED=$((REMOVED - $(grep -c '^--- ' "$OUT")))
     echo "wrote $OUT ($ADDED added, $REMOVED removed)"
 }
 

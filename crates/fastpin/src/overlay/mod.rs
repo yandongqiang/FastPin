@@ -71,6 +71,9 @@ const UIA_TIMEOUT_TRIP: u8 = 3;
 struct UiaPending {
     rx: std::sync::mpsc::Receiver<crate::uia::UiaReply>,
     epoch: u64,
+    /// 发起查询时锁定的目标窗口。200ms 内 HWND 可能关闭并被复用，应用结果前
+    /// 必须重新确认当前 hover 窗口仍是它，否则会把吸附框画到新窗口上。
+    target: HWND,
     /// 发起查询时的屏幕坐标；只有仍是当前 hover 点时才应用结果。
     point: POINT,
     started: Instant,
@@ -1200,6 +1203,15 @@ impl OverlayView {
         self.sync_from_cap(window);
     }
 
+    /// 记一次 UIA 失败；连续 UIA_TIMEOUT_TRIP 次后熔断该窗口，之后不再投递。
+    fn note_uia_timeout(&mut self, target: HWND) {
+        self.uia_timeouts = self.uia_timeouts.saturating_add(1);
+        if self.uia_timeouts >= UIA_TIMEOUT_TRIP {
+            self.uia_blocked_hwnd = Some(target);
+            self.uia_timeouts = 0;
+        }
+    }
+
     /// 发起一次异步 UIA 查询。只有目标窗口与上次熔断的窗口不同时才重新启用。
     fn request_uia(&mut self, self_hwnd: HWND, pt: POINT) {
         if !self.smart_selection.wants_sub_elements() {
@@ -1215,28 +1227,40 @@ impl OverlayView {
             return;
         }
         self.uia_epoch = self.uia_epoch.wrapping_add(1);
-        let rx = crate::uia::elements_at_point_async(target, pt, self.uia_epoch);
+        let query = crate::uia::elements_at_point_async(target, pt, self.uia_epoch);
+        if query.failed_fast {
+            // 队列满 / worker 已退出：等价于一次超时。必须在这里就计数——
+            // 鼠标快速移动时 pending 可能下一帧就被清掉，poll 根本看不到它。
+            self.uia_pending = None;
+            self.note_uia_timeout(target);
+            return;
+        }
         self.uia_pending = Some(UiaPending {
-            rx,
+            rx: query.rx,
             epoch: self.uia_epoch,
+            target,
             point: pt,
             started: Instant::now(),
         });
     }
 
-    /// 非阻塞轮询 UIA 回执。只接受当前 epoch 的结果；超时、断开或过期的回执
-    /// 一律丢弃。连续超时达到阈值后熔断该窗口的 UIA 候选，直到 hover 移动
-    /// 到别的窗口。
+    /// 非阻塞轮询 UIA 回执。只接受当前 epoch、当前 hover 点、当前目标窗口的
+    /// 结果；超时、断开或过期的回执一律丢弃。连续失败达到阈值后熔断该窗口。
     fn poll_uia_result(&mut self, window: &Window) {
         // 把借用收进局部作用域，回调里可以自由改写 self 的字段。
         let received = {
             let Some(pending) = self.uia_pending.as_ref() else {
                 return;
             };
-            let info = (pending.epoch, pending.point, pending.started);
+            let info = (
+                pending.epoch,
+                pending.point,
+                pending.started,
+                pending.target,
+            );
             (pending.rx.try_recv(), info)
         };
-        let (recv, (epoch, point, started)) = received;
+        let (recv, (epoch, point, started, target)) = received;
         match recv {
             Ok(reply) => {
                 self.uia_pending = None;
@@ -1244,8 +1268,6 @@ impl OverlayView {
                     // 鼠标已经移动，旧结果直接丢弃。
                     return;
                 }
-                self.uia_timeouts = 0;
-                self.uia_blocked_hwnd = None;
                 // 查询时的屏幕点必须仍是当前 hover 点，否则结果属于旧位置。
                 let now = POINT {
                     x: (self.mouse.x + self.origin_x as f64) as i32,
@@ -1255,6 +1277,14 @@ impl OverlayView {
                     return;
                 }
                 let hwnd = crate::platform::hwnd_of(window);
+                // HWND 可能在 200ms 内关闭并被新窗口复用：重新确认当前 hover
+                // 窗口仍是查询目标，否则这批复选框属于别的窗口，必须丢弃。
+                // window_under_point 只走 Win32 枚举，不会触发同步 COM。
+                if window_under_point(hwnd, point) != Some(target) {
+                    return;
+                }
+                self.uia_timeouts = 0;
+                self.uia_blocked_hwnd = None;
                 let uia_rects: Vec<RECT> = reply.rects.into_iter().map(|el| el.rect).collect();
                 self.candidates = detect_candidates(
                     self.smart_selection,
@@ -1275,16 +1305,14 @@ impl OverlayView {
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if started.elapsed() > crate::uia::UIA_QUERY_TIMEOUT {
                     self.uia_pending = None;
-                    self.uia_timeouts = self.uia_timeouts.saturating_add(1);
-                    if self.uia_timeouts >= UIA_TIMEOUT_TRIP {
-                        let hwnd = crate::platform::hwnd_of(window);
-                        self.uia_blocked_hwnd = window_under_point(hwnd, point);
-                        self.uia_timeouts = 0;
-                    }
+                    self.note_uia_timeout(target);
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // 回执通道断开（worker 退出 / 请求被丢弃）也算一次失败，
+                // 过去这里只清 pending，导致熔断计数永远到不了阈值。
                 self.uia_pending = None;
+                self.note_uia_timeout(target);
             }
         }
     }

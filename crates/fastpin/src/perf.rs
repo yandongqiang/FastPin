@@ -143,6 +143,42 @@ pub fn log_crash(msg: &str) {
     append_log(Target::Crash, msg);
 }
 
+/// panic hook 专用：直接算出 `logs/crash.log` 的绝对路径，不依赖后台 writer
+/// 的 `LOG_DIR_CACHE` 是否已初始化，也不依赖 writer 线程已经启动。
+/// LOCALAPPDATA 缺失时返回 None，调用方静默降级。
+pub fn crash_log_path_sync() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|base| {
+        PathBuf::from(base)
+            .join("FastPin")
+            .join("logs")
+            .join("crash.log")
+    })
+}
+
+/// 同步把一行崩溃信息追加到 `path`：建目录、打开、写入、flush 全在调用线程
+/// 完成。`panic = "abort"` 下 hook 返回即终止，后台 writer 来不及落盘，所以
+/// 崩溃日志必须走这条同步路径。任何 I/O 失败都静默忽略，避免二次 panic。
+pub(crate) fn write_crash_line_sync(path: &Path, msg: &str) {
+    let result = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent)?;
+        }
+        let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+        f.write_all(msg.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.flush()?;
+        Ok(())
+    })();
+    let _ = result;
+}
+
+/// panic hook 入口：按默认路径同步落盘一行崩溃信息，失败静默。
+pub fn log_crash_sync(msg: &str) {
+    if let Some(path) = crash_log_path_sync() {
+        write_crash_line_sync(&path, msg);
+    }
+}
+
 /// Annotation event-chain diagnostics. Mirrors the whole "button id -> tool ->
 /// draft -> commit -> render" ladder into its own `logs/diag.log`, independent
 /// of app.log's capture/clipboard noise, with a fallback to a file next to the
@@ -341,5 +377,31 @@ mod tests {
     #[test]
     fn percentile_empty_is_zero() {
         assert_eq!(percentile(&[], 50.0), 0);
+    }
+
+    #[test]
+    fn crash_line_is_written_sync_and_readable() {
+        // 用 std 构造唯一临时目录，避免为单测新增依赖；路径可注入，
+        // 因此不必依赖 LOCALAPPDATA 或后台 writer 即可验证同步落盘。
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "fastpin-crash-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = create_dir_all(&dir);
+        let path = dir.join("crash.log");
+
+        write_crash_line_sync(&path, "panic on thread main: boom");
+        let first = std::fs::read_to_string(&path).expect("同步写入后应能立即读回");
+        assert!(first.contains("panic on thread main: boom"));
+        assert_eq!(first.bytes().filter(|b| *b == b'\n').count(), 1);
+
+        // 再次调用是追加而非覆盖，且同步可见。
+        write_crash_line_sync(&path, "second line");
+        let both = std::fs::read_to_string(&path).expect("追加后应能立即读回");
+        assert_eq!(both, format!("{first}second line\n"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

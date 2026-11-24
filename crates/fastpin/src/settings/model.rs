@@ -746,6 +746,17 @@ pub fn copy_page_fields(dst: &mut Settings, src: &Settings, page: Page) {
     }
 }
 
+/// 单页重置的强制落盘：把 `page` 拥有的字段无条件从 `snapshot`（重置后的值）
+/// 覆盖到 `merged`。字段范围与 `reset_page` / `copy_page_fields` 完全一致。
+///
+/// 重置前的值可能恰好等于默认值（例如 collage.spacing 开窗时就是 0），此时
+/// `keep_edited` 看不出差异，会误判成「没改过」而保留其它窗口写入的旧值。
+/// 常规合并完成后调用本函数只强制本页字段，既让重置真正写盘，又不回滚
+/// 其它页 / 其它窗口的共享值。
+pub fn force_page_fields(merged: &mut Settings, snapshot: &Settings, page: Page) {
+    copy_page_fields(merged, snapshot, page);
+}
+
 pub fn reset_all(settings: &mut Settings) {
     *settings = Settings::default();
 }
@@ -1206,6 +1217,31 @@ mod tests {
                 page.id(),
             );
         }
+    }
+
+    /// 开窗时 spacing 已经是默认值 0，差异判断看不出「重置」，force_page_fields
+    /// 必须无条件把本页字段写回快照，同时不碰其它页的字段。
+    #[test]
+    fn force_page_fields_overwrites_only_owned_fields() {
+        let mut snapshot = Settings {
+            appearance: "Catppuccin Latte".into(),
+            ..Settings::default()
+        }; // spacing=0 即开窗默认值
+        assert!(reset_page(&mut snapshot, Page::Output));
+
+        // 其它窗口在开窗后改写了 spacing / pdf / appearance。
+        let mut merged = snapshot.clone();
+        merged.screenshot.collage.spacing = 5;
+        merged.screenshot.pdf.image_quality = 77;
+        merged.appearance = "Tokyo Moon".into();
+
+        force_page_fields(&mut merged, &snapshot, Page::Output);
+        assert_eq!(merged.screenshot.collage.spacing, 0, "默认值也要强制写回");
+        assert_eq!(
+            merged.screenshot.pdf.image_quality,
+            Settings::default().screenshot.pdf.image_quality
+        );
+        assert_eq!(merged.appearance, "Tokyo Moon", "非本页字段保持不动");
     }
 
     #[test]

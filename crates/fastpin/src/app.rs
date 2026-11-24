@@ -256,6 +256,9 @@ fn attach_parent_console() {
 /// Release builds are windows-subsystem with `panic = "abort"`: without this
 /// hook a panic dies silently and the tray icon just vanishes. The message and
 /// location land in crash.log so field reports have something to attach.
+/// `panic = "abort"` means the process stops the instant this hook returns, so
+/// writing must be synchronous here — enqueuing to the background log writer
+/// would lose the message before it ever reaches disk.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let name = std::thread::current()
@@ -263,7 +266,7 @@ fn install_panic_hook() {
             .unwrap_or("<unnamed>")
             .to_string();
         let msg = format!("panic on thread {name}: {info}");
-        crate::perf::log_crash(&msg);
+        crate::perf::log_crash_sync(&msg);
         eprintln!("{msg}");
     }));
 }

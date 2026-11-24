@@ -35,9 +35,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
     IsIconic, IsWindow, IsWindowVisible, PostMessageW, SetForegroundWindow,
-    SetWindowDisplayAffinity, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_SHOWWINDOW,
-    SW_HIDE, SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WHEEL_DELTA, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SetWindowDisplayAffinity, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WHEEL_DELTA,
+    WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::capture::{crop_sdr_bgra, CapturedDesktop, Gpu, WgcLive};
@@ -246,6 +246,8 @@ pub struct OverlayView {
     /// 60fps for the marching ants, and `active_monitor_rect` is called
     /// several times per frame.
     monitor_rects: Vec<Rect>,
+    /// DPI / 显示器变化后的几何重同步任务是否已排队（避免观察点重复触发）。
+    resync_pending: bool,
     hit: SelectionHitKind,
     sel_at_press: Rect,
     start: Instant,
@@ -1092,6 +1094,7 @@ impl OverlayView {
             uia_timeouts: 0,
             uia_blocked_hwnd: None,
             monitor_rects: Vec::new(),
+            resync_pending: false,
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
             start: Instant::now(),
@@ -1164,6 +1167,7 @@ impl OverlayView {
             uia_timeouts: 0,
             uia_blocked_hwnd: None,
             monitor_rects: Vec::new(),
+            resync_pending: false,
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
             start: Instant::now(),
@@ -1194,6 +1198,7 @@ impl OverlayView {
             long_seq: 0,
         };
         view.sync_from_cap(window);
+        view.register_display_resync(cx, window);
         view
     }
 
@@ -1432,6 +1437,86 @@ impl OverlayView {
         // UIA 在后台线程查询；结果由 render 里的 poll_uia_result 应用。
         self.request_uia(hwnd, pt);
         self.hover = hit_window(&self.windows, mouse);
+    }
+
+    /// DPI 变化 / 显示器热插拔时 GPUI 只按逻辑像素重排窗口，而冻结图与
+    /// `monitor_rects` 都是物理像素。挂两个观察点：窗口 bounds 变化（含
+    /// WM_DPICHANGED 触发的 WM_SIZE/WM_MOVE）和显示器配置变化，统一走延迟
+    /// 重同步，避免在处理 WM_SIZE 期间再次 SetWindowPos 造成重入。
+    fn register_display_resync(&mut self, cx: &mut Context<Self>, window: &mut Window) {
+        cx.observe_window_bounds(window, |view, _window, cx| {
+            view.schedule_display_resync(cx);
+        })
+        .detach();
+        cx.observe_displays(|_, cx| {
+            // 全局句柄可能已指向新一轮截图；update 时自然拿到当前 view。
+            if let Some(handle) = OVERLAY_WINDOW.with(|s| *s.borrow()) {
+                let _ = handle.update(cx, |view, _window, cx| {
+                    view.schedule_display_resync(cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn schedule_display_resync(&mut self, cx: &mut Context<Self>) {
+        if self.resync_pending || !self.visible {
+            return;
+        }
+        self.resync_pending = true;
+        cx.spawn(async move |_this, cx| {
+            // 先让 GPUI 处理完本次 resize/move，再按物理坐标写回窗口位置。
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            cx.update(|cx| {
+                if let Some(handle) = OVERLAY_WINDOW.with(|s| *s.borrow()) {
+                    let _ = handle.update(cx, |view, window, cx| {
+                        view.apply_display_resync(window, cx);
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn apply_display_resync(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.resync_pending = false;
+        let (ox, oy, w, h) = match &self.cap {
+            Some(c) => (c.origin_x, c.origin_y, c.width, c.height),
+            None => return,
+        };
+        // 只刷新与物理像素绑定的几何缓存；选区 / 拖动 / UIA 状态不动，避免
+        // 用户正在框选时被重置。
+        self.monitor_rects = crate::capture::enumerate_monitors()
+            .map(|mons| {
+                mons.iter()
+                    .map(|m| {
+                        Rect::new((m.x - ox) as f64, (m.y - oy) as f64, m.w as f64, m.h as f64)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let hwnd = crate::platform::hwnd_of(window);
+        let desired = RECT {
+            left: ox,
+            top: oy,
+            right: ox + w as i32,
+            bottom: oy + h as i32,
+        };
+        let outer = window_rect_for_client_area(hwnd, desired);
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                outer.left,
+                outer.top,
+                outer.right - outer.left,
+                outer.bottom - outer.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        cx.notify();
     }
 
     fn attach_and_show(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -196,7 +196,7 @@ pub fn capture_for_action(
         overlay_luid,
         mut wgc,
     } = prepared;
-    let vd = virtual_desktop();
+    let vd = virtual_desktop(&monitors);
     let want_hdr = any_hdr;
 
     let mut used_dxgi = false;

@@ -4236,9 +4236,9 @@ impl SettingsView {
                 div().w(px(INLINE_FIELD_W)).child(self.model.clone()),
             )),
             language,
-            widgets::row("超时", "秒，5 到 300。").child(widgets::control(
-                div().w(px(120.)).child(self.timeout.clone()),
-            )),
+            widgets::row("请求超时", "秒，5 到 300。按四个阶段分摊，每段至少 2 秒。").child(
+                widgets::control(div().w(px(120.)).child(self.timeout.clone())),
+            ),
             prompt,
         ];
         // A key on a plaintext endpoint is the one case where the vault is not

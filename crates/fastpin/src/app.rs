@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{App, Application, QuitMode};
 
@@ -223,8 +223,11 @@ pub(crate) fn capture_region_live(
             ctx,
             &frame.texture,
             sdr_white,
-            (abs_x - mon_x) as u32,
-            (abs_y - mon_y) as u32,
+            // 会话开始后显示器布局若变了，mon_x/mon_y 可能与选区不再匹配；
+            // 直接 as u32 会让负值下溢成巨大尺寸，这里与 capture_region_bgra
+            // 一样钳零，绝不把负数送进裁剪。
+            (abs_x - mon_x).max(0) as u32,
+            (abs_y - mon_y).max(0) as u32,
             w,
             h,
         )?;
@@ -769,7 +772,12 @@ fn boot_resident(
         cx.background_executor()
             .timer(Duration::from_secs(60))
             .await;
-        crate::pin::drag_retention().lock().unwrap().expire();
+        // 三步走：锁内只摘快照、只按结果回填；阻塞的 remove_file / 删目录
+        // 放在锁外，避免慢盘或杀软扫描时卡住其它拖出的 reserve() / complete()。
+        let retention = crate::pin::drag_retention();
+        let targets = retention.lock().unwrap().expired_targets(Instant::now());
+        let results = crate::dragexport::Retention::finish_deletes(targets);
+        retention.lock().unwrap().apply_deletes(results);
     })
     .detach();
     Ok(())
@@ -979,7 +987,9 @@ fn take_shot(action: HotkeyAction) -> Result<ShotFlow> {
     let mut perf = PerfSession::start();
     perf.mark("T2");
     // Crash breadcrumbs: if the process dies mid-capture, app.log shows how far it got.
-    crate::perf::log_app(&format!("capture start: {action:?}"));
+    // 同步落盘：panic=abort / 强杀时后台 writer 来不及 flush 最后一批，
+    // 这条最关键的路标必须当场写完；其余高频日志仍走异步 log_app。
+    crate::perf::log_app_sync(&format!("capture start: {action:?}"));
     // Copy-only freezes the desktop like a region capture; the overlay then
     // confirms the drag straight to the clipboard. Only fullscreen skips the
     // overlay.

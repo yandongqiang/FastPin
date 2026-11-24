@@ -155,10 +155,11 @@ pub fn crash_log_path_sync() -> Option<PathBuf> {
     })
 }
 
-/// 同步把一行崩溃信息追加到 `path`：建目录、打开、写入、flush 全在调用线程
+/// 同步把一行追加到指定日志 `path`：建目录、打开、写入、flush 全在调用线程
 /// 完成。`panic = "abort"` 下 hook 返回即终止，后台 writer 来不及落盘，所以
-/// 崩溃日志必须走这条同步路径。任何 I/O 失败都静默忽略，避免二次 panic。
-pub(crate) fn write_crash_line_sync(path: &Path, msg: &str) {
+/// 崩溃前必须留下的面包屑都走这条同步路径。失败时静默返回 false（崩溃 hook
+/// 里要避免二次 panic），调用方可据此在多个候选路径间回退。
+fn write_log_line_sync(path: &Path, msg: &str) -> bool {
     let result = (|| -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             create_dir_all(parent)?;
@@ -169,13 +170,48 @@ pub(crate) fn write_crash_line_sync(path: &Path, msg: &str) {
         f.flush()?;
         Ok(())
     })();
-    let _ = result;
+    result.is_ok()
+}
+
+pub(crate) fn write_crash_line_sync(path: &Path, msg: &str) {
+    let _ = write_log_line_sync(path, msg);
 }
 
 /// panic hook 入口：按默认路径同步落盘一行崩溃信息，失败静默。
 pub fn log_crash_sync(msg: &str) {
     if let Some(path) = crash_log_path_sync() {
         write_crash_line_sync(&path, msg);
+    }
+}
+
+/// 同步版 app.log：路径直接解析，不依赖后台 writer 的缓存或线程是否已启动。
+/// 只给"崩溃前面包屑"这类极少数关键点用（如 capture start），热路径仍走
+/// 非阻塞的 `log_app`，避免每条日志都同步刷盘拖慢截图。
+pub fn log_app_sync(msg: &str) {
+    let Some(base) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let path = PathBuf::from(base)
+        .join("FastPin")
+        .join("logs")
+        .join("app.log");
+    let line = format!("{} {msg}", now_stamp());
+    let _ = write_log_line_sync(&path, &line);
+}
+
+/// 同步版 diag.log：注解链路里"崩了也要留痕"的关键节点使用，格式与回退
+/// 顺序都与异步 `log_diag` 一致（profile 优先，exe 旁兜底）。
+pub fn log_diag_sync(msg: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let line = format!("t={ts} [diag] {msg}");
+    let paths = diag_paths();
+    for p in [&paths.profile, &paths.exe_side].into_iter().flatten() {
+        if write_log_line_sync(p, &line) {
+            break;
+        }
     }
 }
 

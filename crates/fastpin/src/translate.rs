@@ -276,8 +276,9 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
         if session.0.is_null() {
             return Err(Error::new("WinHttpOpen failed"));
         }
-        // 每段上限，不是整个请求的总预算：四段叠加（且接收按块重计时）时
-        // 实际墙钟可能是配置值的数倍，详见 phase_timeout_ms。
+        // 配置值是整个请求的总预算：四段各拿约四分之一（并有 2 s 下限），
+        // 墙钟因此接近配置值；接收超时按块重计时，慢速流仍可能超出。
+        // 设置页的"请求超时"与此语义一致，详见 phase_timeout_ms。
         let ms = phase_timeout_ms(timeout_seconds);
         WinHttpSetTimeouts(session.0, ms, ms, ms, ms).map_err(|e| crate::net::winhttp_error(&e))?;
 

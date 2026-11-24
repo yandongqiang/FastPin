@@ -63,6 +63,23 @@ struct Live {
     expires_at: Option<Instant>,
 }
 
+/// 锁内摘取的删除目标：仅复制路径与预算交给锁外处理，不直接改动账本。
+#[derive(Debug, Clone)]
+pub struct DeleteTarget {
+    path: PathBuf,
+    bytes: u64,
+    /// 来自 retry 队列：删除失败时留在 retry，不需要再次入队。
+    retrying: bool,
+    since: Instant,
+}
+
+/// 锁外删除的结果，交回 `apply_deletes` 才能更新账本与预算。
+#[derive(Debug)]
+pub struct DeleteResult {
+    target: DeleteTarget,
+    deleted: bool,
+}
+
 impl Retention {
     pub fn new() -> Self {
         Self::default()
@@ -84,7 +101,9 @@ impl Retention {
     /// the caller reports as "export queue is full" rather than starting a
     /// drag whose file would be deleted mid-transfer.
     pub fn reserve(&mut self, path: PathBuf, bytes: u64) -> Option<Lease> {
-        self.expire();
+        // 这里不再调用 expire()：remove_file / 删目录是阻塞 I/O，若在持锁的
+        // reserve() 里执行，会连带卡住其它拖出。过期统一交给 app.rs 的 sweep，
+        // 由「锁内快照 -> 锁外删除 -> 锁内回填」三步完成。
         if self.live.len() >= MAX_RETAINED_FILES || bytes > MAX_RETAINED_BYTES - self.bytes {
             return None;
         }
@@ -110,50 +129,86 @@ impl Retention {
         live.expires_at = Some(Instant::now() + TRANSFER_GRACE);
     }
 
-    /// Deletes everything whose grace window has passed and retries deletes a
-    /// receiver's open handle previously blocked.
-    pub fn expire(&mut self) {
-        let now = Instant::now();
-        let mut keep = Vec::with_capacity(self.live.len());
-        for live in self.live.drain(..) {
-            let Some(deadline) = live.expires_at else {
-                // Still dragging.
-                keep.push(live);
-                continue;
-            };
-            if deadline > now {
-                keep.push(live);
-                continue;
+    /// 第一步（持锁、无 I/O）：摘出已过期的 live 条目与全部 retry 条目的快照。
+    ///
+    /// 只 clone 路径与预算，账本原样保留：删除完成前名额与字节仍然占用，
+    /// 既不会超发，也不会出现"正在删却被别的拖出抢走名额"的窗口。
+    pub fn expired_targets(&self, now: Instant) -> Vec<DeleteTarget> {
+        let mut out = Vec::with_capacity(self.live.len() + self.retry.len());
+        for live in &self.live {
+            if live.expires_at.is_some_and(|deadline| deadline <= now) {
+                out.push(DeleteTarget {
+                    path: live.lease.path.clone(),
+                    bytes: live.lease.bytes,
+                    retrying: false,
+                    since: now,
+                });
             }
-            if std::fs::remove_file(&live.lease.path).is_err() && live.lease.path.exists() {
-                self.retry
-                    .push((live.lease.path.clone(), live.lease.bytes, now));
-                continue;
-            }
-            // 文件已删（或接收方已取走）：顺手清掉专属空目录，否则每次拖出
-            // 都只删 PNG、留下一个空的 FastPin-drag-* 目录。
-            discard(&live.lease.path);
-            self.bytes -= live.lease.bytes;
         }
-        self.live = keep;
+        for (path, bytes, since) in &self.retry {
+            out.push(DeleteTarget {
+                path: path.clone(),
+                bytes: *bytes,
+                retrying: true,
+                since: *since,
+            });
+        }
+        out
+    }
 
-        let mut still_blocked = Vec::with_capacity(self.retry.len());
-        for (path, bytes, since) in self.retry.drain(..) {
-            if !path.exists() || std::fs::remove_file(&path).is_ok() {
+    /// 第二步（不接触 `self`，可在锁外/任意线程调用）：真正删除文件与目录。
+    ///
+    /// 慢盘、杀软扫描、接收方持有句柄导致的阻塞都发生在这里，与全局
+    /// retention 锁无关，因此其它拖出的 `reserve()` / `complete()` 不受影响。
+    pub fn finish_deletes(targets: Vec<DeleteTarget>) -> Vec<DeleteResult> {
+        targets
+            .into_iter()
+            .map(|target| {
                 // The file is gone: its reservation is over, regardless of how
                 // long it spent in the retry queue. Waiting for TRANSFER_GRACE
                 // here leaked the bytes whenever the receiver released the
                 // handle on the very next sweep, eventually freezing reserve().
-                // 同主 sweep：文件已不在，目录也一并回收。
-                discard(&path);
-                self.bytes = self.bytes.saturating_sub(bytes);
-                continue;
+                let deleted = !target.path.exists() || std::fs::remove_file(&target.path).is_ok();
+                if deleted {
+                    // 文件已删（或接收方已取走）：顺手清掉专属空目录，否则每次
+                    // 拖出都只删 PNG、留下一个空的 FastPin-drag-* 目录。
+                    discard(&target.path);
+                }
+                DeleteResult { target, deleted }
+            })
+            .collect()
+    }
+
+    /// 第三步（持锁、无 I/O）：按删除结果更新账本。
+    ///
+    /// 成功才归还预算并移除记录；首次删除失败（接收方仍持句柄）转入 retry，
+    /// 继续占用预算，等下一次 sweep 重试。
+    pub fn apply_deletes(&mut self, results: Vec<DeleteResult>) {
+        for DeleteResult { target, deleted } in results {
+            if deleted {
+                if target.retrying {
+                    self.retry.retain(|(p, _, _)| p != &target.path);
+                } else {
+                    self.live.retain(|l| l.lease.path != target.path);
+                }
+                self.bytes = self.bytes.saturating_sub(target.bytes);
+            } else if !target.retrying {
+                self.live.retain(|l| l.lease.path != target.path);
+                if !self.retry.iter().any(|(p, _, _)| p == &target.path) {
+                    self.retry.push((target.path, target.bytes, target.since));
+                }
             }
-            // A receiver still holds it. Try again on the next sweep, and keep
-            // its budget reserved so the ledger never over-admits.
-            still_blocked.push((path, bytes, since));
+            // 已在 retry 且仍然失败：原样留在 retry，下轮再试。
         }
-        self.retry = still_blocked;
+    }
+
+    /// 单步便捷路径（仅供测试）：在同一个 `&mut self` 上完成三步。
+    /// 生产路径不要用——它仍会在持锁期间做磁盘 I/O。
+    pub fn expire(&mut self) {
+        let now = Instant::now();
+        let targets = self.expired_targets(now);
+        let results = Self::finish_deletes(targets);
+        self.apply_deletes(results);
     }
 
     /// Drops every reservation record without touching the files.

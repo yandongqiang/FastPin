@@ -10,10 +10,7 @@ use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIOutput, IDXGIOutput6, D
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetSystemMetrics, GetWindowRect, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
 
 use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
 
@@ -47,15 +44,28 @@ pub struct VirtualDesktop {
     pub h: i32,
 }
 
-pub fn virtual_desktop() -> VirtualDesktop {
-    unsafe {
-        VirtualDesktop {
-            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
-            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
-            w: GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            h: GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        }
+/// 虚拟桌面尺寸必须从 `enumerate_monitors` 的物理像素 rect 推导。`GetSystemMetrics`
+/// 的 `SM_XVIRTUALSCREEN` 系列是非 DPI 感知的：登录时 100%、之后改缩放时，返回值
+/// 与每屏 PMv2 rect 不在同一坐标系，混用会让合成图整体偏移 / 出现黑边。
+pub fn virtual_desktop(monitors: &[MonitorInfo]) -> VirtualDesktop {
+    let rects: Vec<(i32, i32, i32, i32)> = monitors.iter().map(|m| (m.x, m.y, m.w, m.h)).collect();
+    let (x, y, w, h) = union_bounds(&rects).unwrap_or((0, 0, 1, 1));
+    VirtualDesktop { x, y, w, h }
+}
+
+/// `(x, y, w, h)` 列表的并集，返回 `(min_x, min_y, width, height)`；空列表为 `None`。
+fn union_bounds(monitors: &[(i32, i32, i32, i32)]) -> Option<(i32, i32, i32, i32)> {
+    let mut iter = monitors.iter().copied();
+    let (x, y, w, h) = iter.next()?;
+    let (mut min_x, mut min_y) = (x, y);
+    let (mut max_x, mut max_y) = (x + w, y + h);
+    for (x, y, w, h) in iter {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x + w);
+        max_y = max_y.max(y + h);
     }
+    Some((min_x, min_y, max_x - min_x, max_y - min_y))
 }
 
 pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
@@ -349,5 +359,29 @@ mod luid_tests {
         assert!(dxgi_allowed(&same, overlay));
         assert!(!dxgi_allowed(&other, overlay));
         assert!(!dxgi_allowed(&unknown, overlay));
+    }
+}
+
+#[cfg(test)]
+mod virtual_desktop_tests {
+    use super::*;
+
+    #[test]
+    fn secondary_monitor_on_the_left_extends_origin_left() {
+        let bounds = union_bounds(&[(-1920, 0, 1920, 1080), (0, 0, 2560, 1440)]);
+        assert_eq!(bounds, Some((-1920, 0, 4480, 1440)));
+    }
+
+    #[test]
+    fn single_monitor_is_returned_unchanged() {
+        let bounds = union_bounds(&[(100, 200, 1920, 1080)]);
+        assert_eq!(bounds, Some((100, 200, 1920, 1080)));
+    }
+
+    #[test]
+    fn empty_list_yields_none_and_virtual_desktop_falls_back() {
+        assert_eq!(union_bounds(&[]), None);
+        let vd = virtual_desktop(&[]);
+        assert_eq!((vd.x, vd.y, vd.w, vd.h), (0, 0, 1, 1));
     }
 }

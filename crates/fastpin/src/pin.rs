@@ -1729,7 +1729,16 @@ impl PinView {
                     windows::Win32::System::Com::COINIT_MULTITHREADED,
                 );
             }
-            let outcome = rx.recv().unwrap_or(crate::drag::DragOutcome::Failed);
+            // OLE 卡死时回调可能永远不来：无限 recv 会让租约的 expires_at
+            // 永远是 None，白占一个名额和预算。超时按"拒绝"收尾，complete()
+            // 会照常启动宽限期，使条目进入过期流程；迟到的 send 只会 Err，无害。
+            let outcome = match rx.recv_timeout(Duration::from_secs(5 * 60)) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    crate::perf::log_app(&format!("拖出回调超时（{e}），按拒绝处理"));
+                    crate::drag::DragOutcome::Failed
+                }
+            };
             let retention = &mut drag_retention().lock().unwrap();
             retention.complete(&lease, outcome.accepted());
             // A refused drop keeps its grace window too: the receiver may have

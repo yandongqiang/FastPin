@@ -34,13 +34,20 @@ use windows::Win32::UI::Accessibility::{
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, MSG, PM_REMOVE};
 
 /// Bounds the tree walk so a pathological accessibility tree cannot stall the
-/// picker. UIA calls cross COM, so each visit has a real cost.
-const MAX_DEPTH: u32 = 8;
-const MAX_VISITS: usize = 96;
-/// Ignore hairline elements (separators, borders) — they make poor snap edges.
-const MIN_EXTENT: i32 = 6;
+/// picker. UIA calls cross COM, so each visit has a real cost. The budget now
+/// matches snow-shot's `snow-ui-selector` (deep trees in Chromium/Electron need
+/// far more than a handful of levels before reaching the pane under the cursor).
+const MAX_DEPTH: u32 = 32;
+const MAX_VISITS: usize = 512;
+/// 与 snow-shot 一致：只要扩张方向有效就保留（>0），细分隔线也交给上层
+/// `candidates_for` 的最小尺寸过滤，不在 COM 遍历阶段丢候选。
+const MIN_EXTENT: i32 = 2;
+/// 单次查询最多发布的矩形数，与 snow-shot 的 `MAX_RECTS` 对齐。
+const MAX_RECTS: usize = 100;
 /// UI 侧等待一次 UIA 查询的上限；超时即丢弃结果，UI 线程从不为 COM 阻塞。
-pub const UIA_QUERY_TIMEOUT: Duration = Duration::from_millis(200);
+/// 300ms 给跨进程 COM 更多时间（snow-shot 首轮 168ms + 1500ms 持续 refinement，
+/// 我们是单轮，因此取 300ms）。
+pub const UIA_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
 /// STA 空闲时每轮等待请求的时长。远小于上面的查询超时，不会拖慢超时判定。
 const WORKER_IDLE_TICK: Duration = Duration::from_millis(50);
 /// 单轮最多派发的消息数，避免消息洪泛把 worker 永久占住。
@@ -251,9 +258,11 @@ pub fn elements_at_point(window: HWND, pt: POINT) -> Vec<ElementRect> {
     }
 }
 
-/// Returns the element's rect when it is visible, large enough, and contains
-/// the cursor. Every UIA property read is a COM call, so all the rejection
-/// rules live in this one place.
+/// Returns the element's rect when it is visible and contains the cursor.
+/// Every UIA property read is a COM call, so all the rejection rules live in
+/// this one place. The size floor is deliberately tiny (snow-shot only insists
+/// on >0): dropping hairlines here used to prune whole descendant branches
+/// before the pure-code policy layer could see them.
 fn visible_rect(element: &IUIAutomationElement, pt: POINT) -> Option<RECT> {
     unsafe {
         if element
@@ -288,9 +297,13 @@ fn descend(
 ) {
     // Depth 0 is the window, not a sub-element.
     if depth > 0 {
+        // 与 snow-shot 的 MAX_RECTS 对齐：满了就停，不再为多余的后代付 COM 开销。
+        if out.len() >= MAX_RECTS {
+            return;
+        }
         out.push(ElementRect { rect, depth });
     }
-    if depth >= MAX_DEPTH || *visits >= MAX_VISITS {
+    if depth >= MAX_DEPTH || *visits >= MAX_VISITS || out.len() >= MAX_RECTS {
         return;
     }
     unsafe {

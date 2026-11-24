@@ -66,6 +66,9 @@ const MAG_PIXEL: f32 = 10.0;
 const MIN_RECT: f64 = 5.0;
 /// 同一窗口连续超时这么多次后熔断其 UIA 候选，直到 hover 移到别的窗口。
 const UIA_TIMEOUT_TRIP: u8 = 3;
+/// 鼠标每轴移动不超过这个像素数时，仍复用上一次成功应用的 UIA 结果。
+/// 否则鼠标每换一个像素就把 UIA 候选清空，回执永远追不上光标。
+const UIA_POINT_TOLERANCE: i32 = 24;
 
 /// 一次异步 UIA 查询的状态。查询在专用 STA 线程上运行，这里只做非阻塞轮询。
 struct UiaPending {
@@ -189,6 +192,13 @@ pub struct OverlayView {
     /// 正在进行的 UIA 查询；UIA 在专用 STA 线程上运行，这里只非阻塞轮询，
     /// 超时或 epoch 过期的回执一律丢弃，绝不等待跨进程 COM。
     uia_pending: Option<UiaPending>,
+    /// 最近一次成功应用的 UIA 矩形。鼠标小幅移动时复用，避免每次换像素都把
+    /// UIA 候选清空；新查询不会清它，只有窗口切换 / 新一轮截图才失效。
+    uia_last: Vec<RECT>,
+    /// `uia_last` 对应的目标窗口（顶层应用窗口，不是 overlay 自己）。
+    uia_last_target: Option<HWND>,
+    /// `uia_last` 对应的查询屏幕点，用于容差比较。
+    uia_last_point: POINT,
     /// UIA 查询序号，用于丢弃鼠标移动后返回的过期结果。
     uia_epoch: u64,
     /// 连续超时次数；达到阈值后暂时禁用当前窗口的 UIA 候选（熔断）。
@@ -1039,6 +1049,9 @@ impl OverlayView {
             smart_selection: crate::config::SmartSelectionMode::default(),
             candidates_at: None,
             uia_pending: None,
+            uia_last: Vec::new(),
+            uia_last_target: None,
+            uia_last_point: POINT::default(),
             uia_epoch: 0,
             uia_timeouts: 0,
             uia_blocked_hwnd: None,
@@ -1108,6 +1121,9 @@ impl OverlayView {
             smart_selection,
             candidates_at: None,
             uia_pending: None,
+            uia_last: Vec::new(),
+            uia_last_target: None,
+            uia_last_point: POINT::default(),
             uia_epoch: 0,
             uia_timeouts: 0,
             uia_blocked_hwnd: None,
@@ -1192,8 +1208,10 @@ impl OverlayView {
         self.smart_selection = smart_selection;
         self.candidates.clear();
         self.candidates_at = None;
-        // 上一张图的 UIA 回执不能落到这一张图上。
+        // 上一张图的 UIA 回执和缓存都不能落到这一张图上。
         self.uia_pending = None;
+        self.uia_last.clear();
+        self.uia_last_target = None;
         self.uia_timeouts = 0;
         self.uia_blocked_hwnd = None;
         self.color_open = false;
@@ -1268,19 +1286,22 @@ impl OverlayView {
                     // 鼠标已经移动，旧结果直接丢弃。
                     return;
                 }
-                // 查询时的屏幕点必须仍是当前 hover 点，否则结果属于旧位置。
+                // 查询时的屏幕点与当前 hover 点允许小幅偏差（每轴 <=24px），
+                // 否则鼠标稍动一两个像素就会把来之不易的结果整个丢弃。
                 let now = POINT {
                     x: (self.mouse.x + self.origin_x as f64) as i32,
                     y: (self.mouse.y + self.origin_y as f64) as i32,
                 };
-                if now != point {
+                if (now.x - point.x).abs() > UIA_POINT_TOLERANCE
+                    || (now.y - point.y).abs() > UIA_POINT_TOLERANCE
+                {
                     return;
                 }
                 let hwnd = crate::platform::hwnd_of(window);
-                // HWND 可能在 200ms 内关闭并被新窗口复用：重新确认当前 hover
-                // 窗口仍是查询目标，否则这批复选框属于别的窗口，必须丢弃。
+                // HWND 可能在 300ms 内关闭并被新窗口复用：用当前点重新确认
+                // hover 窗口仍是查询目标，否则这批复选框属于别的窗口，必须丢弃。
                 // window_under_point 只走 Win32 枚举，不会触发同步 COM。
-                if window_under_point(hwnd, point) != Some(target) {
+                if window_under_point(hwnd, now) != Some(target) {
                     return;
                 }
                 self.uia_timeouts = 0;
@@ -1296,6 +1317,11 @@ impl OverlayView {
                     self.freeze_size.1,
                     &uia_rects,
                 );
+                // 缓存成功应用的矩形：后续鼠标小幅移动时继续复用，直到窗口
+                // 切换或新一轮截图让它失效。request_uia 不碰这份缓存。
+                self.uia_last = uia_rects;
+                self.uia_last_target = Some(target);
+                self.uia_last_point = point;
                 self.hover = crate::smart_selection::preview_rect(
                     self.smart_selection,
                     &self.candidates,
@@ -1932,11 +1958,17 @@ impl OverlayView {
                     x: (self.mouse.x + self.origin_x as f64) as i32,
                     y: (self.mouse.y + self.origin_y as f64) as i32,
                 };
-                // 换了像素：上一次查询的结果已经不适用，丢弃并重新发起。
-                // 本帧先用 child HWND 候选，UIA 回执到达后再补上。
+                // 换了像素：丢弃未完成的旧查询并重新发起，但已成功应用的 UIA
+                // 结果在光标只挪了几像素且仍在同一个顶层窗口时继续复用。
+                // 过去这里传 `&[]`，UIA 候选几乎永远等不到回执就被清空。
                 self.uia_pending = None;
                 self.request_uia(hwnd, pt);
-                self.candidates = detect_candidates(
+                let cached = self.uia_last_target.is_some()
+                    && self.uia_last_target == window_under_point(hwnd, pt)
+                    && (pt.x - self.uia_last_point.x).abs() <= UIA_POINT_TOLERANCE
+                    && (pt.y - self.uia_last_point.y).abs() <= UIA_POINT_TOLERANCE;
+                let uia: Option<&[RECT]> = if cached { Some(&self.uia_last) } else { None };
+                let candidates = detect_candidates(
                     self.smart_selection,
                     hwnd,
                     pt,
@@ -1944,8 +1976,9 @@ impl OverlayView {
                     self.origin_y,
                     self.freeze_size.0,
                     self.freeze_size.1,
-                    &[],
+                    uia.unwrap_or(&[]),
                 );
+                self.candidates = candidates;
                 self.candidates_at = Some(self.mouse);
             }
             // Candidates are ordered deepest-first, but still ask for the one
@@ -4965,7 +4998,6 @@ fn detect_candidates(
             // classic child HWNDs ...
             let mut ctx = ChildCtx {
                 bounds,
-                pt,
                 rects: Vec::new(),
             };
             unsafe {
@@ -5066,17 +5098,18 @@ fn window_under_point(self_hwnd: HWND, pt: POINT) -> Option<HWND> {
 
 struct ChildCtx {
     bounds: RECT,
-    pt: POINT,
     rects: Vec<RECT>,
 }
 
 /// Collects one visible child window's rect, clipped to the parent window.
 ///
-/// This mirrors snow-shot's `enum_child_window_proc`: invisible children and
-/// children that cover the whole parent are skipped, because a child identical
-/// to its parent adds no boundary and would duplicate the window rect. Only
-/// panes that actually sit under the cursor are candidates — a sibling pane on
-/// the other side of the window must never become a hover/click boundary.
+/// Mirrors snow-shot's `enum_child_window_proc`: enumerate *all* descendants,
+/// not just the one under the cursor. Only invisible children, empty rects and
+/// children that cover the whole parent are skipped — a child identical to its
+/// parent adds no boundary and would duplicate the window rect. A sibling pane
+/// on the other side of the window is still a legitimate snap boundary once the
+/// user moves there, and enumerating it up front removes the per-pixel HWND
+/// walk and makes classic Win32 apps expose as many candidates as snow-shot.
 unsafe extern "system" fn enum_child_window_proc(
     hwnd: HWND,
     lparam: LPARAM,
@@ -5101,11 +5134,9 @@ unsafe extern "system" fn enum_child_window_proc(
             && clipped.top == ctx.bounds.top
             && clipped.right == ctx.bounds.right
             && clipped.bottom == ctx.bounds.bottom;
-        let under_cursor = ctx.pt.x >= clipped.left
-            && ctx.pt.x < clipped.right
-            && ctx.pt.y >= clipped.top
-            && ctx.pt.y < clipped.bottom;
-        if non_empty && !same_as_parent && under_cursor {
+        // 不再要求 under_cursor：snow-shot 的 window.rs 枚举全部后代，
+        // 兄弟窗口也是真实边界，交给上层按面积/深度排序即可。
+        if non_empty && !same_as_parent {
             ctx.rects.push(clipped);
         }
         windows::core::BOOL(1)

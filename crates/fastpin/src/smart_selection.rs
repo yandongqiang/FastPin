@@ -21,7 +21,9 @@
 //!
 //! Candidates are ordered deepest-first (snow-shot's `normalize_child_rects`
 //! sorts by area), which is the order a hover walk wants: the boundary the
-//! user is literally pointing at, then each coarser one behind it.
+//! user is literally pointing at, then each coarser one behind it. The list is
+//! capped at `MAX_CANDIDATES` (snow-shot's `MAX_RECTS`) so a pathological tree
+//! cannot flood the hover walk.
 
 use crate::config::SmartSelectionMode;
 use crate::geom::{Point, Rect};
@@ -44,7 +46,8 @@ pub struct Candidate {
 /// Filtering is deliberately conservative — a rect must be non-degenerate and
 /// inside the frozen desktop image, because a candidate that spills outside the
 /// screenshot cannot be cropped and would produce a selection with negative
-/// pixels.
+/// pixels. At most `MAX_CANDIDATES` surviving boundaries are kept, deepest and
+/// smallest first (the ones the hover walk would reach first).
 pub fn candidates_for(
     mode: SmartSelectionMode,
     raw: Vec<Candidate>,
@@ -79,8 +82,13 @@ pub fn candidates_for(
         )
     });
     out.dedup_by(|a, b| a.rect == b.rect);
+    // 已经按「深 → 浅、小 → 大」排好，直接截掉尾部最粗的一批。
+    out.truncate(MAX_CANDIDATES);
     out
 }
+
+/// 与 snow-shot 的 `MAX_RECTS` 对齐的单次候选上限。
+const MAX_CANDIDATES: usize = 100;
 
 /// Slack for the half-open `contains` check at the desktop's far edge.
 const EDGE_EPSILON: f64 = 0.5;
@@ -238,6 +246,28 @@ mod tests {
             1,
             "the same pane reported twice is still one boundary"
         );
+    }
+
+    /// snow-shot 风格的上限：候选过多时只留下最深的 100 个，浅层的大矩形
+    /// 被截掉，hover 遍历不会随无障碍树的规模线性变慢。
+    #[test]
+    fn candidates_are_capped_at_one_hundred() {
+        let raw: Vec<Candidate> = (0..120)
+            .map(|i| {
+                candidate(
+                    (i % 12) as f64 * 20.0,
+                    (i / 12) as f64 * 20.0,
+                    10.0,
+                    10.0,
+                    i,
+                )
+            })
+            .collect();
+        let list = candidates_for(SmartSelectionMode::WindowSubElement, raw, DESKTOP, 4.0);
+        assert_eq!(list.len(), 100, "the extra twenty are dropped");
+        assert_eq!(list[0].depth, 119, "deepest first");
+        assert_eq!(list[99].depth, 20, "the shallowest twenty are the tail");
+        assert!(!list.iter().any(|c| c.depth < 20));
     }
 
     #[test]

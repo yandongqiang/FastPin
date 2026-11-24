@@ -767,10 +767,14 @@ mod tests {
     impl TempDir {
         fn new(tag: &str) -> Self {
             let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "fastpin-imagesplit-{tag}-{}-{seq}",
-                std::process::id()
-            ));
+            // 沙箱拒绝写 %TEMP%，与其它测试一致放在 target/ 下。
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("imagesplit-tests")
+                .join(format!(
+                    "fastpin-imagesplit-{tag}-{}-{seq}",
+                    std::process::id()
+                ));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("temp parent");
             Self(path)

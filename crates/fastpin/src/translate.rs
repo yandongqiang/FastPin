@@ -210,6 +210,28 @@ fn header_safe_key(key: &str) -> String {
     key.chars().filter(|c| *c != '\r' && *c != '\n').collect()
 }
 
+/// Per-phase timeout handed to `WinHttpSetTimeouts`, in milliseconds.
+///
+/// WinHTTP applies its four timeouts (resolve / connect / send / receive) to
+/// *each phase separately* — they are not one budget for the whole exchange.
+/// Passing the configured `timeout_seconds * 1000` to all four therefore lets
+/// a slow gateway occupy the background executor for roughly 4x the configured
+/// time (300 s -> ~20 minutes). Split the budget between the phases instead,
+/// with a 2 s floor so a slow DNS lookup still has a chance to finish.
+///
+/// Two limits remain by design: receive timeout is re-armed for every chunk,
+/// so a slow trickle can still outlast the total budget, and there is no
+/// cancellation — the request runs on a background thread where closing the
+/// WinHTTP handle from another thread is unsafe. Short per-phase limits are
+/// the whole mitigation.
+fn phase_timeout_ms(timeout_seconds: u32) -> i32 {
+    const PHASES: u32 = 4;
+    const MIN_MS: u64 = 2_000;
+    let total_ms = u64::from(timeout_seconds.clamp(5, 300)).saturating_mul(1000);
+    let per_phase = (total_ms / u64::from(PHASES)).max(MIN_MS);
+    per_phase.min(i32::MAX as u64) as i32
+}
+
 fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Result<String> {
     let wide: Vec<u16> = url.encode_utf16().chain([0]).collect();
     let mut parts = URL_COMPONENTS {
@@ -254,9 +276,9 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
         if session.0.is_null() {
             return Err(Error::new("WinHttpOpen failed"));
         }
-        // One budget for the whole exchange, matching the C# provider, which
-        // times the request rather than each socket phase.
-        let ms = (timeout_seconds * 1000) as i32;
+        // 每段上限，不是整个请求的总预算：四段叠加（且接收按块重计时）时
+        // 实际墙钟可能是配置值的数倍，详见 phase_timeout_ms。
+        let ms = phase_timeout_ms(timeout_seconds);
         WinHttpSetTimeouts(session.0, ms, ms, ms, ms).map_err(|e| crate::net::winhttp_error(&e))?;
 
         let host_w = nul_terminated_from(&host);
@@ -360,6 +382,18 @@ mod tests {
             "sk-aX-Evil: 1X-Other: 2"
         );
         assert_eq!(header_safe_key("\r\n"), "");
+    }
+
+    #[test]
+    fn timeout_budget_is_split_across_winhttp_phases() {
+        // 四段之和应与配置的预算同量级，而不是每段都拿到整份预算。
+        assert_eq!(phase_timeout_ms(30), 7_500, "30 s budget / 4");
+        assert_eq!(phase_timeout_ms(300), 75_000, "worst case stays ~5 min");
+        // 小预算也要保住慢 DNS：2 s 下限会让墙钟略超配置，但远好于原来的 4x。
+        assert_eq!(phase_timeout_ms(5), 2_000, "2 s floor for short budgets");
+        // 异常配置同样收敛到安全区间，避免 u32 溢出或无限等待。
+        assert_eq!(phase_timeout_ms(0), 2_000, "clamped up to 5 s");
+        assert_eq!(phase_timeout_ms(u32::MAX), 75_000, "clamped down to 300 s");
     }
 
     #[test]

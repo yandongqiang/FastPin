@@ -706,6 +706,10 @@ fn run_tray() -> Result<()> {
     }
     uninstall_ll_hook();
 
+    // 应用退出：拖出文件的账本只清记录、不删文件（接收方可能还在读，
+    // 留下来的临时文件由 OS 清理）。不清会让残留记录一直占着预算。
+    crate::pin::drag_retention().lock().unwrap().forget();
+
     unbind_gpui_app();
 
     if let Some(e) = boot_error.borrow_mut().take() {
@@ -758,6 +762,16 @@ fn boot_resident(
         register_emergency_quit(hwnd);
         show_tray_unavailable_hint();
     }
+    // 拖出文件的宽限期时钟由 complete() 启动，真正删除靠这里的周期 sweep。
+    // 复用 GPUI 后台执行器的定时器，不新增线程；任务随 app 退出而终止。
+    // 退出时的账本清理在 run_tray 的收尾路径里调用 forget()。
+    cx.spawn(async move |cx| loop {
+        cx.background_executor()
+            .timer(Duration::from_secs(60))
+            .await;
+        crate::pin::drag_retention().lock().unwrap().expire();
+    })
+    .detach();
     Ok(())
 }
 

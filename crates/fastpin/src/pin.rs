@@ -769,8 +769,9 @@ impl Drop for ExportDragGuard {
 
 /// The process-wide drag-export file retention. Leases live here because the
 /// gesture thread ends, but the staged file must survive until the receiver
-/// finishes its copy or the grace window closes.
-fn drag_retention() -> &'static std::sync::Mutex<crate::dragexport::Retention> {
+/// finishes its copy or the grace window closes. app.rs 的周期 sweep 与退出
+/// 清理也经此访问同一本账。
+pub(crate) fn drag_retention() -> &'static std::sync::Mutex<crate::dragexport::Retention> {
     use std::sync::{Mutex, OnceLock};
     static RETENTION: OnceLock<Mutex<crate::dragexport::Retention>> = OnceLock::new();
     RETENTION.get_or_init(|| Mutex::new(crate::dragexport::Retention::new()))
@@ -1055,6 +1056,9 @@ impl PinView {
         self.pending = None;
         self.drag_offset = None;
         self.resize = None;
+        // Ctrl+按下 arm 的导出手势若还没越过阈值就进了编辑态，必须在这里清掉：
+        // 否则编辑中松开左键后它仍是 Some，下一次普通拖动会误触发 OLE 拖出。
+        self.export_drag_origin = None;
         let group = self.group();
         let tiles = snapshots(cx, group, self.snapshot(window));
         pin_edit::start(cx, group, &tiles);
@@ -1426,6 +1430,9 @@ impl PinView {
         match event.button {
             MouseButton::Left => {
                 if self.editing() {
+                    // 编辑中的松开同样要 disarm：此时 OLE 分支被 editing 挡住，
+                    // 手势会一直残留到退出编辑态。
+                    self.export_drag_origin = None;
                     self.edit_release(cx);
                 } else if self.export_drag_origin.take().is_some() {
                     // Released before the threshold: not a drag, just a click.
@@ -1696,6 +1703,21 @@ impl PinView {
                 }
             };
             let bytes = px.len() as u64;
+            // 先占位再启动 OLE：账本满额时拒绝本次拖出并回收刚暂存的文件。
+            // 漏掉 reserve 会让 complete() 找不到记录，expires_at 永远是 None，
+            // 文件连同目录永久残留在临时目录里。
+            let reserved = drag_retention()
+                .lock()
+                .unwrap()
+                .reserve(path.clone(), bytes);
+            let lease = match reserved {
+                Some(lease) => lease,
+                None => {
+                    crate::dragexport::discard(&path);
+                    crate::perf::log_app("导出队列已满");
+                    return;
+                }
+            };
             let (tx, rx) = std::sync::mpsc::channel();
             crate::drag::drag_file_async(path.clone(), move |outcome| {
                 let _ = tx.send(outcome);
@@ -1709,13 +1731,7 @@ impl PinView {
             }
             let outcome = rx.recv().unwrap_or(crate::drag::DragOutcome::Failed);
             let retention = &mut drag_retention().lock().unwrap();
-            retention.complete(
-                &crate::dragexport::Lease {
-                    path: path.clone(),
-                    bytes,
-                },
-                outcome.accepted(),
-            );
+            retention.complete(&lease, outcome.accepted());
             // A refused drop keeps its grace window too: the receiver may have
             // read the file mid-drop even though it refused the final effect.
             // `_gate` drops here, releasing the gate after every path.

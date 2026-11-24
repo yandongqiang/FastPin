@@ -14,7 +14,7 @@
 //! 的 `watch_dir` 做热重载。查找主题时用各 JSON `themes` 数组条目的 `name`
 //! （如 `Ayu Light`）——registry 正是以这个名字作为键。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use gpui::{hsla, rgb, App, Hsla, Pixels, SharedString};
@@ -188,18 +188,27 @@ pub fn available_themes() -> Vec<(String, String)> {
 /// 仓库内的 themes 目录（编译期路径），供开发运行与发布包缺失时回退。
 const REPO_THEMES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../themes");
 
+/// 纯路径选择：exe 旁的 `themes/` 存在（`shipped_exists`）时优先用它（发布
+/// 布局），否则回退仓库内的副本（开发运行）。把 `is_dir` 的结果作为参数传入，
+/// 让这段逻辑可以脱离真实文件系统单测。
+fn themes_dir_from(exe_base: Option<&Path>, shipped_exists: bool, repo: &Path) -> PathBuf {
+    match exe_base {
+        Some(base) if shipped_exists => base.join("themes"),
+        _ => repo.to_path_buf(),
+    }
+}
+
 /// 解析 themes 目录：先找 exe 旁的 `themes/`（发布布局），找不到再用仓库内的
 /// 副本（开发运行）。和 ocr 的模型目录同一套策略，换目录运行也能加载主题。
 fn themes_dir() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(base) = exe.parent() {
-            let shipped = base.join("themes");
-            if shipped.is_dir() {
-                return shipped;
-            }
-        }
-    }
-    PathBuf::from(REPO_THEMES)
+    let exe_base = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
+    let shipped_exists = exe_base
+        .as_ref()
+        .map(|base| base.join("themes").is_dir())
+        .unwrap_or(false);
+    themes_dir_from(exe_base.as_deref(), shipped_exists, Path::new(REPO_THEMES))
 }
 
 /// 把主题名快照从 registry 刷新一次，供下拉使用。纯过程，无 `cx` 参数即可在
@@ -304,19 +313,6 @@ pub fn set_appearance(cx: &mut gpui::App, name: &str) {
         apply_theme(&theme);
         cx.refresh_windows();
     }
-}
-
-/// Historical light/dark entry point, kept for callers that only have a bool.
-#[allow(dead_code)]
-pub fn set_dark(cx: &mut gpui::App, dark: bool) {
-    set_appearance(
-        cx,
-        if dark {
-            crate::config::DEFAULT_DARK_APPEARANCE
-        } else {
-            crate::config::DEFAULT_APPEARANCE
-        },
-    );
 }
 
 // ---- chrome tokens ---------------------------------------------------------
@@ -663,5 +659,29 @@ mod tests {
                 option(crate::config::DEFAULT_DARK_APPEARANCE),
             ]
         );
+    }
+
+    /// themes 目录选择是纯逻辑：exe 旁的目录存在时优先，否则回退仓库。
+    #[test]
+    fn themes_dir_prefers_shipped_directory_when_present() {
+        let exe = Path::new("D:/FastPin/FastPin.exe");
+        let repo = Path::new("D:/src/themes");
+        let chosen = themes_dir_from(exe.parent(), true, repo);
+        assert_eq!(chosen, PathBuf::from("D:/FastPin/themes"));
+    }
+
+    #[test]
+    fn themes_dir_falls_back_to_repo_when_shipped_is_missing() {
+        let exe = Path::new("D:/FastPin/FastPin.exe");
+        let repo = Path::new("D:/src/themes");
+        let chosen = themes_dir_from(exe.parent(), false, repo);
+        assert_eq!(chosen.as_path(), repo);
+    }
+
+    #[test]
+    fn themes_dir_falls_back_to_repo_without_exe_base() {
+        let repo = Path::new("D:/src/themes");
+        let chosen = themes_dir_from(None, true, repo);
+        assert_eq!(chosen.as_path(), repo);
     }
 }

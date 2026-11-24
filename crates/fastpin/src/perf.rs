@@ -383,12 +383,15 @@ mod tests {
     fn crash_line_is_written_sync_and_readable() {
         // 用 std 构造唯一临时目录，避免为单测新增依赖；路径可注入，
         // 因此不必依赖 LOCALAPPDATA 或后台 writer 即可验证同步落盘。
+        // 沙箱拒绝写 %TEMP%，与其它测试一致放在 target/ 下。
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "fastpin-crash-test-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "fastpin-crash-test-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
         let _ = create_dir_all(&dir);
         let path = dir.join("crash.log");
 

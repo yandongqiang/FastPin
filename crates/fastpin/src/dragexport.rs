@@ -130,6 +130,9 @@ impl Retention {
                     .push((live.lease.path.clone(), live.lease.bytes, now));
                 continue;
             }
+            // 文件已删（或接收方已取走）：顺手清掉专属空目录，否则每次拖出
+            // 都只删 PNG、留下一个空的 FastPin-drag-* 目录。
+            discard(&live.lease.path);
             self.bytes -= live.lease.bytes;
         }
         self.live = keep;
@@ -141,6 +144,8 @@ impl Retention {
                 // long it spent in the retry queue. Waiting for TRANSFER_GRACE
                 // here leaked the bytes whenever the receiver released the
                 // handle on the very next sweep, eventually freezing reserve().
+                // 同主 sweep：文件已不在，目录也一并回收。
+                discard(&path);
                 self.bytes = self.bytes.saturating_sub(bytes);
                 continue;
             }
@@ -177,7 +182,12 @@ pub fn stage_in(root: &Path, bytes: &[u8], extension: &str) -> std::io::Result<P
         "FastPin-drag.{}",
         extension.trim_start_matches('.')
     ));
-    std::fs::write(&path, bytes)?;
+    if let Err(e) = std::fs::write(&path, bytes) {
+        // create_dir_all 已经建好了专属目录；写失败时若不回收，会留下一个
+        // 没有任何账本记录能清掉的空 FastPin-drag-* 目录。
+        discard(&path);
+        return Err(e);
+    }
     Ok(path)
 }
 
@@ -336,5 +346,58 @@ mod tests {
         let dir = path.parent().unwrap().to_path_buf();
         discard(&path);
         assert!(!dir.exists(), "the per-drag directory should be gone too");
+    }
+
+    #[test]
+    fn a_full_drag_lifecycle_stages_reserves_completes_and_expires() {
+        let root = scratch();
+        let path = stage_in(&root, b"payload", "png").unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        let mut retention = Retention::new();
+        let lease = retention.reserve(path.clone(), bytes).unwrap();
+
+        // 拖拽进行中：reserve 只记账，complete 之前 sweep 不能删文件。
+        retention.expire();
+        assert!(path.exists(), "an in-flight drag must never be deleted");
+        assert_eq!(retention.retained_bytes(), bytes);
+
+        retention.complete(&lease, true);
+        retention.expire();
+        // 宽限期内仍可读：接收方可能正在复制。
+        assert!(path.exists(), "the receiver may still be copying the file");
+
+        // 越过宽限期后 sweep 删掉文件与专属目录，并回收预算。
+        for live in retention.live.iter_mut() {
+            live.expires_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+        retention.expire();
+        assert!(!path.exists(), "aged-out drag file should be deleted");
+        assert!(
+            !dir.exists(),
+            "the per-drag directory should be deleted too"
+        );
+        assert_eq!(retention.retained_files(), 0, "the record must be dropped");
+        assert_eq!(retention.retained_bytes(), 0, "the budget must be returned");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_full_ledger_refuses_the_reservation_before_the_file_is_handed_out() {
+        let mut retention = Retention::new();
+        for i in 0..MAX_RETAINED_FILES {
+            let path = std::env::temp_dir().join(format!("fastpin-full-{i}.png"));
+            assert!(retention.reserve(path, 1).is_some());
+        }
+        let root = scratch();
+        let staged = stage_in(&root, b"late", "png").unwrap();
+        let dir = staged.parent().unwrap().to_path_buf();
+
+        assert!(retention.reserve(staged.clone(), 4).is_none());
+        // 生产路径在 reserve 失败时 discard(&path)：文件与目录都不应残留。
+        discard(&staged);
+        assert!(!staged.exists());
+        assert!(!dir.exists(), "the refused drag must not leave a directory");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

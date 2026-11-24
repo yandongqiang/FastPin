@@ -261,6 +261,41 @@ fn history_file_mtime(path: &PathBuf) -> Option<u64> {
     Some(duration.as_millis() as u64)
 }
 
+/// 缓存命中判定（纯函数，便于单测）：必须同时有占位、记录过成功解码时的
+/// mtime、且文件 mtime 未变。失败留下的 `None` 没有 mtime，必然返回 false，
+/// 下一次刷新会重新尝试。
+fn thumb_cache_hit(
+    has_placeholder: bool,
+    cached_mtime: Option<u64>,
+    current_mtime: Option<u64>,
+) -> bool {
+    has_placeholder && current_mtime.is_some() && cached_mtime == current_mtime
+}
+
+/// 写入一次后台解码结果。失败时只保留 `None` 占位（避免同一批次里反复排队），
+/// 但**不写** `thumbs_mtime`：文件可能正被写入，瞬时失败不该靠一个"有效"
+/// 的 mtime 变成永久空白，直到用户等到 mtime 变化才恢复。
+fn apply_thumb_result(
+    thumbs: &mut HashMap<String, Option<Arc<RenderImage>>>,
+    mtimes: &mut HashMap<String, u64>,
+    id: String,
+    mtime: Option<u64>,
+    thumb: Option<Arc<RenderImage>>,
+) {
+    match thumb {
+        Some(image) => {
+            if let Some(m) = mtime {
+                mtimes.insert(id.clone(), m);
+            }
+            thumbs.insert(id, Some(image));
+        }
+        None => {
+            mtimes.remove(&id);
+            thumbs.insert(id, None);
+        }
+    }
+}
+
 /// Total bytes across all records, formatted like "27.8 MB".
 fn total_size(records: &[HistoryRecord]) -> SharedString {
     let bytes: u64 = records.iter().map(|r| r.bytes).sum();
@@ -346,9 +381,11 @@ impl HistoryWindowView {
         for r in &self.records {
             let path = self.store.image_path(r);
             let mtime = history_file_mtime(&path);
-            let cached = self.thumbs.contains_key(&r.id)
-                && self.thumbs_mtime.get(&r.id).copied() == mtime
-                && mtime.is_some();
+            let cached = thumb_cache_hit(
+                self.thumbs.contains_key(&r.id),
+                self.thumbs_mtime.get(&r.id).copied(),
+                mtime,
+            );
             if !cached {
                 jobs.push((r.id.clone(), path));
             }
@@ -373,10 +410,13 @@ impl HistoryWindowView {
                 // Ignore a batch that was queued before a newer refresh.
                 if this.thumb_seq == seq {
                     for (id, mtime, thumb) in decoded {
-                        if let Some(m) = mtime {
-                            this.thumbs_mtime.insert(id.clone(), m);
-                        }
-                        this.thumbs.insert(id, thumb);
+                        apply_thumb_result(
+                            &mut this.thumbs,
+                            &mut this.thumbs_mtime,
+                            id,
+                            mtime,
+                            thumb,
+                        );
                     }
                     cx.notify();
                 }
@@ -1065,6 +1105,53 @@ mod tests {
         let thumb = load_thumb(&path).expect("thumbnail decodes");
         let bytes = thumb.as_bytes(0).expect("RenderImage carries the frame");
         assert_eq!(&bytes[..4], &[200, 20, 10, 255]);
+    }
+
+    /// 文件正被写入时的解码失败是瞬时的：失败分支只能留占位，不能记 mtime，
+    /// 否则下一次刷新会把它当成有效缓存，缩略图永久空白。
+    #[test]
+    fn a_failed_thumbnail_decode_stays_retryable() {
+        let dir = scratch();
+        let path = dir.join("image.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+        let mtime = history_file_mtime(&path).expect("mtime");
+        let id = "retry-me".to_string();
+
+        let mut thumbs: HashMap<String, Option<Arc<RenderImage>>> = HashMap::new();
+        let mut mtimes = HashMap::new();
+
+        // 第一次失败：占位在，mtime 不在，缓存判定必须为假。
+        apply_thumb_result(&mut thumbs, &mut mtimes, id.clone(), Some(mtime), None);
+        assert!(thumbs.contains_key(&id), "占位保留");
+        assert!(thumbs[&id].is_none());
+        assert!(!mtimes.contains_key(&id), "失败不能记 mtime");
+        assert!(
+            !thumb_cache_hit(
+                thumbs.contains_key(&id),
+                mtimes.get(&id).copied(),
+                Some(mtime)
+            ),
+            "失败后必须重试"
+        );
+
+        // 重试成功：这次才写 mtime，下次刷新才能命中缓存。
+        let decoded = load_thumb(&path).expect("decodes");
+        apply_thumb_result(
+            &mut thumbs,
+            &mut mtimes,
+            id.clone(),
+            Some(mtime),
+            Some(decoded),
+        );
+        assert!(thumbs[&id].is_some());
+        assert_eq!(mtimes.get(&id).copied(), Some(mtime), "成功才记 mtime");
+        assert!(thumb_cache_hit(
+            thumbs.contains_key(&id),
+            mtimes.get(&id).copied(),
+            Some(mtime)
+        ));
     }
 
     /// 头部声明超大画布但文件只有几十字节的图片必须在解码前被拒绝：

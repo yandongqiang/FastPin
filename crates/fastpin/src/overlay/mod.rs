@@ -69,6 +69,42 @@ const UIA_TIMEOUT_TRIP: u8 = 3;
 /// 鼠标每轴移动不超过这个像素数时，仍复用上一次成功应用的 UIA 结果。
 /// 否则鼠标每换一个像素就把 UIA 候选清空，回执永远追不上光标。
 const UIA_POINT_TOLERANCE: i32 = 24;
+/// 复用缓存矩形时，按当前点重新验证允许的外扩像素数。旧点处的元素矩形若不
+/// 经这一步就进入候选表，触顶 100 时会挤掉当前位置的有效边界。
+const UIA_CACHE_PAD: i32 = 8;
+
+/// 缓存复用判定：目标窗口未变、且屏幕点仍在容差内时才复用上一次成功应用
+/// 的 UIA 结果。纯函数，便于单测窗口切换 / 超距移动 / 无目标三种失效场景。
+fn uia_cache_usable(
+    last_target: Option<HWND>,
+    cur_target: Option<HWND>,
+    last_point: POINT,
+    pt: POINT,
+) -> bool {
+    last_target.is_some()
+        && last_target == cur_target
+        && (pt.x - last_point.x).abs() <= UIA_POINT_TOLERANCE
+        && (pt.y - last_point.y).abs() <= UIA_POINT_TOLERANCE
+}
+
+/// 复用缓存前按当前屏幕点重新验证：只保留（各边外扩 `pad` 像素后）包含当前
+/// 点的矩形。当前点落在窗口空白区时旧位置的子元素不再入选，避免它们挤占
+/// 候选名额。RECT 的 `contains` 是半开区间 `[left, right) × [top, bottom)`。
+fn filter_uia_for_point(rects: &[RECT], pt: POINT, pad: i32) -> Vec<RECT> {
+    let x = pt.x as i64;
+    let y = pt.y as i64;
+    let pad = pad as i64;
+    rects
+        .iter()
+        .copied()
+        .filter(|r| {
+            x >= r.left as i64 - pad
+                && x < r.right as i64 + pad
+                && y >= r.top as i64 - pad
+                && y < r.bottom as i64 + pad
+        })
+        .collect()
+}
 
 /// 一次异步 UIA 查询的状态。查询在专用 STA 线程上运行，这里只做非阻塞轮询。
 struct UiaPending {
@@ -1958,16 +1994,29 @@ impl OverlayView {
                     x: (self.mouse.x + self.origin_x as f64) as i32,
                     y: (self.mouse.y + self.origin_y as f64) as i32,
                 };
-                // 换了像素：丢弃未完成的旧查询并重新发起，但已成功应用的 UIA
-                // 结果在光标只挪了几像素且仍在同一个顶层窗口时继续复用。
-                // 过去这里传 `&[]`，UIA 候选几乎永远等不到回执就被清空。
-                self.uia_pending = None;
-                self.request_uia(hwnd, pt);
-                let cached = self.uia_last_target.is_some()
-                    && self.uia_last_target == window_under_point(hwnd, pt)
-                    && (pt.x - self.uia_last_point.x).abs() <= UIA_POINT_TOLERANCE
-                    && (pt.y - self.uia_last_point.y).abs() <= UIA_POINT_TOLERANCE;
-                let uia: Option<&[RECT]> = if cached { Some(&self.uia_last) } else { None };
+                let cached = uia_cache_usable(
+                    self.uia_last_target,
+                    window_under_point(hwnd, pt),
+                    self.uia_last_point,
+                    pt,
+                );
+                // 只有缓存不可用时才丢弃在途查询并重新发起。缓存可用时保留
+                // pending，让在途回执仍能被 poll 到并刷新 uia_last_point；
+                // 否则每换一像素就 uia_epoch+=1，旧回执必被 epoch 不匹配
+                // 丢弃，UIA 结果只在鼠标完全停下时才落地。
+                if !cached {
+                    self.uia_pending = None;
+                    self.request_uia(hwnd, pt);
+                }
+                // 复用前按当前点重新验证：旧点处的元素矩形不能原样进入候选表，
+                // 否则触顶 100 时会挤掉当前位置的有效边界。
+                let filtered;
+                let uia: &[RECT] = if cached {
+                    filtered = filter_uia_for_point(&self.uia_last, pt, UIA_CACHE_PAD);
+                    &filtered
+                } else {
+                    &[]
+                };
                 let candidates = detect_candidates(
                     self.smart_selection,
                     hwnd,
@@ -1976,7 +2025,7 @@ impl OverlayView {
                     self.origin_y,
                     self.freeze_size.0,
                     self.freeze_size.1,
-                    uia.unwrap_or(&[]),
+                    uia,
                 );
                 self.candidates = candidates;
                 self.candidates_at = Some(self.mouse);
@@ -5656,5 +5705,91 @@ mod tests {
         // Every click flips, so the same button goes back and forth.
         assert_eq!(axis_after_bar_click(Axis::Vertical, true), Axis::Horizontal);
         assert_eq!(axis_after_bar_click(Axis::Horizontal, true), Axis::Vertical);
+    }
+
+    // ---- 智能选区：UIA 缓存复用判定与按点重新验证 --------------------------
+
+    fn pt(x: i32, y: i32) -> POINT {
+        POINT { x, y }
+    }
+
+    fn hwnd(raw: usize) -> HWND {
+        HWND(raw as *mut core::ffi::c_void)
+    }
+
+    #[test]
+    fn uia_cache_reuse_within_tolerance_and_same_window() {
+        let target = hwnd(0x1234);
+        // 24px 容差内（含边界）且目标窗口不变时继续复用。
+        assert!(uia_cache_usable(
+            Some(target),
+            Some(target),
+            pt(100, 100),
+            pt(124, 124)
+        ));
+        assert!(uia_cache_usable(
+            Some(target),
+            Some(target),
+            pt(100, 100),
+            pt(76, 76)
+        ));
+        // 超过 24px 后缓存失效，必须重新查询。
+        assert!(!uia_cache_usable(
+            Some(target),
+            Some(target),
+            pt(100, 100),
+            pt(125, 100)
+        ));
+        assert!(!uia_cache_usable(
+            Some(target),
+            Some(target),
+            pt(100, 100),
+            pt(100, 125)
+        ));
+    }
+
+    #[test]
+    fn uia_cache_invalid_on_window_change_or_missing_last() {
+        let a = hwnd(0x1234);
+        let b = hwnd(0x5678);
+        // HWND 变更（包括当前点找不到窗口）都不能复用旧缓存。
+        assert!(!uia_cache_usable(
+            Some(a),
+            Some(b),
+            pt(100, 100),
+            pt(100, 100)
+        ));
+        assert!(!uia_cache_usable(Some(a), None, pt(100, 100), pt(100, 100)));
+        // 从未成功应用过 UIA 结果，没有缓存可复用。
+        assert!(!uia_cache_usable(None, Some(a), pt(100, 100), pt(100, 100)));
+        assert!(!uia_cache_usable(None, None, pt(100, 100), pt(100, 100)));
+    }
+
+    #[test]
+    fn filter_uia_for_point_keeps_only_rects_near_the_cursor() {
+        let rect = |l, t, r, b| RECT {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        };
+        let rects = [
+            rect(100, 100, 200, 200), // 当前点 (150,150) 在内
+            rect(300, 300, 400, 400), // 旧位置，远离当前点
+            rect(140, 140, 160, 160), // 在内
+            rect(158, 158, 200, 200), // 点在外 8px：pad=8 时保留，pad=0 时丢弃
+        ];
+        let kept = filter_uia_for_point(&rects, pt(150, 150), 8);
+        assert_eq!(kept.len(), 3);
+        assert!(kept.contains(&rect(100, 100, 200, 200)));
+        assert!(kept.contains(&rect(140, 140, 160, 160)));
+        assert!(kept.contains(&rect(158, 158, 200, 200)));
+        assert!(!kept.contains(&rect(300, 300, 400, 400)));
+
+        // pad=0 时按半开区间严格 contains：右/下边界不算在内。
+        let strict = filter_uia_for_point(&rects, pt(150, 150), 0);
+        assert_eq!(strict.len(), 2);
+        assert!(!strict.contains(&rect(158, 158, 200, 200)));
+        assert!(filter_uia_for_point(&rects, pt(200, 150), 0).is_empty());
     }
 }

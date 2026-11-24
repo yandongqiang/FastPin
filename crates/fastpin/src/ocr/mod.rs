@@ -2,6 +2,7 @@
 
 pub mod reading_order;
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
@@ -78,16 +79,43 @@ pub fn recognize(bgra: &[u8], w: u32, h: u32, stride: u32) -> Result<String> {
     Ok(reading_order::to_plain_text(&blocks))
 }
 
-/// True when `dir` holds all three model files with bytes in them. A zero-byte
-/// file is what an interrupted copy or download leaves behind, and ORT refuses
-/// it later, so it counts as missing. Unreadable entries count as missing too.
+/// Minimal integrity sniff for a model file. "Non-empty" is not enough: an
+/// interrupted transfer leaves a non-zero but truncated ONNX, which ORT only
+/// rejects later in `build()` — after the resources page has already painted a
+/// green dot. Read only the first 16 bytes (never the whole file) and require a
+/// conservative size floor; real ONNX models and the dictionary are tens of KB
+/// at least. ONNX is protobuf (usually starting with `0x08`), but encoders and
+/// versions differ, so only require a non-zero head rather than a strict magic
+/// match — enough to reject the common zero-filled / stub-file cases without
+/// false-negatives on valid models.
+fn looks_like_onnx(path: &std::path::Path) -> bool {
+    const MIN_BYTES: u64 = 4096;
+    let Ok(meta) = path.metadata() else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() < MIN_BYTES {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 16];
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    read > 0 && head[..read].iter().any(|&byte| byte != 0)
+}
+
+/// True when `dir` holds all three model files that pass the integrity sniff.
+/// A zero-byte or truncated file is what an interrupted copy/download leaves
+/// behind, and ORT refuses it later, so it counts as missing. Unreadable
+/// entries count as missing too. `engine_status` and `models_available` call
+/// this directly, and `build` applies the same per-file sniff, so the green dot
+/// cannot disagree with what OCR actually accepts.
 pub fn models_present_in(dir: &std::path::Path) -> bool {
-    [DET_MODEL, REC_MODEL, DICT].iter().all(|file| {
-        dir.join(file)
-            .metadata()
-            .map(|meta| meta.is_file() && meta.len() > 0)
-            .unwrap_or(false)
-    })
+    [DET_MODEL, REC_MODEL, DICT]
+        .iter()
+        .all(|file| looks_like_onnx(&dir.join(file)))
 }
 
 /// Whether the resolved model directory can drive OCR. There is no fallback
@@ -172,16 +200,14 @@ pub fn invalidate_engine() {
 
 fn build() -> Result<OAROCR> {
     let dir = models_dir()?;
+    // 与 engine_status / models_present_in 使用同一套完整性判定：截断或
+    // 全零的模型不能在这里才被发现。
     for file in [DET_MODEL, REC_MODEL, DICT] {
-        let usable = dir
-            .join(file)
-            .metadata()
-            .map(|meta| meta.is_file() && meta.len() > 0)
-            .unwrap_or(false);
-        if !usable {
+        let path = dir.join(file);
+        if !looks_like_onnx(&path) {
             return Err(Error::new(format!(
-                "OCR model missing: {}",
-                dir.join(file).display()
+                "OCR model missing or incomplete: {}",
+                path.display()
             )));
         }
     }
@@ -336,8 +362,43 @@ mod tests {
         fs::remove_file(dir.join(REC_MODEL)).unwrap();
         assert!(!models_present_in(&dir), "one file missing");
 
-        write_models(&dir, 1);
-        assert!(models_present_in(&dir), "all three non-empty");
+        write_models(&dir, 4_096);
+        assert!(models_present_in(&dir), "all three pass the sniff");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn integrity_sniff_rejects_short_and_all_zero_files() {
+        let dir = scratch("sniff");
+        let file = dir.join("candidate.onnx");
+
+        fs::write(&file, vec![8u8; 15]).unwrap();
+        assert!(!looks_like_onnx(&file), "below the 4 KiB floor");
+
+        fs::write(&file, vec![0u8; 8_192]).unwrap();
+        assert!(!looks_like_onnx(&file), "zero-filled stub is not a model");
+
+        let mut good = vec![0u8; 8_192];
+        good[0] = 0x08; // protobuf field 1: ONNX ir_version
+        fs::write(&file, &good).unwrap();
+        assert!(looks_like_onnx(&file), "non-zero head with enough bytes");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_truncated_model_is_enough_to_report_missing() {
+        let dir = scratch("integrity");
+        write_models(&dir, 8_192);
+        assert!(models_present_in(&dir), "all three intact");
+
+        fs::write(dir.join(REC_MODEL), vec![0u8; 8_192]).unwrap();
+        assert!(!models_present_in(&dir), "zeroed rec model");
+
+        fs::write(dir.join(REC_MODEL), vec![7u8; 8_192]).unwrap();
+        fs::write(dir.join(DET_MODEL), vec![8u8; 16]).unwrap();
+        assert!(!models_present_in(&dir), "truncated det model");
 
         fs::remove_dir_all(&dir).unwrap();
     }

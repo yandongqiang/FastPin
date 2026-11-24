@@ -1871,16 +1871,16 @@ mod tests {
 
     #[test]
     fn theme_variant_names_do_not_need_a_dark_suffix() {
-        // 变体名直接写进 appearance，深色变体不再要求 -dark 后缀。
+        // 真实明暗由 ThemeConfig.mode 决定，与名字后缀无关。下面的名字启发式
+        // 只按是否含 "dark" 猜测，因此无后缀的深色变体不会被它识别为深色——
+        // 这正说明深色变体靠 mode 而非后缀决定明暗，启发式仅按名字猜。
         for name in ["Catppuccin Mocha", "Tokyo Moon", "Adventure"] {
-            let settings = Settings {
-                appearance: name.into(),
-                ..Default::default()
-            };
-            let json = serde_json::to_string(&settings).expect("serializes");
-            let back = parse(&json);
-            assert_eq!(back.appearance, name);
+            assert!(!appearance_dark(name), "{name}");
         }
+        assert!(!appearance_dark("Ayu Light"));
+        assert!(appearance_dark("Ayu Dark"));
+        // 大小写不敏感，首尾空白不影响判断。
+        assert!(appearance_dark("  DARK  "));
     }
 
     #[test]

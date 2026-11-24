@@ -12,6 +12,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1
+          components: clippy, rustfmt
+      # 与 ci.yml 同款质量门禁：打 tag 前先过 fmt/clippy/test，不让坏代码发布。
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
       - run: cargo build --release --locked
       # The exe looks for models\v6 next to itself, so both packages have to carry
       # them: without this the OCR button is dead on a fresh machine (translate

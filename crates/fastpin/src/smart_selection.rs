@@ -82,8 +82,14 @@ pub fn candidates_for(
         )
     });
     out.dedup_by(|a, b| a.rect == b.rect);
-    // 已经按「深 → 浅、小 → 大」排好，直接截掉尾部最粗的一批。
-    out.truncate(MAX_CANDIDATES);
+    // 已按「深 → 浅、小 → 大」排好。直接 truncate 会丢掉排末位的整窗候选
+    // （depth 最小）：候选超过 100 时，光标落在窗口空白区就找不到包含它的
+    // 候选，整窗边界再也无法吸附。这里把最浅的那个单独留下，其余照常截断。
+    if out.len() > MAX_CANDIDATES {
+        let window = out.pop().expect("len > MAX_CANDIDATES");
+        out.truncate(MAX_CANDIDATES - 1);
+        out.push(window);
+    }
     out
 }
 
@@ -248,8 +254,8 @@ mod tests {
         );
     }
 
-    /// snow-shot 风格的上限：候选过多时只留下最深的 100 个，浅层的大矩形
-    /// 被截掉，hover 遍历不会随无障碍树的规模线性变慢。
+    /// snow-shot 风格的上限：候选过多时只留下最深的 99 个，加上保底保留的
+    /// 整窗候选，hover 遍历不会随无障碍树的规模线性变慢。
     #[test]
     fn candidates_are_capped_at_one_hundred() {
         let raw: Vec<Candidate> = (0..120)
@@ -266,8 +272,47 @@ mod tests {
         let list = candidates_for(SmartSelectionMode::WindowSubElement, raw, DESKTOP, 4.0);
         assert_eq!(list.len(), 100, "the extra twenty are dropped");
         assert_eq!(list[0].depth, 119, "deepest first");
-        assert_eq!(list[99].depth, 20, "the shallowest twenty are the tail");
-        assert!(!list.iter().any(|c| c.depth < 20));
+        assert_eq!(list[98].depth, 21, "the shallowest tail is dropped");
+        assert_eq!(
+            list[99].depth, 0,
+            "the whole-window candidate survives at the tail"
+        );
+        assert_eq!(
+            list.iter().filter(|c| c.depth == 0).count(),
+            1,
+            "only one shallow candidate is kept"
+        );
+    }
+
+    /// 候选触顶 100 时 depth 最小的整窗候选必须保底留下，否则光标落在窗口
+    /// 空白区时没有任何候选包含它，无法吸附整窗边界。
+    #[test]
+    fn truncation_keeps_the_whole_window_candidate() {
+        let window = candidate(0.0, 0.0, 900.0, 700.0, 0);
+        let mut raw: Vec<Candidate> = Vec::new();
+        raw.push(window);
+        for i in 1..120u32 {
+            // 全部落在整窗内部，深度都比整窗大。
+            raw.push(candidate(
+                10.0 + (i % 10) as f64 * 60.0,
+                10.0 + (i / 10) as f64 * 40.0,
+                30.0,
+                20.0,
+                i,
+            ));
+        }
+        let list = candidates_for(SmartSelectionMode::WindowSubElement, raw, DESKTOP, 4.0);
+        assert_eq!(list.len(), 100);
+        assert!(list.iter().any(|c| c.rect == window.rect));
+        assert_eq!(
+            preview_rect(
+                SmartSelectionMode::WindowSubElement,
+                &list,
+                Point { x: 880.0, y: 680.0 }
+            ),
+            Some(window.rect),
+            "窗口空白区仍能吸附整窗边界"
+        );
     }
 
     #[test]

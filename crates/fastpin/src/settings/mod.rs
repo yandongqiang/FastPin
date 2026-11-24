@@ -5614,8 +5614,7 @@ mod tests {
         let mut adjusted = before.clone();
         model::copy_page_fields(&mut adjusted, &before, Page::Output);
         assert_eq!(
-            adjusted.appearance,
-            "Catppuccin Latte",
+            adjusted.appearance, "Catppuccin Latte",
             "外观不是输出页的字段，重置输出页不应触碰它"
         );
 

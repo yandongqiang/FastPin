@@ -64,6 +64,17 @@ use crate::platform::WM_APP_READY_SENTINEL;
 const MAG_COUNT: u32 = 15;
 const MAG_PIXEL: f32 = 10.0;
 const MIN_RECT: f64 = 5.0;
+/// 同一窗口连续超时这么多次后熔断其 UIA 候选，直到 hover 移到别的窗口。
+const UIA_TIMEOUT_TRIP: u8 = 3;
+
+/// 一次异步 UIA 查询的状态。查询在专用 STA 线程上运行，这里只做非阻塞轮询。
+struct UiaPending {
+    rx: std::sync::mpsc::Receiver<crate::uia::UiaReply>,
+    epoch: u64,
+    /// 发起查询时的屏幕坐标；只有仍是当前 hover 点时才应用结果。
+    point: POINT,
+    started: Instant,
+}
 
 /// 完成 / Enter 按「输出」页的两个独立开关决定是否写文件与复制；
 /// 工具栏的保存按钮另有语义，只写文件、不复制（见 `save`）。
@@ -172,6 +183,15 @@ pub struct OverlayView {
     /// Where the last candidate lookup happened, so a mouse move that stays on
     /// the same pixel does not re-enumerate every child window.
     candidates_at: Option<Point>,
+    /// 正在进行的 UIA 查询；UIA 在专用 STA 线程上运行，这里只非阻塞轮询，
+    /// 超时或 epoch 过期的回执一律丢弃，绝不等待跨进程 COM。
+    uia_pending: Option<UiaPending>,
+    /// UIA 查询序号，用于丢弃鼠标移动后返回的过期结果。
+    uia_epoch: u64,
+    /// 连续超时次数；达到阈值后暂时禁用当前窗口的 UIA 候选（熔断）。
+    uia_timeouts: u8,
+    /// 被熔断的 UIA 提供程序所属顶层窗口；hover 移到别的窗口时解除。
+    uia_blocked_hwnd: Option<HWND>,
     /// Monitor bounds in capture-relative coordinates, captured once per
     /// capture instead of enumerated every frame -- the overlay repaints at
     /// 60fps for the marching ants, and `active_monitor_rect` is called
@@ -1015,6 +1035,10 @@ impl OverlayView {
             candidates: Vec::new(),
             smart_selection: crate::config::SmartSelectionMode::default(),
             candidates_at: None,
+            uia_pending: None,
+            uia_epoch: 0,
+            uia_timeouts: 0,
+            uia_blocked_hwnd: None,
             monitor_rects: Vec::new(),
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
@@ -1080,6 +1104,10 @@ impl OverlayView {
             candidates: Vec::new(),
             smart_selection,
             candidates_at: None,
+            uia_pending: None,
+            uia_epoch: 0,
+            uia_timeouts: 0,
+            uia_blocked_hwnd: None,
             monitor_rects: Vec::new(),
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
@@ -1161,11 +1189,104 @@ impl OverlayView {
         self.smart_selection = smart_selection;
         self.candidates.clear();
         self.candidates_at = None;
+        // 上一张图的 UIA 回执不能落到这一张图上。
+        self.uia_pending = None;
+        self.uia_timeouts = 0;
+        self.uia_blocked_hwnd = None;
         self.color_open = false;
         self.long = None;
         self.long_seq = self.long_seq.wrapping_add(1);
         set_long_passthrough(crate::platform::hwnd_of(window), None);
         self.sync_from_cap(window);
+    }
+
+    /// 发起一次异步 UIA 查询。只有目标窗口与上次熔断的窗口不同时才重新启用。
+    fn request_uia(&mut self, self_hwnd: HWND, pt: POINT) {
+        if !self.smart_selection.wants_sub_elements() {
+            self.uia_pending = None;
+            return;
+        }
+        let Some(target) = window_under_point(self_hwnd, pt) else {
+            self.uia_pending = None;
+            return;
+        };
+        if self.uia_blocked_hwnd == Some(target) {
+            self.uia_pending = None;
+            return;
+        }
+        self.uia_epoch = self.uia_epoch.wrapping_add(1);
+        let rx = crate::uia::elements_at_point_async(target, pt, self.uia_epoch);
+        self.uia_pending = Some(UiaPending {
+            rx,
+            epoch: self.uia_epoch,
+            point: pt,
+            started: Instant::now(),
+        });
+    }
+
+    /// 非阻塞轮询 UIA 回执。只接受当前 epoch 的结果；超时、断开或过期的回执
+    /// 一律丢弃。连续超时达到阈值后熔断该窗口的 UIA 候选，直到 hover 移动
+    /// 到别的窗口。
+    fn poll_uia_result(&mut self, window: &Window) {
+        // 把借用收进局部作用域，回调里可以自由改写 self 的字段。
+        let received = {
+            let Some(pending) = self.uia_pending.as_ref() else {
+                return;
+            };
+            let info = (pending.epoch, pending.point, pending.started);
+            (pending.rx.try_recv(), info)
+        };
+        let (recv, (epoch, point, started)) = received;
+        match recv {
+            Ok(reply) => {
+                self.uia_pending = None;
+                if reply.epoch != epoch {
+                    // 鼠标已经移动，旧结果直接丢弃。
+                    return;
+                }
+                self.uia_timeouts = 0;
+                self.uia_blocked_hwnd = None;
+                // 查询时的屏幕点必须仍是当前 hover 点，否则结果属于旧位置。
+                let now = POINT {
+                    x: (self.mouse.x + self.origin_x as f64) as i32,
+                    y: (self.mouse.y + self.origin_y as f64) as i32,
+                };
+                if now != point {
+                    return;
+                }
+                let hwnd = crate::platform::hwnd_of(window);
+                let uia_rects: Vec<RECT> = reply.rects.into_iter().map(|el| el.rect).collect();
+                self.candidates = detect_candidates(
+                    self.smart_selection,
+                    hwnd,
+                    point,
+                    self.origin_x,
+                    self.origin_y,
+                    self.freeze_size.0,
+                    self.freeze_size.1,
+                    &uia_rects,
+                );
+                self.hover = crate::smart_selection::preview_rect(
+                    self.smart_selection,
+                    &self.candidates,
+                    self.mouse,
+                );
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if started.elapsed() > crate::uia::UIA_QUERY_TIMEOUT {
+                    self.uia_pending = None;
+                    self.uia_timeouts = self.uia_timeouts.saturating_add(1);
+                    if self.uia_timeouts >= UIA_TIMEOUT_TRIP {
+                        let hwnd = crate::platform::hwnd_of(window);
+                        self.uia_blocked_hwnd = window_under_point(hwnd, point);
+                        self.uia_timeouts = 0;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.uia_pending = None;
+            }
+        }
     }
 
     fn sync_from_cap(&mut self, window: &Window) {
@@ -1216,7 +1337,10 @@ impl OverlayView {
             oy,
             self.freeze_size.0,
             self.freeze_size.1,
+            &[],
         );
+        // UIA 在后台线程查询；结果由 render 里的 poll_uia_result 应用。
+        self.request_uia(hwnd, pt);
         self.hover = hit_window(&self.windows, mouse);
     }
 
@@ -1385,7 +1509,9 @@ impl OverlayView {
             }
             Err(e) => {
                 crate::perf::log_app(&format!("gpu reset: overlay recovery failed: {e}"));
-                let _ = crate::gpu_lifecycle::acknowledge_recovery();
+                // 冻结视觉没有重建成功，不能确认恢复：保持在 Recreated，
+                // 让下一次捕获继续按新 generation 重建，绝不谎报 Ready。
+                let _ = crate::gpu_lifecycle::mark_recovery_failed();
                 self.finish(empty_result(), window, cx);
             }
         }
@@ -1576,6 +1702,7 @@ impl OverlayView {
         self.hit = SelectionHitKind::None;
         self.hover = None;
         self.candidates_at = None;
+        self.uia_pending = None;
         self.phase = Phase::Selecting;
     }
 
@@ -1777,6 +1904,10 @@ impl OverlayView {
                     x: (self.mouse.x + self.origin_x as f64) as i32,
                     y: (self.mouse.y + self.origin_y as f64) as i32,
                 };
+                // 换了像素：上一次查询的结果已经不适用，丢弃并重新发起。
+                // 本帧先用 child HWND 候选，UIA 回执到达后再补上。
+                self.uia_pending = None;
+                self.request_uia(hwnd, pt);
                 self.candidates = detect_candidates(
                     self.smart_selection,
                     hwnd,
@@ -1785,6 +1916,7 @@ impl OverlayView {
                     self.origin_y,
                     self.freeze_size.0,
                     self.freeze_size.1,
+                    &[],
                 );
                 self.candidates_at = Some(self.mouse);
             }
@@ -4217,6 +4349,11 @@ impl EntityInputHandler for OverlayView {
 impl Render for OverlayView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_recover_gpu(cx);
+        // UIA 查询在专用 STA 线程上跑；这里只非阻塞取回结果，绝不在渲染帧里
+        // 等待跨进程 COM（提供程序无响应时曾把截图窗口整条 UI 线程卡死）。
+        if self.visible && self.phase == Phase::Selecting {
+            self.poll_uia_result(window);
+        }
         if self.visible {
             window.request_animation_frame();
         }
@@ -4763,6 +4900,7 @@ fn detect_windows(self_hwnd: HWND, ox: i32, oy: i32) -> Vec<Rect> {
 /// Depth is assigned by rect containment: a pane inside another candidate is
 /// one layer deeper. That puts the same scale on child HWNDs and UIA elements,
 /// so the hover walk can order them without knowing where each came from.
+#[allow(clippy::too_many_arguments)]
 fn detect_candidates(
     mode: crate::config::SmartSelectionMode,
     self_hwnd: HWND,
@@ -4771,6 +4909,7 @@ fn detect_candidates(
     oy: i32,
     capture_w: u32,
     capture_h: u32,
+    uia_rects: &[RECT],
 ) -> Vec<crate::smart_selection::Candidate> {
     use crate::smart_selection::{candidates_for, Candidate};
     if !mode.enabled() {
@@ -4811,12 +4950,10 @@ fn detect_candidates(
             rects.extend(ctx.rects.into_iter().map(shift));
 
             // ... and UIA elements for modern apps that paint their panes
-            // inside a single HWND (WPF / Electron / Chromium).
-            rects.extend(
-                crate::uia::elements_at_point(top, pt)
-                    .into_iter()
-                    .map(|el| shift(el.rect)),
-            );
+            // inside a single HWND (WPF / Electron / Chromium). The query runs
+            // on a dedicated STA worker; we only consume an already-returned
+            // result here, so a hung provider can never stall the UI thread.
+            rects.extend(uia_rects.iter().map(|r| shift(*r)));
         }
     }
     if rects.is_empty() {

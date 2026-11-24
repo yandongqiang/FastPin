@@ -7,6 +7,10 @@ This project is licensed under the GNU General Public License, version 3 or
 
 === Upstream attribution ===
 
+FastPin was originally built by secondary development on Zshot (the source
+project / 来源项目), a Rust / GPUI screen capture utility; its underlying base
+technology comes from Starshot.
+
 FastPin contains code derived from Starshot
 (https://github.com/loliri/Starshot), originally distributed under the MIT
 License:
@@ -37,12 +41,15 @@ License:
     SOFTWARE.
 
 FastPin vendors GPL-3.0-or-later Rust crates from Snow Shot
-(https://github.com/mg-chao/snow-shot), used for long-screenshot image stitching:
+(https://github.com/mg-chao/snow-shot) and contains code ported from snow-shot
+across image stitching/collage, image splitting, capture history, colour picking,
+scroll stepping, adaptive capture cadence and other modules:
 
     Snow Crates - shared Rust libraries and C ABI components for Snow Apps.
     Copyright (C) 2026 mg-chao
     SPDX-License-Identifier: GPL-3.0-or-later
 
     crates/snow-stitch-images/ and crates/snow-memory/ are derived from
-    snow-crates/ in the Snow Shot repository. See COPYRIGHT.snow-shot and the
+    snow-crates/ in the Snow Shot repository; the additional modules listed
+    above are ported into FastPin itself. See COPYRIGHT.snow-shot and the
     LICENSE files inside those crate directories for full notices.

@@ -14,8 +14,4 @@ The complete GNU General Public License version 3 is in LICENSE. Third-party
 components remain subject to their respective licenses and attribution terms.
 Nested copyright notices take precedence for their stated scope.
 
-The independent `crates/simd-paddle-ocr-rs/` Git submodule remains licensed
-under Apache-2.0; see its LICENSE and NOTICE files. Its copyright is:
-Copyright (C) 2026 simd-paddle-ocr-rs Contributors
-
 SPDX-License-Identifier: GPL-3.0-or-later

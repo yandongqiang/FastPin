@@ -1,7 +1,9 @@
-; FastPin installer — build with:
-;   "C:\Users\admin\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer\fastpin.iss
-; Payload mirrors the portable layout: FastPin.exe + DirectML.dll + models\v6,
-; which is exactly what ocr::models_dir expects next to the exe. Themes are
+; FastPin installer — build with Inno Setup 6's ISCC.exe (on PATH, or found under
+; "C:\Program Files (x86)\Inno Setup 6" / "%LOCALAPPDATA%\Programs\Inno Setup 6"):
+;   ISCC.exe installer\fastpin.iss
+; Payload mirrors the portable layout: FastPin.exe + DirectML.dll + models\v6
+; plus LICENSE / NOTICE / COPYRIGHT.snow-shot for GPL attribution. The models
+; are exactly what ocr::models_dir expects next to the exe. Themes are
 ; compiled into the binary by build.rs, so no themes\ directory is shipped.
 
 // release.yml injects /DAppVersion=<tag>; the fallback matches Cargo.toml.
@@ -44,6 +46,9 @@ Name: "autostart"; Description: "开机自动启动"; GroupDescription: "其他�
 [Files]
 Source: "..\target\release\FastPin.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\DirectML.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\COPYRIGHT.snow-shot"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\models\v6\*"; DestDir: "{app}\models\v6"; Flags: ignoreversion recursesubdirs createallSubdirs
 
 [Icons]

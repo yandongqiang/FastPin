@@ -12,7 +12,7 @@ migration.
 
 ## What the patches add
 
-`gpui-pre-0.3.9-fastpin-overlay.patch` (155 added, 4 removed) — the platform-neutral
+`gpui-pre-0.3.9-fastpin-overlay.patch` (163 added, 0 removed) — the platform-neutral
 surface:
 
 | File | Change |
@@ -22,7 +22,7 @@ surface:
 | `src/app.rs` | `App::gpu_generation / adapter_luid / with_gpu_context / on_gpu_reset_begin / release_gpu_devices`. |
 | `src/window.rs` | `Window::set_background_swap_chain / wait_for_commit_completion / on_app_ready_sentinel`. |
 
-`gpui-pre-windows-0.3.9-fastpin-overlay.patch` (256 added, 13 removed) — the
+`gpui-pre-windows-0.3.9-fastpin-overlay.patch` (271 added, 7 removed) — the
 Windows implementation:
 
 | File | Change |

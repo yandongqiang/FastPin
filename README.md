@@ -26,7 +26,7 @@
 
 GPUI 界面、单 HWND 冻结覆盖层、DirectComposition 合成，目标是更小的体积与更快的冷启动。功能上对齐 C# 版的主干流程，尚未补齐的部分见[与 C# 版的差距](#与-c-版的差距)。
 
-FastPin 最初基于 Zshot 二次vibe coding开发。
+FastPin 最初基于 Zshot 二次开发，底座技术来自 Starshot。
 
 ## 为什么
 
@@ -77,7 +77,7 @@ FastPin 最初基于 Zshot 二次vibe coding开发。
 - 模型是 **PP-OCRv6 Small**，随发布包一起分发，装完即用，不需要联网下载
 - 多语言单模型：简体中文、繁体中文、英文、日文及拉丁语系
 - **全程本地推理，截图不上传**
-- 首次调用加载模型约 160 ms，之后会话保留 60 秒，空闲超时自动释放，不长期占内存
+- 首次调用加载模型约 160–400 ms，之后会话保留 60 秒，空闲超时自动释放，不长期占内存
 
 ### 翻译
 
@@ -94,11 +94,11 @@ OCR 取出文字后一键翻译：
 
 固定选区，滚动页面时自动检测新内容并拼接。可以手动滚动，也可以打开长截图工具栏上的「自动滚动」开关，让程序按固定节奏代你滚动；连续多步没有新内容时会自动停止。
 
-- 每 150 ms 采一帧，按重叠区域做灰度 SAD / ORB 特征匹配对齐，避免重复条带
+- 自适应帧率采帧（2–30 fps，初始约 125 ms 一帧），按重叠区域做灰度 SAD / ORB 特征匹配对齐，避免重复条带
 - 上限 16384px（D3D11 纹理尺寸上限）
 - 拼接期间选区点击穿透，下方的应用正常接收滚轮
 - 自动滚动按原生滚轮步长发送，每步间隔与步长可配
-- 完成时同时保存 PNG 并复制到剪贴板
+- 完成进入预览窗口，可手动保存 PNG、复制或继续裁剪/拼图
 
 长截图预览窗口还能把结果直接送到两个后续工具：
 
@@ -222,7 +222,7 @@ set FASTPIN_MODELS=<你的仓库路径>\models\v6
 HDR 屏幕下捕获走 scRGB + GPU tone mapping，理论上不会发灰。若遇到请提 issue 并附显示器型号。
 
 **OCR 第一次特别慢？**
-首次调用要加载 ONNX 模型（约 160~400 ms），之后 60 秒内复用同一会话。稳定后典型选区约 1 秒。
+首次调用要加载 ONNX 模型（约 160–400 ms），之后 60 秒内复用同一会话。稳定后典型选区约 1 秒。
 
 **OCR 认不出某种语言？**
 PP-OCRv6 Small 覆盖中日英与拉丁语系。韩文、阿拉伯文等不在支持范围内。
@@ -238,8 +238,8 @@ PP-OCRv6 Small 覆盖中日英与拉丁语系。韩文、阿拉伯文等不在�
 
 ## 致谢
 
-- [Starshot](https://github.com/loliri/Starshot) — FastPin 最初的底座，作者 [@loliri](https://github.com/loliri)（MIT）
-- Zshot — 本仓库直接基于其二次开发的 Rust / GPUI 截图工具
+- Zshot — FastPin 最初基于其二次开发的 Rust / GPUI 截图工具（来源项目）
+- [Starshot](https://github.com/loliri/Starshot) — 底座技术来源，作者 [@loliri](https://github.com/loliri)（MIT）
 - [GPUI](https://github.com/zed-industries/zed) — Zed 编辑器的 GPU 加速 UI 框架
 - [oar-ocr](https://github.com/GreatV/oar-ocr) — Rust OCR 推理封装
 - [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) — PP-OCRv6 模型（Apache-2.0）
@@ -255,4 +255,4 @@ FastPin does not transfer screenshots, OCR results, API keys, or other user data
 
 GPL-3.0-or-later，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
 
-FastPin 包含来自 snow-shot（GPL-3.0-or-later）的拼图/图像拼接代码，因此整体按 GPL-3.0-or-later 发布。FastPin 最初基于 Zshot 二次开发。
+FastPin 包含来自 snow-shot（GPL-3.0-or-later）的图像拼接、切图、历史、颜色选取、滚动步长、自适应帧率等多个模块的代码，因此整体按 GPL-3.0-or-later 发布。FastPin 最初基于 Zshot 二次开发，底座技术来自 Starshot。

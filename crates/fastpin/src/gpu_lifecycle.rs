@@ -155,6 +155,8 @@ pub struct GpuLifecycle {
     /// The newest generation a device was successfully created for.
     generation: u64,
     resets: u32,
+    /// 冻结视觉重建失败次数；仅用于诊断，不改变状态转移。
+    recovery_failures: u32,
 }
 
 impl GpuLifecycle {
@@ -163,6 +165,7 @@ impl GpuLifecycle {
             state: GpuLifecycleState::Ready { generation },
             generation,
             resets: 0,
+            recovery_failures: 0,
         }
     }
 
@@ -176,6 +179,10 @@ impl GpuLifecycle {
 
     pub fn reset_count(&self) -> u32 {
         self.resets
+    }
+
+    pub fn recovery_failures(&self) -> u32 {
+        self.recovery_failures
     }
 
     /// Marks the start of a device reset. `Ready`/`Recreated`/`Lost` may
@@ -257,6 +264,21 @@ impl GpuLifecycle {
         }
     }
 
+    /// 冻结视觉 / 辅助资源在新设备上重建失败。
+    ///
+    /// 保持在 `Recreated`（新设备资源仍可用，`should_rebuild_freeze` 会继续
+    /// 要求重试），绝不谎报 `Ready`；只累计失败次数供诊断。后续重建成功时
+    /// `acknowledge_recovery` 仍可正常回到 `Ready`。
+    pub fn mark_recovery_failed(&mut self) -> Result<GpuLifecycleState, GpuLifecycleError> {
+        match self.state {
+            GpuLifecycleState::Recreated { .. } => {
+                self.recovery_failures = self.recovery_failures.wrapping_add(1);
+                Ok(self.state)
+            }
+            _ => Err(GpuLifecycleError::NotRecovering),
+        }
+    }
+
     pub fn is_usable(&self, generation: u64) -> bool {
         self.state.is_usable(generation)
     }
@@ -321,6 +343,11 @@ pub fn observe_generation(generation: u64) -> GpuLifecycleState {
 
 pub fn acknowledge_recovery() -> Result<GpuLifecycleState, GpuLifecycleError> {
     lock().acknowledge_recovery()
+}
+
+/// 冻结视觉重建失败：保持 `Recreated`，不确认恢复。
+pub fn mark_recovery_failed() -> Result<GpuLifecycleState, GpuLifecycleError> {
+    lock().mark_recovery_failed()
 }
 
 pub fn is_usable(generation: u64) -> bool {
@@ -491,6 +518,36 @@ mod tests {
             Ok(GpuLifecycleState::Ready { generation: 2 })
         );
         assert!(life.is_usable(2));
+    }
+
+    #[test]
+    fn failed_recovery_stays_recreated_and_can_be_retried() {
+        let mut life = GpuLifecycle::new(1);
+        life.begin_reset().unwrap();
+        life.device_recreated(2).unwrap();
+        assert_eq!(
+            life.mark_recovery_failed(),
+            Ok(GpuLifecycleState::Recreated { generation: 2 })
+        );
+        assert_eq!(life.recovery_failures(), 1);
+        assert_ne!(life.state(), GpuLifecycleState::Ready { generation: 2 });
+        // 视觉没重建成功，下一帧仍应重试。
+        assert!(should_rebuild_freeze(life.state(), None));
+        // 重试成功后仍可正常回到 Ready。
+        assert_eq!(
+            life.acknowledge_recovery(),
+            Ok(GpuLifecycleState::Ready { generation: 2 })
+        );
+    }
+
+    #[test]
+    fn mark_recovery_failed_outside_recreated_is_refused() {
+        let mut life = GpuLifecycle::new(1);
+        assert_eq!(
+            life.mark_recovery_failed(),
+            Err(GpuLifecycleError::NotRecovering)
+        );
+        assert_eq!(life.recovery_failures(), 0);
     }
 
     #[test]

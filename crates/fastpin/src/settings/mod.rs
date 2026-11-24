@@ -486,8 +486,9 @@ pub struct SettingsView {
     /// 差异即为本页真正改过的字段；相同字段保留其它窗口写入的最新值。
     /// 每次保存成功后前移，避免「改回原值」被误判成从未编辑过。
     baseline: Settings,
-    /// 重置本页 / 全部设置时置位：默认配置可能恰好等于开窗基线，此时逐字段
-    /// 差异无法区分「重置」与「没碰过」，必须强制整份采用快照让重置落盘。
+    /// 仅全局重置时置位：默认配置可能恰好等于开窗基线，此时逐字段差异无法
+    /// 区分「重置」与「没碰过」，必须强制整份采用快照让重置落盘。单页重置
+    /// 改为只把本页字段的基线前移到重置前的值，不置这个全局开关。
     force_snapshot: bool,
     /// 外观下拉的全部选项（gpui-kit registry 里的主题名，默认两项在前），开窗时取样一次。
     theme_options: Vec<(String, String)>,
@@ -1082,7 +1083,9 @@ impl SettingsView {
         seq
     }
 
-    fn persist(&mut self, cx: &mut Context<Self>) {
+    /// 返回本次是否真的写盘成功。重置流程据此决定能否显示「已重置」；其它
+    /// 调用点忽略即可（bool 不是 must_use，不会触发未使用返回值警告）。
+    fn persist(&mut self, cx: &mut Context<Self>) -> bool {
         // self.settings 是开窗时的快照，拼图 / 切图窗口期间可能已各自保存过
         // 自己的字段。从最新配置出发，只把本页改过的字段换成快照值；没改过的
         // 共享字段（collage / pdf / export / appearance / split）一律保留 latest。
@@ -1092,7 +1095,7 @@ impl SettingsView {
             &self.baseline,
             self.force_snapshot,
         );
-        match crate::config::save(&merged) {
+        let saved = match crate::config::save(&merged) {
             Ok(()) => {
                 // 保存成功才前移基线并撤销重置强制：失败时保留现场，下次
                 // 重试仍应把重置的默认值写下去。
@@ -1100,10 +1103,16 @@ impl SettingsView {
                 self.force_snapshot = false;
                 self.status = SharedString::default();
                 self.status_error = false;
+                true
             }
-            Err(e) => self.fail(format!("设置保存失败：{e}")),
-        }
+            Err(e) => {
+                // 失败文案留在这里，调用方（尤其是重置）不得再用成功提示覆盖。
+                self.fail(format!("设置保存失败：{e}"));
+                false
+            }
+        };
         cx.notify();
+        saved
     }
 
     fn commit_api_key(&mut self, cx: &mut Context<Self>) {
@@ -1246,6 +1255,10 @@ impl SettingsView {
             cx.notify();
             return;
         }
+        // 先留一份重置前的快照 / 基线：只把本页字段在基线中标成「已编辑」，
+        // 保存失败时还能原样回滚，不污染下次重试的判断。
+        let before_reset = self.settings.clone();
+        let baseline_before = self.baseline.clone();
         if model::reset_page(&mut self.settings, self.page) {
             if self.page == Page::Translate {
                 // The key lives in the credential vault, not settings.json:
@@ -1260,16 +1273,25 @@ impl SettingsView {
             if self.page == Page::Hotkey {
                 self.reapply_hotkeys();
             }
-            // 重置值可能恰好等于基线（本来就是默认的字段），显式强制整份
-            // 采用快照，否则这些字段会从 latest 读回外部写入的旧值。
-            self.force_snapshot = true;
-            self.persist(cx);
+            // 不能置全局 force：那会让 collage / pdf / export / appearance /
+            // split 整份取开窗快照，回滚其它窗口共享的最新值。只把本页字段的
+            // 基线改成重置前的值，使快照（默认值）与之产生差异，keep_edited
+            // 自然采用快照；其它页的字段仍保留 latest。
+            model::copy_page_fields(&mut self.baseline, &before_reset, self.page);
+            let saved = self.persist(cx);
+            if !saved {
+                // persist 已写入「设置保存失败」且未前移基线；撤销刚才的本页
+                // 标记，下次重试仍按原始基线判断，也不显示「已重置」成功提示。
+                self.baseline = baseline_before;
+            }
             if self.page == Page::Resources {
                 // 模型目录被重置，缓存的引擎快照与已加载引擎都必须同步失效。
                 crate::ocr::invalidate_engine();
                 self.refresh_engine_status(true, cx);
             }
-            self.ok(format!("已重置「{}」", self.page.title()));
+            if saved {
+                self.ok(format!("已重置「{}」", self.page.title()));
+            }
         } else {
             self.ok("本页没有可重置的配置");
         }
@@ -1287,16 +1309,21 @@ impl SettingsView {
         self.sync_inputs(cx);
         self.reapply_hotkeys();
         self.confirm_reset_all = false;
-        // 全局重置包含 split 等由其它窗口写入的字段，必须整份落盘。
+        // 全局重置包含 split 等由其它窗口写入的字段，必须整份落盘（这里全局
+        // force 是语义所需，与单页重置不同）。
         self.force_snapshot = true;
-        self.persist(cx);
+        let saved = self.persist(cx);
         // 全局重置也会清掉 OCR 模型目录，刷新状态页快照并让旧引擎立即失效。
         crate::ocr::invalidate_engine();
         self.refresh_engine_status(true, cx);
-        match autostart_error {
-            Some(e) => self.fail(format!("所有设置已恢复默认，但关闭开机启动失败：{e}")),
-            None => self.ok("所有设置已恢复默认"),
+        if saved {
+            match autostart_error {
+                Some(e) => self.fail(format!("所有设置已恢复默认，但关闭开机启动失败：{e}")),
+                None => self.ok("所有设置已恢复默认"),
+            }
         }
+        // 保存失败时 persist 已显示「设置保存失败」，不再用成功文案覆盖，
+        // force_snapshot 也保留着，下次重试仍会整份写入默认配置。
         cx.notify();
     }
 
@@ -5044,8 +5071,9 @@ impl SettingsView {
 }
 
 /// 共享字段的逐字段合并：本页改过（快照与上次落盘基线不同）才用快照值，
-/// 没改过的一律保留其它窗口写入的最新值。`force` 供重置使用——默认值可能
-/// 恰好等于基线，此时不看差异也必须整份采用快照。
+/// 没改过的一律保留其它窗口写入的最新值。`force` 仅供全局重置使用——默认值
+/// 可能恰好等于基线，此时不看差异也必须整份采用快照。单页重置改为只把本页
+/// 字段的基线前移到重置前的值，仍走差异判断，不置全局 force。
 fn keep_edited<T: PartialEq + Clone>(dst: &mut T, snapshot: &T, baseline: &T, force: bool) {
     if force || snapshot != baseline {
         *dst = snapshot.clone();
@@ -5054,11 +5082,12 @@ fn keep_edited<T: PartialEq + Clone>(dst: &mut T, snapshot: &T, baseline: &T, fo
 
 /// 设置页落盘前的合并：从最新配置出发，只覆盖本页真正改过的字段。
 ///
-/// ocr / translation / history / hotkeys 与截屏页的显示项、水印只有本页写，
-/// 沿用快照（与旧行为一致）。collage / pdf / export / appearance 同时被拼图
-/// 窗口、切图窗口和主题回写修改：`baseline` 是上次本页落盘时的值，逐字段
-/// 比较即可知道本页是否改过，没改过的字段保留 latest，不再被陈旧快照整体
-/// 回滚。split 本页没有控件，只有全局重置才会改，因此仅在 `force` 时取快照。
+/// ocr / translation / history / hotkeys 与截屏页的显示项、水印、13 个独占
+/// 控件字段只有本页写，沿用快照（与旧行为一致）。collage / pdf / export /
+/// appearance 同时被拼图窗口、切图窗口和主题回写修改：`baseline` 是上次本页
+/// 落盘时的值，逐字段比较即可知道本页是否改过，没改过的字段保留 latest，
+/// 不再被陈旧快照整体回滚。split 本页没有控件，只有全局重置才会改，因此仅
+/// 在 `force` 时取快照。
 fn settings_persist_merge(
     latest: &Settings,
     snapshot: &Settings,
@@ -5081,6 +5110,21 @@ fn settings_persist_merge(
     screenshot.watermark = s.watermark.clone();
     screenshot.smart_selection = s.smart_selection;
     screenshot.auto_scroll = s.auto_scroll.clone();
+    // 截屏页独占的控件字段：无条件采用快照（force 与否都一样）。否则开关改了
+    // 也落不了盘，reset_page(Screenshot) / reset_all 也带不回默认值。
+    screenshot.capture_mode = s.capture_mode;
+    screenshot.show_cursor = s.show_cursor;
+    screenshot.show_guides = s.show_guides;
+    screenshot.long_capture_auto_start = s.long_capture_auto_start;
+    screenshot.left_double_click = s.left_double_click;
+    screenshot.middle_click = s.middle_click;
+    screenshot.click_outside = s.click_outside;
+    screenshot.record_history_sources = s.record_history_sources.clone();
+    screenshot.toolbar_position = s.toolbar_position;
+    screenshot.panel_position = s.panel_position;
+    screenshot.show_magnifier = s.show_magnifier;
+    screenshot.show_info_bar = s.show_info_bar;
+    screenshot.show_shortcut_hints = s.show_shortcut_hints;
     keep_edited(
         &mut screenshot.collage.direction,
         &s.collage.direction,
@@ -5430,6 +5474,221 @@ mod tests {
         assert_eq!(reset.screenshot.split.count, 2);
     }
 
+    /// 截屏页 13 个独占字段的非默认样例（与 model.rs 的重置用例一致）。
+    fn non_default_exclusive(s: &mut Settings) {
+        s.screenshot.capture_mode = crate::config::CaptureMode::Dxgi;
+        s.screenshot.show_cursor = true;
+        s.screenshot.show_guides = true;
+        s.screenshot.long_capture_auto_start = crate::config::LongCaptureAutoStart::Manual;
+        s.screenshot.left_double_click = crate::config::ClickAction::Save;
+        s.screenshot.middle_click = crate::config::ClickAction::Copy;
+        s.screenshot.click_outside = crate::config::ClickOutside::Recreate;
+        s.screenshot.record_history_sources = vec!["region".into()];
+        s.screenshot.toolbar_position = crate::config::ToolbarPosition::Bottom;
+        s.screenshot.panel_position = crate::config::PanelPosition::Right;
+        s.screenshot.show_magnifier = false;
+        s.screenshot.show_info_bar = false;
+        s.screenshot.show_shortcut_hints = false;
+    }
+
+    fn assert_exclusive(actual: &Settings, expected: &Settings) {
+        assert_eq!(
+            actual.screenshot.capture_mode,
+            expected.screenshot.capture_mode
+        );
+        assert_eq!(
+            actual.screenshot.show_cursor,
+            expected.screenshot.show_cursor
+        );
+        assert_eq!(
+            actual.screenshot.show_guides,
+            expected.screenshot.show_guides
+        );
+        assert_eq!(
+            actual.screenshot.long_capture_auto_start,
+            expected.screenshot.long_capture_auto_start
+        );
+        assert_eq!(
+            actual.screenshot.left_double_click,
+            expected.screenshot.left_double_click
+        );
+        assert_eq!(
+            actual.screenshot.middle_click,
+            expected.screenshot.middle_click
+        );
+        assert_eq!(
+            actual.screenshot.click_outside,
+            expected.screenshot.click_outside
+        );
+        assert_eq!(
+            actual.screenshot.record_history_sources,
+            expected.screenshot.record_history_sources
+        );
+        assert_eq!(
+            actual.screenshot.toolbar_position,
+            expected.screenshot.toolbar_position
+        );
+        assert_eq!(
+            actual.screenshot.panel_position,
+            expected.screenshot.panel_position
+        );
+        assert_eq!(
+            actual.screenshot.show_magnifier,
+            expected.screenshot.show_magnifier
+        );
+        assert_eq!(
+            actual.screenshot.show_info_bar,
+            expected.screenshot.show_info_bar
+        );
+        assert_eq!(
+            actual.screenshot.show_shortcut_hints,
+            expected.screenshot.show_shortcut_hints
+        );
+    }
+
+    /// 截图页独占控件没有 keep_edited 保护：无论 force 与否、无论基线如何，
+    /// 都必须取快照，否则打开「捕获鼠标光标」这类开关根本落不了盘，重置也无效。
+    #[test]
+    fn persist_merge_uses_screenshot_page_owned_fields_even_when_unchanged() {
+        let baseline = Settings::default();
+        let mut snapshot = baseline.clone();
+        non_default_exclusive(&mut snapshot);
+        let merged = settings_persist_merge(&Settings::default(), &snapshot, &baseline, false);
+        assert_eq!(
+            merged.screenshot.capture_mode,
+            crate::config::CaptureMode::Dxgi
+        );
+        assert!(merged.screenshot.show_cursor, "捕获鼠标光标必须落盘");
+        assert_exclusive(&merged, &snapshot);
+
+        // 重置：快照已回默认，latest 里还留着非默认值也必须写回默认。
+        let mut stale = Settings::default();
+        non_default_exclusive(&mut stale);
+        let reset = settings_persist_merge(&stale, &baseline, &baseline, false);
+        assert_exclusive(&reset, &baseline);
+        // force=true（全局重置）同理。
+        let forced = settings_persist_merge(&stale, &baseline, &baseline, true);
+        assert_exclusive(&forced, &baseline);
+    }
+
+    /// 触发回归的场景：开窗 spacing=0，拼图窗口改成 5，此时点「重置数据页」
+    /// 不能把 collage / pdf / export / appearance / split 回滚成开窗值。
+    #[test]
+    fn page_reset_does_not_roll_back_other_windows_shared_fields() {
+        let mut baseline = Settings::default();
+        baseline.history.enabled = false; // 本页重置前的旧值
+        let mut snapshot = baseline.clone();
+        let mut latest = Settings::default();
+        latest.screenshot.collage.spacing = 5;
+        latest.screenshot.pdf.image_quality = 77;
+        latest.screenshot.export.quality = 88;
+        latest.appearance = "Tokyo Moon".into();
+        latest.screenshot.split.count = 9;
+
+        assert!(model::reset_page(&mut snapshot, Page::Data));
+        let mut adjusted = baseline.clone();
+        model::copy_page_fields(&mut adjusted, &baseline, Page::Data);
+        let merged = settings_persist_merge(&latest, &snapshot, &adjusted, false);
+        assert_eq!(merged.screenshot.collage.spacing, 5);
+        assert_eq!(merged.screenshot.pdf.image_quality, 77);
+        assert_eq!(merged.screenshot.export.quality, 88);
+        assert_eq!(merged.appearance, "Tokyo Moon");
+        assert_eq!(merged.screenshot.split.count, 9);
+        assert_eq!(
+            serde_json::to_value(&merged.history).expect("serializes"),
+            serde_json::to_value(&snapshot.history).expect("serializes")
+        );
+    }
+
+    /// 本页字段仍要能重置落盘；其它页的字段保持旧 baseline，继续取 latest。
+    #[test]
+    fn page_reset_baseline_marks_only_owned_fields_edited() {
+        let mut before = Settings::default();
+        before.screenshot.collage.spacing = 12; // 上次落盘的本页值
+        before.appearance = "Catppuccin Latte".into(); // 开窗时本页的外观值
+        let mut snapshot = before.clone();
+        assert!(model::reset_page(&mut snapshot, Page::Output));
+
+        // 真实的 baseline 包含所有字段的上次落盘值；copy_page_fields 只把
+        // 本页字段改成重置前值，其它字段必须保持原样。
+        let mut adjusted = before.clone();
+        model::copy_page_fields(&mut adjusted, &before, Page::Output);
+        assert_eq!(
+            adjusted.appearance,
+            "Catppuccin Latte",
+            "外观不是输出页的字段，重置输出页不应触碰它"
+        );
+
+        let mut latest = before.clone();
+        latest.screenshot.collage.spacing = 5; // 其它窗口也写过，但本页重置优先
+        latest.appearance = "Tokyo Moon".into(); // 主题回写
+        let merged = settings_persist_merge(&latest, &snapshot, &adjusted, false);
+        assert_eq!(merged.screenshot.collage.spacing, 0, "本页重置值必须落盘");
+        assert_eq!(merged.appearance, "Tokyo Moon", "其它页字段保留 latest");
+    }
+
+    /// 基线前移后，「把值改回默认值」也必须与基线产生差异，才能跨两次
+    /// persist 正确落盘（回归：第二次合并拿旧基线比对，误判成没改过）。
+    #[test]
+    fn persist_merge_value_returned_to_default_lands_after_baseline_advanced() {
+        let baseline = Settings::default();
+        let mut snapshot = baseline.clone();
+        snapshot.screenshot.collage.spacing = 5;
+        let mut latest = Settings::default();
+        let first = settings_persist_merge(&latest, &snapshot, &baseline, false);
+        assert_eq!(first.screenshot.collage.spacing, 5);
+
+        // 第一次保存成功后基线前移为快照；本页再把 spacing 改回默认 0。
+        let advanced = snapshot;
+        let snapshot2 = Settings::default();
+        latest.screenshot.collage.spacing = 5;
+        let second = settings_persist_merge(&latest, &snapshot2, &advanced, false);
+        assert_eq!(second.screenshot.collage.spacing, 0);
+    }
+
+    /// persist 必须把成败返回给重置流程；失败文案不得被「已重置」覆盖，
+    /// 单页重置也不能再置全局 force（全局重置仍保留）。
+    #[test]
+    fn reset_flows_check_persist_result_and_scope() {
+        let source = include_str!("mod.rs");
+        assert!(source.contains("fn persist(&mut self, cx: &mut Context<Self>) -> bool"));
+        let start = source
+            .find("fn reset_page(")
+            .expect("reset_page is defined");
+        let all_start = source
+            .find("fn reset_all(")
+            .expect("reset_all follows reset_page");
+        let end = source
+            .find("fn set_water_position(")
+            .expect("set_water_position follows resets");
+        let page = &source[start..all_start];
+        let all = &source[all_start..end];
+        assert_eq!(page.matches("self.persist(cx)").count(), 1);
+        assert_eq!(all.matches("self.persist(cx)").count(), 1);
+        assert!(page.contains("if saved {"), "成功才显示已重置");
+        assert!(page.contains("if !saved {"), "失败时回滚本页基线标记");
+        assert!(
+            !page.contains("force_snapshot = true"),
+            "单页重置不得整份 force"
+        );
+        assert!(
+            all.contains("force_snapshot = true"),
+            "全局重置仍整份 force"
+        );
+        // persist 只在成功分支前移基线 / 清除 force；失败后仍保留 force 供重试。
+        let p_start = source
+            .find("fn persist(&mut self")
+            .expect("persist is defined");
+        let p_end = source
+            .find("fn commit_api_key(")
+            .expect("commit_api_key follows persist");
+        let body = &source[p_start..p_end];
+        assert!(
+            body.find("self.force_snapshot = false").unwrap() > body.find("Ok(()) =>").unwrap(),
+            "失败分支不得清除 force_snapshot"
+        );
+    }
+
     #[test]
     fn history_thumb_height_follows_aspect_ratio_with_clamp() {
         // 16:9 → 176 * 9 / 16 = 99
@@ -5550,6 +5809,8 @@ mod tests {
             // 残留；用该句原文作标记只豁免这些致谢行，README 其余命中照常报错。
             ("README.md", "二次vibe coding开发"),
             ("README.md", "二次开发"),
+            // NOTICE credits the predecessor project explicitly.
+            ("NOTICE", concat!("Zsh", "ot")),
             // Phase 1 审计文档引用历史命名（C# 命名空间、README 原文摘录）作为
             // 证据，属于说明性引用而非代码残留；标记用 concat! 拼接，避免本文件
             // 自身命中扫描 needle。

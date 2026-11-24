@@ -25,7 +25,14 @@ regen() {
         a b ) > "$OUT" || true
 
     rm -rf "$WORK"
-    echo "wrote $OUT ($(grep -c '^+' "$OUT") added, $(grep -c '^-' "$OUT") removed)"
+    # grep -c '^+' also counts the per-file "+++"/"---" diff headers, so
+    # subtract those header lines to get the real added/removed counts.
+    local ADDED REMOVED
+    ADDED=$(grep -c '^+' "$OUT")
+    ADDED=$((ADDED - $(grep -c '^+++' "$OUT")))
+    REMOVED=$(grep -c '^-' "$OUT")
+    REMOVED=$((REMOVED - $(grep -c '^---' "$OUT")))
+    echo "wrote $OUT ($ADDED added, $REMOVED removed)"
 }
 
 regen gpui-pre-0.3.9 gpui-pre-0.3.9 third_party/gpui-pre

@@ -78,8 +78,27 @@ pub fn migrate_legacy_paths() -> Vec<String> {
 pub(crate) fn migrate_dir(old: &Path, new: &Path) -> Result<Vec<String>, String> {
     let mut notes = Vec::new();
     cleanup_stale_staging(new, &mut notes, STALE_STAGING_AFTER);
-    if !old.is_dir() || has_real_content(new) {
+    if !old.is_dir() {
         return Ok(notes);
+    }
+    if has_real_content(new) {
+        // 非空目标绝不覆盖：记录警告并跳过，新旧两边的数据都保留。
+        notes.push(format!(
+            "目标目录已有数据，跳过迁移以保留两边的内容：{}",
+            new.display()
+        ));
+        return Ok(notes);
+    }
+    // Windows 的 rename 即 MoveFileExW(REPLACE_EXISTING)，它无法覆盖一个
+    // 已存在的目录。安装器或上次崩溃留下的空目录必须先移除，否则 rename 与
+    // 回退复制都会失败，旧配置/历史会被遗弃。
+    if new.is_dir() {
+        if let Err(e) = fs::remove_dir(new) {
+            return Err(format!(
+                "目标为空目录但无法移除 {}（{e}）；保留旧数据以避免覆盖",
+                new.display()
+            ));
+        }
     }
     match fs::rename(old, new) {
         Ok(()) => {
@@ -250,7 +269,11 @@ mod tests {
         fs::write(old.join("settings.json"), "old").unwrap();
         fs::write(new.join("settings.json"), "new").unwrap();
 
-        assert!(migrate_dir(&old, &new).unwrap().is_empty());
+        let notes = migrate_dir(&old, &new).unwrap();
+        assert!(
+            notes.iter().any(|n| n.contains("跳过迁移")),
+            "non-empty destination must be reported: {notes:?}"
+        );
         assert_eq!(
             fs::read_to_string(new.join("settings.json")).unwrap(),
             "new"

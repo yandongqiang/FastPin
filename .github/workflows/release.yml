@@ -14,7 +14,8 @@ jobs:
           toolchain: 1.99.1
       - run: cargo build --release --locked
       # The exe looks for models\v6 next to itself, so both packages have to carry
-      # them: without this the OCR and translate buttons are dead on a fresh machine.
+      # them: without this the OCR button is dead on a fresh machine (translate
+      # uses a user-supplied API and reads no models).
       # DirectML.dll is the OCR GPU backend; ship it too.
       - name: Stage zip
         run: |
@@ -23,6 +24,8 @@ jobs:
           Copy-Item target/release/FastPin.exe $dir
           Copy-Item target/release/DirectML.dll $dir
           Copy-Item LICENSE $dir
+          Copy-Item NOTICE $dir
+          Copy-Item COPYRIGHT.snow-shot $dir
           New-Item -ItemType Directory -Force "$dir/models/v6" | Out-Null
           Copy-Item models/v6/* "$dir/models/v6"
           Compress-Archive -Path $dir -DestinationPath "dist/FastPin-${{ github.ref_name }}-x64.zip"

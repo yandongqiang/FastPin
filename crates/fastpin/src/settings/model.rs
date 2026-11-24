@@ -699,6 +699,53 @@ pub fn reset_page(settings: &mut Settings, page: Page) -> bool {
     }
 }
 
+/// 把 `src` 中 `page` 拥有的字段覆盖到 `dst`，其余字段保持不动。字段范围
+/// 必须与 `reset_page` 完全一致。
+///
+/// 页重置时先把「重置前」的快照按页写回基线：重置后的默认值与基线产生差异，
+/// `settings_persist_merge` 的 `keep_edited` 就会采用快照；而其它页 / 其它窗口
+/// 共享的字段仍保留 latest，不会被开窗快照整份回滚。
+pub fn copy_page_fields(dst: &mut Settings, src: &Settings, page: Page) {
+    match page {
+        Page::Screenshot => {
+            let d = &mut dst.screenshot;
+            let s = &src.screenshot;
+            d.hidden_toolbar_items = s.hidden_toolbar_items.clone();
+            d.annotation = s.annotation.clone();
+            d.smart_selection = s.smart_selection;
+            d.auto_scroll = s.auto_scroll.clone();
+            d.capture_mode = s.capture_mode;
+            d.show_cursor = s.show_cursor;
+            d.show_guides = s.show_guides;
+            d.long_capture_auto_start = s.long_capture_auto_start;
+            d.left_double_click = s.left_double_click;
+            d.middle_click = s.middle_click;
+            d.click_outside = s.click_outside;
+            d.record_history_sources = s.record_history_sources.clone();
+            d.toolbar_position = s.toolbar_position;
+            d.panel_position = s.panel_position;
+            d.show_magnifier = s.show_magnifier;
+            d.show_info_bar = s.show_info_bar;
+            d.show_shortcut_hints = s.show_shortcut_hints;
+        }
+        Page::Output => {
+            let d = &mut dst.screenshot;
+            let s = &src.screenshot;
+            d.save_dir = s.save_dir.clone();
+            d.watermark = s.watermark.clone();
+            d.export = s.export.clone();
+            d.collage = s.collage.clone();
+            d.pdf = s.pdf.clone();
+        }
+        Page::Data => dst.history = src.history.clone(),
+        Page::Hotkey => dst.hotkeys = src.hotkeys.clone(),
+        Page::Appearance => dst.appearance = src.appearance.clone(),
+        Page::Translate => dst.translation = src.translation.clone(),
+        Page::Resources => dst.ocr = src.ocr.clone(),
+        _ => {}
+    }
+}
+
 pub fn reset_all(settings: &mut Settings) {
     *settings = Settings::default();
 }
@@ -1114,6 +1161,50 @@ mod tests {
                 assert!(!changed, "{page:?} has no config but reported a reset");
                 assert_eq!(actual, expected, "{page:?} must not change any field");
             }
+        }
+    }
+
+    /// 递归核对：凡是本页重置改动过的字段，`copy_page_fields` 都必须把重置前
+    /// 的值写进基线，否则页重置在合并时会被误判成「没改过」而落不了盘。
+    fn assert_reset_fields_marked(
+        original: &serde_json::Value,
+        snapshot: &serde_json::Value,
+        baseline: &serde_json::Value,
+        path: &str,
+    ) {
+        if let (serde_json::Value::Object(a), serde_json::Value::Object(b)) = (original, snapshot) {
+            for (key, before) in a {
+                if let Some(after) = b.get(key.as_str()) {
+                    assert_reset_fields_marked(
+                        before,
+                        after,
+                        &baseline[key.as_str()],
+                        &format!("{path}.{key}"),
+                    );
+                }
+            }
+        } else if original != snapshot {
+            assert_eq!(
+                baseline, original,
+                "reset field {path} missing from baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_page_fields_marks_every_field_the_page_resets() {
+        for page in Page::ALL {
+            let original = all_non_default();
+            let mut snapshot = original.clone();
+            reset_page(&mut snapshot, page);
+            let mut baseline = Settings::default();
+            copy_page_fields(&mut baseline, &original, page);
+            assert_reset_fields_marked(
+                &serde_json::to_value(&original).expect("serializes"),
+                &serde_json::to_value(&snapshot).expect("serializes"),
+                &serde_json::to_value(&baseline).expect("serializes"),
+                page.id(),
+            );
         }
     }
 

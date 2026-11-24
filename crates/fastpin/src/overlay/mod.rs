@@ -21,8 +21,9 @@ use gpui::{
     App, BorderStyle, Bounds, BoxShadow, ContentMask, Context, CursorStyle, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, ImageSource, InteractiveElement,
     KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point as GpuiPoint, RenderImage, SharedString, UTF16Selection, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    PathBuilder, Pixels, Point as GpuiPoint, RenderImage, SharedString, Subscription,
+    UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -248,6 +249,8 @@ pub struct OverlayView {
     monitor_rects: Vec<Rect>,
     /// DPI / 显示器变化后的几何重同步任务是否已排队（避免观察点重复触发）。
     resync_pending: bool,
+    /// 显示器观察点：随 view 一起释放时退订，避免 app 级观察点无人回收。
+    display_subscription: Option<Subscription>,
     hit: SelectionHitKind,
     sel_at_press: Rect,
     start: Instant,
@@ -1095,6 +1098,7 @@ impl OverlayView {
             uia_blocked_hwnd: None,
             monitor_rects: Vec::new(),
             resync_pending: false,
+            display_subscription: None,
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
             start: Instant::now(),
@@ -1168,6 +1172,7 @@ impl OverlayView {
             uia_blocked_hwnd: None,
             monitor_rects: Vec::new(),
             resync_pending: false,
+            display_subscription: None,
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
             start: Instant::now(),
@@ -1448,15 +1453,16 @@ impl OverlayView {
             view.schedule_display_resync(cx);
         })
         .detach();
-        cx.observe_displays(|_, cx| {
+        // 显示器观察点注册在 app 级，必须持有 Subscription 随 view 一起退订；
+        // 窗口 bounds 观察点则随窗口销毁自动失效，仍可 detach。
+        self.display_subscription = Some(cx.observe_displays(|_, cx| {
             // 全局句柄可能已指向新一轮截图；update 时自然拿到当前 view。
             if let Some(handle) = OVERLAY_WINDOW.with(|s| *s.borrow()) {
                 let _ = handle.update(cx, |view, _window, cx| {
                     view.schedule_display_resync(cx);
                 });
             }
-        })
-        .detach();
+        }));
     }
 
     fn schedule_display_resync(&mut self, cx: &mut Context<Self>) {
@@ -3849,9 +3855,9 @@ impl OverlayView {
         };
         let auto_on = state.auto_scroll.enabled();
         let auto_label: SharedString = if auto_on {
-            "自动滚动:开".into()
+            "自动滚动：开".into()
         } else {
-            "自动滚动:关".into()
+            "自动滚动：关".into()
         };
 
         // Live preview: a downsampled snapshot of the growing canvas, sent from

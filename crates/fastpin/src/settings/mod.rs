@@ -310,7 +310,7 @@ const WM_SCALES: [(&str, f32); 4] = [
 
 /// (label, value) presets for the JPG/WebP quality dropdown. PNG ignores it.
 const EXPORT_QUALITIES: [(&str, u8); 5] = [
-    ("60%（最小）", 60),
+    ("60%（最低预设）", 60),
     ("75%", 75),
     ("85%", 85),
     ("90%（推荐）", 90),
@@ -648,7 +648,7 @@ impl SettingsView {
                 false,
             )
         });
-        let search = cx.new(|cx| TextInput::new(cx, "", "搜索所有配置...", false).flat());
+        let search = cx.new(|cx| TextInput::new(cx, "", "搜索所有配置…", false).flat());
 
         let export_name = cx.new(|cx| {
             TextInput::new(
@@ -2896,8 +2896,8 @@ impl SettingsView {
         let long_capture = self.enum_select_row(
             cx,
             SelectId::LongCaptureAutoStart,
-            "长截屏自动开始",
-            "选择进入长截屏工具时的开始策略。",
+            "长截图自动开始",
+            "选择进入长截图工具时的开始策略。",
             self.settings.screenshot.long_capture_auto_start,
             &LongCaptureAutoStart::ALL,
             LongCaptureAutoStart::id,
@@ -3115,7 +3115,7 @@ impl SettingsView {
             "选择截屏工具栏上显示的按钮；完成与取消始终显示。",
         )
         .child(
-            widgets::button("customize-toolbar", "自定义...").on_mouse_down(
+            widgets::button("customize-toolbar", "自定义…").on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.toggle_customize_panel(cx)),
             ),
@@ -3152,7 +3152,7 @@ impl SettingsView {
                 show_shortcut_hints,
             ]))
             .child(widgets::hint(
-                "工具栏与注释默认值在下一次截图时生效；自动滚动的间隔与步长在下一次长截图时生效。",
+                "工具栏与标注默认值在下一次截图时生效；自动滚动的间隔与步长在下一次长截图时生效。",
             ))
     }
 

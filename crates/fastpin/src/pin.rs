@@ -2224,7 +2224,7 @@ pub(crate) fn menu_items(cx: &mut App, id: u64) -> Option<Vec<MenuEntry>> {
     });
     items.push(Item {
         cmd: CMD_CLOSE_ALL,
-        label: "关闭全部钉图",
+        label: "关闭所有贴图",
     });
     Some(items)
 }

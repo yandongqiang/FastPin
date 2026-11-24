@@ -60,7 +60,7 @@ pub fn recognize(bgra: &[u8], w: u32, h: u32, stride: u32) -> Result<String> {
 
     let result = ocr.predict(vec![image]);
 
-    let pages = result.map_err(|e| Error::new(format!("OCR failed: {e}")))?;
+    let pages = result.map_err(|e| Error::new(format!("文字识别失败：{e}")))?;
     let blocks: Vec<Block> = pages
         .into_iter()
         .flat_map(|page| page.text_regions)
@@ -206,7 +206,7 @@ fn build() -> Result<OAROCR> {
         let path = dir.join(file);
         if !looks_like_onnx(&path) {
             return Err(Error::new(format!(
-                "OCR model missing or incomplete: {}",
+                "识别模型缺失或不完整：{}",
                 path.display()
             )));
         }
@@ -225,7 +225,7 @@ fn build() -> Result<OAROCR> {
         ..Default::default()
     })
     .build()
-    .map_err(|e| Error::new(format!("OCR init failed: {e}")))
+    .map_err(|e| Error::new(format!("识别引擎初始化失败：{e}")))
 }
 
 /// `settings.json` wins, then `FASTPIN_MODELS`, then the install layout the C#
@@ -300,21 +300,21 @@ fn ensure_idle_thread() {
 
 fn to_rgb(bgra: &[u8], w: u32, h: u32, stride: u32) -> Result<RgbImage> {
     if w == 0 || h == 0 {
-        return Err(Error::new("OCR input bitmap is invalid"));
+        return Err(Error::new("待识别图像无效"));
     }
     let need = (h - 1) as usize * stride as usize + w as usize * 4;
     if bgra.len() < need {
-        return Err(Error::new("OCR input bitmap is invalid"));
+        return Err(Error::new("待识别图像无效"));
     }
     // 3 B/px RGB buffer: validate against the shared budget and allocate
     // fallibly instead of the old unbounded `Vec::with_capacity(w*h*3)`.
     let budget = crate::image_budget::BUDGET;
     let len = budget
         .checked_bytes(w as u64, h as u64, 3)
-        .map_err(|e| Error::new(format!("OCR input bitmap is invalid: {e}")))?;
+        .map_err(|e| Error::new(format!("待识别图像无效：{e}")))?;
     let mut buf = budget
         .alloc_zeroed(len)
-        .map_err(|e| Error::new(format!("OCR input bitmap is invalid: {e}")))?;
+        .map_err(|e| Error::new(format!("待识别图像无效：{e}")))?;
     for y in 0..h as usize {
         let row = &bgra[y * stride as usize..];
         for x in 0..w as usize {
@@ -325,7 +325,7 @@ fn to_rgb(bgra: &[u8], w: u32, h: u32, stride: u32) -> Result<RgbImage> {
             buf[i + 2] = p[0];
         }
     }
-    RgbImage::from_raw(w, h, buf).ok_or_else(|| Error::new("OCR input bitmap is invalid"))
+    RgbImage::from_raw(w, h, buf).ok_or_else(|| Error::new("待识别图像无效"))
 }
 
 #[cfg(test)]

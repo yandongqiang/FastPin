@@ -29,7 +29,9 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a translator. Output only the trans
 pub fn translate(text: &str) -> Result<String> {
     let cfg = config::get().translation;
     if cfg.base_url.trim().is_empty() {
-        return Err(Error::new("翻译未配置：请在 设置 → 翻译 中填写 Base URL"));
+        return Err(Error::new(
+            "翻译未配置：请在 设置 → 翻译 中填写「接口地址」。",
+        ));
     }
     let body = serde_json::json!({
         "model": cfg.model,
@@ -54,7 +56,7 @@ pub fn translate(text: &str) -> Result<String> {
         cfg.timeout_seconds.clamp(5, 300),
     )?;
     message_content(&response)
-        .ok_or_else(|| Error::new("Translation API returned an empty result."))
+        .ok_or_else(|| Error::new("翻译接口返回空结果，请检查模型名称与提示词配置。"))
 }
 
 /// Whether the configured Base URL uses plaintext HTTP. Used by both the
@@ -350,7 +352,7 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
             return Err(Error::new(format!("翻译失败（HTTP {status}）{detail}")));
         }
         String::from_utf8(payload)
-            .map_err(|_| Error::new("Translation API returned invalid UTF-8."))
+            .map_err(|_| Error::new("翻译接口返回的内容不是有效的 UTF-8 文本。"))
     }
 }
 

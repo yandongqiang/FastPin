@@ -172,8 +172,8 @@ pub const ROWS: &[RowMeta] = &[
     },
     RowMeta {
         page: Page::Screenshot,
-        title: "长截屏自动开始",
-        desc: "选择进入长截屏工具时的开始策略。",
+        title: "长截图自动开始",
+        desc: "选择进入长截图工具时的开始策略。",
     },
     RowMeta {
         page: Page::Screenshot,
@@ -920,7 +920,7 @@ mod tests {
             "截屏模式",
             "捕获鼠标光标",
             "未选区时显示辅助线",
-            "长截屏自动开始",
+            "长截图自动开始",
             "左键双击行为",
             "中键单击行为",
             "点击选区外行为",

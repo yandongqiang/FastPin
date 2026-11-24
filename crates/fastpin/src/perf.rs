@@ -164,9 +164,13 @@ fn write_log_line_sync(path: &Path, msg: &str) -> bool {
         if let Some(parent) = path.parent() {
             create_dir_all(parent)?;
         }
+        // 这条路径每次 open/close，顺便按大小轮转，避免长挂机时无限增长。
+        rotate_if_needed(path, LOG_ROTATE_BYTES);
         let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-        f.write_all(msg.as_bytes())?;
-        f.write_all(b"\n")?;
+        // msg 与换行合成一次写入：同一进程内 O_APPEND 的单次 write 是原子的，
+        // 因此不会与后台 writer 交错把两行粘成一行。
+        let line = format!("{msg}\n");
+        f.write_all(line.as_bytes())?;
         f.flush()?;
         Ok(())
     })();
@@ -299,13 +303,60 @@ fn parse_msg(msg: String) -> Option<(Target, String)> {
     Some((Target::from_tag(tag)?, line.to_owned()))
 }
 
-/// 向某个长开句柄追加一行；句柄不存在时按需打开（失败则静默丢弃）。
+// ── 日志轮转 ────────────────────────────────────────────────────────────
+// 三个日志共同的问题：长开句柄或频繁追加，文件只增不减（diag.log 每 tick 一行）。
+// 这里做最简按大小轮转：只保留一代备份 `*.log.1`，超阈值时覆盖旧备份。
+
+/// 单个日志文件的轮转阈值：8 MiB。
+const LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 磁盘上的文件是否达到轮转阈值。
+fn log_exceeds(path: &Path, max_bytes: u64) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len() >= max_bytes)
+        .unwrap_or(false)
+}
+
+/// 把 `path` 改名为 `*.log.1`。Windows 上 rename 目标已存在会失败，先删旧备份。
+fn rotate_file(path: &Path) -> bool {
+    let rotated = path.with_extension("log.1");
+    let _ = std::fs::remove_file(&rotated);
+    std::fs::rename(path, &rotated).is_ok()
+}
+
+/// 若 `path` 达到 `max_bytes` 就轮转成 `*.log.1`，返回是否发生轮转。
+/// 阈值由参数传入而非写死，便于单测用极小文件覆盖轮转分支。
+fn rotate_if_needed(path: &Path, max_bytes: u64) -> bool {
+    log_exceeds(path, max_bytes) && rotate_file(path)
+}
+
+/// 写之前检查长开句柄对应的文件：超限则先 drop 句柄（顺带 flush，并释放
+/// 文件句柄，否则 Windows 上无法 rename），改名后把句柄置空，下一行写入时
+/// 由 `open_rotated` 打开全新的文件。
+fn rotate_target(handle: &mut Option<BufWriter<std::fs::File>>, path: &Path) {
+    if log_exceeds(path, LOG_ROTATE_BYTES) {
+        let _ = handle.take();
+        rotate_file(path);
+    }
+}
+
+/// 打开日志前先按需轮转，避免从上一轮残留的大文件继续追加。
+fn open_rotated(path: &Path) -> Option<BufWriter<std::fs::File>> {
+    if log_exceeds(path, LOG_ROTATE_BYTES) {
+        rotate_file(path);
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+        .map(BufWriter::new)
+}
+
+/// 向某个长开句柄追加一行；句柄不存在时按需打开（打开前按需轮转，失败则静默丢弃）。
 fn write_line(handle: &mut Option<BufWriter<std::fs::File>>, path: &Path, line: &str) {
     if handle.is_none() {
-        match OpenOptions::new().create(true).append(true).open(path) {
-            Ok(f) => *handle = Some(BufWriter::new(f)),
-            Err(_) => return,
-        }
+        *handle = open_rotated(path);
     }
     if let Some(f) = handle.as_mut() {
         let _ = f.write_all(line.as_bytes());
@@ -340,9 +391,11 @@ fn writer_loop(rx: Receiver<String>) {
     let crash_path = dir.join("crash.log");
 
     // 三个目标各持一个长开句柄，避免每次日志都 open/close。
+    // diag 的两个候选路径只解析一次，首次打开时选中并记住，供后续轮转使用。
     let mut app_f: Option<BufWriter<std::fs::File>> = None;
     let mut crash_f: Option<BufWriter<std::fs::File>> = None;
     let mut diag_f: Option<BufWriter<std::fs::File>> = None;
+    let mut diag_path: Option<PathBuf> = None;
 
     // 阻塞等待第一条；所有发送端 drop 时 recv 返回 Err -> 线程退出。
     while let Ok(first) = rx.recv() {
@@ -356,16 +409,42 @@ fn writer_loop(rx: Receiver<String>) {
             }
         }
 
+        // 每批开始前只检查本批会写到、且已打开的文件：超限则关句柄并轮转，
+        // 下一行写入时由 open_rotated 打开新文件。不在逐行循环里 stat，避免热路径开销。
+        let mut need_app = false;
+        let mut need_crash = false;
+        let mut need_diag = false;
+        for (target, _) in &batch {
+            match target {
+                Target::App => need_app = true,
+                Target::Crash => need_crash = true,
+                Target::Diag => need_diag = true,
+            }
+        }
+        if need_app {
+            rotate_target(&mut app_f, &app_path);
+        }
+        if need_crash {
+            rotate_target(&mut crash_f, &crash_path);
+        }
+        if need_diag {
+            if let Some(p) = &diag_path {
+                rotate_target(&mut diag_f, p);
+            }
+        }
+
         for (target, line) in batch {
             match target {
                 Target::App => write_line(&mut app_f, &app_path, &line),
                 Target::Crash => write_line(&mut crash_f, &crash_path, &line),
                 Target::Diag => {
                     if diag_f.is_none() {
-                        // 首次 diag：按顺序尝试 profile / exe 旁，选第一个能打开的。
+                        // 首次 diag：按顺序尝试 profile / exe 旁，选第一个能打开的；
+                        // open_rotated 会在打开前处理上一轮残留的大文件。
                         for p in [&diag.profile, &diag.exe_side].into_iter().flatten() {
-                            if let Ok(f) = OpenOptions::new().create(true).append(true).open(p) {
-                                diag_f = Some(BufWriter::new(f));
+                            if let Some(f) = open_rotated(p) {
+                                diag_f = Some(f);
+                                diag_path = Some(p.clone());
                                 break;
                             }
                         }
@@ -415,19 +494,46 @@ mod tests {
         assert_eq!(percentile(&[], 50.0), 0);
     }
 
+    /// 沙箱拒绝写 %TEMP%，与其它测试一致把临时目录放在 target/ 下；
+    /// 进程 id + 自增序号保证并发测试进程间不冲突。
+    fn test_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "fastpin-{tag}-test-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+    }
+
+    #[test]
+    fn sync_log_line_appends_and_is_readable() {
+        // log_app_sync / log_diag_sync 共用的同步入口：路径可注入，
+        // 不必依赖 LOCALAPPDATA 缓存或后台 writer 即可验证内容与追加语义。
+        let dir = test_dir("sync-append");
+        let _ = create_dir_all(&dir);
+        let path = dir.join("app.log");
+
+        assert!(write_log_line_sync(&path, "first line"));
+        let first = std::fs::read_to_string(&path).expect("同步写入后应能立即读回");
+        assert_eq!(first, "first line\n");
+
+        // 重复调用是追加而非覆盖，且同步可见。
+        assert!(write_log_line_sync(&path, "second line"));
+        let both = std::fs::read_to_string(&path).expect("追加后应能立即读回");
+        assert_eq!(both, format!("{first}second line\n"));
+        assert_eq!(both.bytes().filter(|b| *b == b'\n').count(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn crash_line_is_written_sync_and_readable() {
         // 用 std 构造唯一临时目录，避免为单测新增依赖；路径可注入，
         // 因此不必依赖 LOCALAPPDATA 或后台 writer 即可验证同步落盘。
         // 沙箱拒绝写 %TEMP%，与其它测试一致放在 target/ 下。
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "fastpin-crash-test-{}-{}",
-                std::process::id(),
-                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
+        let dir = test_dir("crash");
         let _ = create_dir_all(&dir);
         let path = dir.join("crash.log");
 
@@ -440,6 +546,79 @@ mod tests {
         write_crash_line_sync(&path, "second line");
         let both = std::fs::read_to_string(&path).expect("追加后应能立即读回");
         assert_eq!(both, format!("{first}second line\n"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_sync_writes_never_join_lines() {
+        // 路径可注入，直接让多线程并发调用同步写。若 msg 与换行分两次 write，
+        // 就会与别的线程交错，产生粘连行（两行的标记落在同一行里）。
+        let dir = test_dir("sync-concurrent");
+        let _ = create_dir_all(&dir);
+        let path = dir.join("app.log");
+
+        const THREADS: usize = 8;
+        const LINES: usize = 50;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..LINES {
+                        // 长行 + 重复正文，便于检测行首/行尾是否被截断或粘连。
+                        let msg = format!("thread-{t:02} line-{i:03} {}", "x".repeat(64));
+                        assert!(write_log_line_sync(&path, &msg));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("同步写线程不应 panic");
+        }
+
+        let content = std::fs::read_to_string(&path).expect("并发写后应能读回");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), THREADS * LINES, "行数应完整，不得粘连");
+        for line in lines {
+            assert_eq!(
+                line.matches("thread-").count(),
+                1,
+                "每行只能有一个行首标记: {line}"
+            );
+            assert!(line.ends_with("xxxxxxxx"), "行尾必须完整: {line}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_if_needed_splits_log_and_overwrites_backup() {
+        let dir = test_dir("rotate");
+        let _ = create_dir_all(&dir);
+        let path = dir.join("app.log");
+        let backup = dir.join("app.log.1");
+        let old = "old content longer than four bytes";
+        std::fs::write(&path, old).expect("准备旧日志");
+
+        // 未达阈值：什么都不做。
+        assert!(!rotate_if_needed(&path, 1024));
+        assert!(path.exists());
+        assert!(!backup.exists());
+
+        // 超阈值：原文件改名为 .1，原路径消失（下次写入时重新创建）。
+        assert!(rotate_if_needed(&path, 4));
+        assert!(backup.exists(), "应生成 .1 备份");
+        assert!(!path.exists(), "原文件应已改名");
+        assert_eq!(std::fs::read_to_string(&backup).expect("读回备份"), old);
+
+        // 再次超阈值：覆盖旧 .1，而不是因目标已存在而失败。
+        let newer = "second generation";
+        std::fs::write(&path, newer).expect("准备第二代日志");
+        assert!(rotate_if_needed(&path, 4));
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("读回覆盖后的备份"),
+            newer
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

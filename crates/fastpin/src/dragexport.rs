@@ -455,4 +455,41 @@ mod tests {
         assert!(!dir.exists(), "the refused drag must not leave a directory");
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn three_step_delete_preserves_bytes_until_apply() {
+        // 生产路径（app.rs 的 sweep）走的是「摘取 -> 锁外删除 -> 回填」三步，
+        // 这里直接驱动三步 API，验证预算只在最后一步才归还。
+        let dir = scratch();
+        let path = stage_in(&dir, b"payload", "png").unwrap();
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        let mut retention = Retention::new();
+        let lease = retention.reserve(path.clone(), bytes).unwrap();
+        retention.complete(&lease, true);
+        for live in retention.live.iter_mut() {
+            live.expires_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        // 第一步：只摘快照，账本与文件原样保留。
+        let now = Instant::now();
+        let targets = retention.expired_targets(now);
+        assert_eq!(targets.len(), 1, "已过期的 lease 应被摘出");
+        assert_eq!(retention.retained_bytes(), bytes, "摘取目标不应释放预算");
+        assert_eq!(retention.retained_files(), 1, "摘取目标不应移除记录");
+        assert!(path.exists(), "摘取目标不应删除文件");
+
+        // 第二步：静态关联函数不接触 self，删除发生在锁外。
+        let results = Retention::finish_deletes(targets);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].deleted, "文件应能被删除");
+        assert_eq!(retention.retained_bytes(), bytes, "锁外删除不应释放预算");
+        assert_eq!(retention.retained_files(), 1, "锁外删除不应移除记录");
+
+        // 第三步：回填结果才归还预算、移除记录。
+        retention.apply_deletes(results);
+        assert_eq!(retention.retained_bytes(), 0, "回填后才归还预算");
+        assert_eq!(retention.retained_files(), 0, "回填后才移除记录");
+        assert!(!path.exists(), "文件应已被删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

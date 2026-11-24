@@ -82,7 +82,6 @@ enum BlitMode {
 }
 
 static GPU_SHADERS: Mutex<Option<GpuShaders>> = Mutex::new(None);
-static FREEZE_TEXTURE: Mutex<Option<ID3D11Texture2D>> = Mutex::new(None);
 
 #[derive(Clone)]
 pub struct GpuShaders {
@@ -139,7 +138,6 @@ impl GpuShaders {
 
 pub fn drop_gpu_resources() {
     *GPU_SHADERS.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    *FREEZE_TEXTURE.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 pub struct RestoreGpu<'a>(pub &'a ID3D11DeviceContext);

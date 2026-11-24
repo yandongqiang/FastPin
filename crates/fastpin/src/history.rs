@@ -262,11 +262,16 @@ impl HistoryStore {
         source: &str,
     ) -> Result<HistoryRecord> {
         let _guard = lock();
+        // 先读索引再落图片：索引损坏时直接失败，不会留下已写图片却没有记录的孤立目录。
+        let mut index = self.read_index()?;
         std::fs::create_dir_all(self.records_dir())?;
         let now = now_ms();
         let id = next_id(now);
         let dir = self.record_dir(&id);
-        std::fs::create_dir_all(&dir)?;
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e.into());
+        }
         let file = format!("image.{}", extension);
         let path = dir.join(&file);
         if let Err(e) = std::fs::write(&path, bytes) {
@@ -283,7 +288,6 @@ impl HistoryStore {
             file,
             source: source.to_string(),
         };
-        let mut index = self.read_index()?;
         index.records.push(record.clone());
         if let Err(e) = self.write_index(&index) {
             let _ = std::fs::remove_dir_all(&dir);
@@ -343,7 +347,11 @@ impl HistoryStore {
         HISTORY_REVISION.fetch_add(1, Ordering::Release);
 
         for id in &to_remove {
-            let _ = std::fs::remove_dir_all(self.record_dir(id));
+            let dir = self.record_dir(id);
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                // 删除失败（目录被占用等）时 pending 条目会保留，下次启动重试。
+                eprintln!("history: 删除记录目录 {} 失败：{e}", dir.display());
+            }
         }
 
         // Finalize: drop the pending entries whose directories are gone (or
@@ -374,9 +382,21 @@ impl HistoryStore {
         let _guard = lock();
         let mut index = self.read_index()?;
         let before = index.pending_deletions.len();
-        index
-            .pending_deletions
-            .retain(|p| self.record_dir(&p.id).exists());
+        index.pending_deletions.retain(|p| {
+            let dir = self.record_dir(&p.id);
+            if !dir.exists() {
+                // 目录已不存在：两步删除的第二步其实已完成。
+                return false;
+            }
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => false,
+                Err(e) => {
+                    // 仍被占用（例如历史窗口正在读缩略图），保留待下次重试。
+                    eprintln!("history: 重试删除目录 {} 失败：{e}", dir.display());
+                    true
+                }
+            }
+        });
         if index.pending_deletions.len() != before {
             self.write_index(&index)?;
         }
@@ -505,13 +525,13 @@ pub fn record_saved_image(bytes: &[u8], extension: &str, width: u32, height: u32
 /// Cleans up interrupted deletions and prunes once at startup.
 pub fn startup_maintenance() {
     let settings = crate::config::get();
-    if !settings.history.enabled {
-        return;
-    }
     if let Ok(dir) = settings.history.store_dir() {
         let store = HistoryStore::new(dir);
+        // 即使当前关闭了历史也要回收上次删除留下的目录，用户随时可能重新开启。
         let _ = store.cleanup_pending();
-        let _ = store.prune(&settings.history.retention());
+        if settings.history.enabled {
+            let _ = store.prune(&settings.history.retention());
+        }
     }
 }
 
@@ -611,6 +631,47 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
         assert!(!dir.exists());
         assert_eq!(store.pending_count(), 0);
+    }
+
+    /// 模拟两步删除中途崩溃：索引已移除记录但目录仍在，pending 条目必须能
+    /// 真正把目录删掉并把 pending 清空，而不是只做一次 `retain`。
+    #[test]
+    fn cleanup_pending_retries_directory_removal() {
+        let root = scratch();
+        let store = HistoryStore::new(root.clone());
+        let rec = sample(&store, 1, 1);
+        let dir = store.image_path(&rec).parent().unwrap().to_path_buf();
+
+        let mut index = store.read_index().unwrap();
+        let pending = index.records.remove(0);
+        index.pending_deletions.push(PendingDeletion {
+            id: pending.id.clone(),
+            bytes: pending.bytes,
+        });
+        store.write_index(&index).unwrap();
+        assert!(dir.exists(), "precondition: crashed before unlinking");
+        assert_eq!(store.pending_count(), 1);
+
+        store.cleanup_pending().unwrap();
+        assert!(!dir.exists(), "pending directory must be removed");
+        assert_eq!(store.pending_count(), 0);
+    }
+
+    /// 索引损坏时 `add` 必须在写图片之前失败，否则会留下永远无人回收的目录。
+    #[test]
+    fn add_with_a_corrupt_index_leaves_no_orphan_directory() {
+        let root = scratch();
+        std::fs::write(root.join(INDEX_FILE), b"{ not json").unwrap();
+        let store = HistoryStore::new(root.clone());
+        assert!(store.add(&[1, 2, 3], "png", 1, 1, "region").is_err());
+        let records = root.join(RECORDS_DIR);
+        if records.exists() {
+            assert_eq!(
+                std::fs::read_dir(&records).unwrap().count(),
+                0,
+                "no image directory may be created before the index is read"
+            );
+        }
     }
 
     #[test]

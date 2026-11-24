@@ -2110,11 +2110,22 @@ impl OverlayView {
 
     /// What OCR reads is the annotated crop, same as the C# `FlattenSelection`:
     /// a mosaic over a password must hide it from the recognizer too.
-    fn selection_pixels(&self, cx: &mut Context<Self>) -> Option<(Vec<u8>, u32, u32, u32)> {
-        let result = self.result_from_current()?;
-        let cap = self.cap.as_ref()?;
+    /// 取出当前选区经标注合成后的像素。失败时带回可读的中文原因，供 OCR /
+    /// 翻译 / 贴图按钮在面板上明确告知，而不是点了没反应。
+    fn selection_pixels(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> std::result::Result<(Vec<u8>, u32, u32, u32), String> {
+        let result = self
+            .result_from_current()
+            .ok_or_else(|| "没有可处理的选区".to_string())?;
+        let cap = self
+            .cap
+            .as_ref()
+            .ok_or_else(|| "截图数据已释放，请重新截图".to_string())?;
         let (mut px, w, h, stride) =
-            crate::app::crop_from_app(cx, cap, result.x, result.y, result.w, result.h).ok()?;
+            crate::app::crop_from_app(cx, cap, result.x, result.y, result.w, result.h)
+                .map_err(|e| format!("裁剪选区失败：{e}"))?;
         composite::apply_annotations(
             &mut px,
             w,
@@ -2124,7 +2135,7 @@ impl OverlayView {
             result.y as f64,
             &result.marks,
         );
-        Some((px, w, h, stride))
+        Ok((px, w, h, stride))
     }
 
     fn busy(&self) -> bool {
@@ -3054,8 +3065,12 @@ impl OverlayView {
         if self.busy() {
             return;
         }
-        let Some((px, w, h, stride)) = self.selection_pixels(cx) else {
-            return;
+        let (px, w, h, stride) = match self.selection_pixels(cx) {
+            Ok(pixels) => pixels,
+            Err(e) => {
+                self.show_panel("失败", e, false, cx);
+                return;
+            }
         };
         self.show_panel(OCR_TITLE, "识别中…".into(), true, cx);
         let task = cx.background_spawn(async move { crate::ocr::recognize(&px, w, h, stride) });
@@ -3079,8 +3094,12 @@ impl OverlayView {
         if self.busy() {
             return;
         }
-        let Some((px, w, h, stride)) = self.selection_pixels(cx) else {
-            return;
+        let (px, w, h, stride) = match self.selection_pixels(cx) {
+            Ok(pixels) => pixels,
+            Err(e) => {
+                self.show_panel("失败", e, false, cx);
+                return;
+            }
         };
         self.show_panel(TRANSLATE_TITLE, "翻译中…".into(), true, cx);
         let task = cx.background_spawn(async move {
@@ -3107,14 +3126,23 @@ impl OverlayView {
             return;
         }
         let Some(result) = self.result_from_current() else {
+            self.show_panel("失败", "没有可贴图的选区".into(), false, cx);
             return;
         };
-        let Some((px, w, h, stride)) = self.selection_pixels(cx) else {
-            return;
+        let (px, w, h, stride) = match self.selection_pixels(cx) {
+            Ok(pixels) => pixels,
+            Err(e) => {
+                self.show_panel("失败", e, false, cx);
+                return;
+            }
         };
         let screen_x = self.origin_x + result.x as i32;
         let screen_y = self.origin_y + result.y as i32;
-        crate::pin::show_pin(cx, px, w, h, stride, screen_x, screen_y);
+        if let Err(e) = crate::pin::show_pin(cx, px, w, h, stride, screen_x, screen_y) {
+            // 贴图失败时保留截图界面，让用户能重试；关窗会连失败原因一起藏起来。
+            self.show_panel("失败", format!("贴图失败：{e}"), false, cx);
+            return;
+        }
         self.finish(empty_result(), window, cx);
     }
 
@@ -3125,11 +3153,14 @@ impl OverlayView {
         if panel.busy {
             return;
         }
-        if let Err(e) = crate::codec::set_clipboard_text(&panel.body) {
-            eprintln!("clipboard text failed: {e}");
+        // 先克隆出正文再放手 self.panel 的借用，下面失败分支要改面板本身。
+        let body = panel.body.to_string();
+        if let Err(e) = crate::codec::set_clipboard_text(&body) {
+            crate::perf::log_app(&format!("clipboard text failed: {e}"));
+            self.show_panel("失败", format!("复制到剪贴板失败：{e}"), false, cx);
             return;
         }
-        self.show_panel(COPIED_TITLE, panel.body.to_string(), false, cx);
+        self.show_panel(COPIED_TITLE, body, false, cx);
     }
 
     /// Pixelated tiles plus the ids of the elements that produced them; an element

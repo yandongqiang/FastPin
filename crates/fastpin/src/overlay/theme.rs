@@ -227,25 +227,39 @@ pub fn init(cx: &mut gpui::App) {
 /// `name` 是 registry 里的主题注册名（下拉直接写这个名字），gpui-kit 默认
 /// 浅色 / 深色两项也始终可选。明暗与颜色一概取自 registry 里的 `ThemeConfig`，
 /// 不再叠加任何族映射或人造 tint。找不到的名字回退到 gpui-kit 默认浅色变体，
-/// 绝不 panic。
+/// 并把修正后的名字写回配置（记日志），让配置与实际外观始终一致；绝不 panic。
 pub fn set_appearance(cx: &mut gpui::App, name: &str) {
-    let cfg = {
+    let key = name.trim();
+    let (cfg, fallback_name) = {
         let registry = ThemeRegistry::global(cx);
-        let key = name.trim();
-        registry
-            .themes()
-            .get(&SharedString::from(key))
-            .cloned()
-            .or_else(|| {
-                registry
-                    .themes()
-                    .get(&SharedString::from(crate::config::DEFAULT_APPEARANCE))
-                    .cloned()
-            })
-            .or_else(|| registry.default_themes().get(&ThemeMode::Light).cloned())
-            .or_else(|| registry.themes().values().next().cloned())
+        if let Some(cfg) = registry.themes().get(&SharedString::from(key)).cloned() {
+            (Some(cfg), None)
+        } else {
+            // 名字无效：回退到默认浅色变体。同时记下实际应用的注册名，
+            // 写回配置，避免配置文件长期保留无效名字、UI 与外观对不上。
+            let cfg = registry
+                .themes()
+                .get(&SharedString::from(crate::config::DEFAULT_APPEARANCE))
+                .cloned()
+                .or_else(|| registry.default_themes().get(&ThemeMode::Light).cloned())
+                .or_else(|| registry.themes().values().next().cloned());
+            let fallback_name = cfg.as_ref().map(|c| c.name.to_string());
+            (cfg, fallback_name)
+        }
     };
     if let Some(cfg) = cfg {
+        if let Some(actual) = fallback_name {
+            crate::perf::log_app(&format!(
+                "appearance: 主题变体 '{name}' 无效，已回退到 '{actual}' 并写回配置"
+            ));
+            let mut settings = crate::config::get();
+            if settings.appearance != actual {
+                settings.appearance = actual;
+                if let Err(e) = crate::config::save(&settings) {
+                    crate::perf::log_app(&format!("appearance: 回退写回配置失败：{e}"));
+                }
+            }
+        }
         Theme::update(cx, |t| t.apply_config(&cfg));
         let theme = Theme::global(cx).clone();
         apply_theme(&theme);

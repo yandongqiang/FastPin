@@ -1061,7 +1061,10 @@ impl SettingsView {
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
-        match crate::config::save(&self.settings) {
+        // self.settings 是开窗时的快照，拼图 / 切图窗口期间可能已各自保存过
+        // 自己的字段。直接落盘会把那些改动整体回滚，因此从最新配置出发合并。
+        let merged = settings_persist_merge(&crate::config::get(), &self.settings);
+        match crate::config::save(&merged) {
             Ok(()) => {
                 self.status = SharedString::default();
                 self.status_error = false;
@@ -4929,6 +4932,28 @@ impl SettingsView {
     }
 }
 
+/// 设置页落盘前的合并：从最新配置出发，只覆盖本页拥有的字段。
+///
+/// 设置窗口持有的是打开时的快照，拼图 / 切图窗口期间可能已经各自保存过
+/// collage / pdf / split。直接保存快照会把这些改动整体回滚。
+/// screenshot 内部这三块由对应窗口拥有，保留最新值；export 的格式 / 质量 /
+/// 文件名 / 自动保存 / 自动复制在本页有控件，用快照值。其余字段同样归本页。
+fn settings_persist_merge(latest: &Settings, snapshot: &Settings) -> Settings {
+    let mut merged = latest.clone();
+    merged.ocr = snapshot.ocr.clone();
+    merged.translation = snapshot.translation.clone();
+    merged.history = snapshot.history.clone();
+    merged.hotkeys = snapshot.hotkeys.clone();
+    merged.appearance = snapshot.appearance.clone();
+
+    let mut screenshot = snapshot.screenshot.clone();
+    screenshot.collage = latest.screenshot.collage.clone();
+    screenshot.pdf = latest.screenshot.pdf.clone();
+    screenshot.split = latest.screenshot.split.clone();
+    merged.screenshot = screenshot;
+    merged
+}
+
 /// Gallery source-filter predicate. `"all"` accepts everything; other values
 /// match a record's source string exactly.
 fn history_matches_filter(source: &str, filter: &str) -> bool {
@@ -5047,6 +5072,43 @@ mod tests {
         let snapshot = EngineStatusSnapshot::from(missing);
         assert!(!snapshot.available);
         assert_eq!(&*snapshot.dir, "未找到");
+    }
+
+    /// 设置页保存时不能把拼图 / 切图窗口期间保存的改动回滚。
+    #[test]
+    fn persist_merge_keeps_other_windows_fields_and_uses_snapshot_for_owned_ones() {
+        let mut latest = Settings::default();
+        latest.screenshot.collage.spacing = 33;
+        latest.screenshot.pdf.paper_size = crate::config::PaperSize::Letter;
+        latest.screenshot.split.count = 9;
+        latest.screenshot.export.format = crate::config::ImageFormat::Webp;
+
+        let mut snapshot = Settings::default();
+        snapshot.translation.base_url = "https://snapshot/v1".into();
+        snapshot.screenshot.collage.spacing = 11;
+        snapshot.screenshot.pdf.paper_size = crate::config::PaperSize::A5;
+        snapshot.screenshot.split.count = 2;
+        snapshot.screenshot.export.quality = 42;
+        snapshot.screenshot.watermark.text = "机密".into();
+        snapshot.hotkeys.region = "Ctrl+Shift+1".into();
+
+        let merged = settings_persist_merge(&latest, &snapshot);
+        // collage / pdf / split 由其它窗口拥有：保留最新值。
+        assert_eq!(merged.screenshot.collage.spacing, 33);
+        assert_eq!(
+            merged.screenshot.pdf.paper_size,
+            crate::config::PaperSize::Letter
+        );
+        assert_eq!(merged.screenshot.split.count, 9);
+        // 设置页拥有的顶层字段与 export 用快照值。
+        assert_eq!(merged.translation.base_url, "https://snapshot/v1");
+        assert_eq!(
+            merged.screenshot.export.format,
+            crate::config::ImageFormat::Png
+        );
+        assert_eq!(merged.screenshot.export.quality, 42);
+        assert_eq!(merged.screenshot.watermark.text, "机密");
+        assert_eq!(merged.hotkeys.region, "Ctrl+Shift+1");
     }
 
     #[test]

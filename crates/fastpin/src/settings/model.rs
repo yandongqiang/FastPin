@@ -1049,140 +1049,70 @@ mod tests {
         assert!(search("zzz-不存在的配置-zzz").is_empty());
     }
 
-    #[test]
-    fn reset_page_only_touches_fields_the_page_owns() {
-        let owned: fn(Page, &Settings) -> bool = |page, s| match page {
+    /// 每页重置后的期望配置：从原配置出发，只把该页拥有的字段换成默认值。
+    /// 顶层字段范围与 reset_page 一致；screenshot 内部按截图页 / 输出页区分。
+    fn expected_after_reset(page: Page, original: &Settings) -> Settings {
+        let default = Settings::default();
+        let mut expected = original.clone();
+        match page {
             Page::Screenshot => {
-                s.screenshot.hidden_toolbar_items.is_empty()
-                    && s.screenshot.annotation.stroke_color == "#FA3C3C"
-                    && s.screenshot.auto_scroll.interval_ms == 600
-                    && s.screenshot.auto_scroll.notches == 1
-                    && s.screenshot.smart_selection
-                        == crate::config::SmartSelectionMode::WindowSubElement
-                    && s.screenshot.capture_mode == crate::config::CaptureMode::Auto
-                    && !s.screenshot.show_cursor
-                    && !s.screenshot.show_guides
-                    && s.screenshot.long_capture_auto_start
-                        == crate::config::LongCaptureAutoStart::Auto
-                    && s.screenshot.left_double_click == crate::config::ClickAction::None
-                    && s.screenshot.middle_click == crate::config::ClickAction::None
-                    && s.screenshot.click_outside == crate::config::ClickOutside::Expand
-                    && s.screenshot.record_history_sources == ["region", "copyOnly", "fullscreen"]
-                    && s.screenshot.toolbar_position
-                        == crate::config::ToolbarPosition::FollowSelection
-                    && s.screenshot.panel_position == crate::config::PanelPosition::FollowSelection
-                    && s.screenshot.show_magnifier
-                    && s.screenshot.show_info_bar
-                    && s.screenshot.show_shortcut_hints
+                let d = &default.screenshot;
+                expected.screenshot.hidden_toolbar_items = d.hidden_toolbar_items.clone();
+                expected.screenshot.annotation = d.annotation.clone();
+                expected.screenshot.smart_selection = d.smart_selection;
+                expected.screenshot.auto_scroll = d.auto_scroll.clone();
+                expected.screenshot.capture_mode = d.capture_mode;
+                expected.screenshot.show_cursor = d.show_cursor;
+                expected.screenshot.show_guides = d.show_guides;
+                expected.screenshot.long_capture_auto_start = d.long_capture_auto_start;
+                expected.screenshot.left_double_click = d.left_double_click;
+                expected.screenshot.middle_click = d.middle_click;
+                expected.screenshot.click_outside = d.click_outside;
+                expected.screenshot.record_history_sources = d.record_history_sources.clone();
+                expected.screenshot.toolbar_position = d.toolbar_position;
+                expected.screenshot.panel_position = d.panel_position;
+                expected.screenshot.show_magnifier = d.show_magnifier;
+                expected.screenshot.show_info_bar = d.show_info_bar;
+                expected.screenshot.show_shortcut_hints = d.show_shortcut_hints;
             }
             Page::Output => {
-                s.screenshot.save_dir.is_none()
-                    && s.screenshot.watermark.text.is_empty()
-                    && !s.screenshot.export.auto_save
-                    && s.screenshot.export.auto_copy
-                    && s.screenshot.export.format == crate::config::ImageFormat::Png
-                    && s.screenshot.export.quality == 90
-                    && s.screenshot.export.filename_template
-                        == crate::config::DEFAULT_FILENAME_TEMPLATE
-                    && s.screenshot.collage.direction == crate::config::Direction::Vertical
-                    && s.screenshot.collage.sizing == crate::config::Sizing::Uniform
-                    && s.screenshot.collage.border == 0
-                    && s.screenshot.collage.spacing == 0
-                    && s.screenshot.collage.background_rgba == [255, 255, 255, 255]
-                    && s.screenshot.collage.rows == 1
-                    && s.screenshot.collage.columns == 1
-                    && s.screenshot.pdf.stitching_method
-                        == crate::config::StitchingMethod::PageBased
-                    && s.screenshot.pdf.template_type == crate::config::TemplateType::TwoImages
-                    && s.screenshot.pdf.spacing_mm == 5.0
-                    && s.screenshot.pdf.paper_size == crate::config::PaperSize::A4
-                    && s.screenshot.pdf.orientation == crate::config::Orientation::Portrait
-                    && s.screenshot.pdf.custom_width_mm == 210.0
-                    && s.screenshot.pdf.custom_height_mm == 297.0
-                    && s.screenshot.pdf.margin_top_mm == 10.0
-                    && s.screenshot.pdf.margin_bottom_mm == 10.0
-                    && s.screenshot.pdf.margin_left_mm == 10.0
-                    && s.screenshot.pdf.margin_right_mm == 10.0
-                    && s.screenshot.pdf.export_mode == crate::config::ExportMode::Combined
-                    && s.screenshot.pdf.image_quality == 90
+                let d = &default.screenshot;
+                expected.screenshot.save_dir = d.save_dir.clone();
+                expected.screenshot.watermark = d.watermark.clone();
+                expected.screenshot.export = d.export.clone();
+                expected.screenshot.collage = d.collage.clone();
+                expected.screenshot.pdf = d.pdf.clone();
             }
-            Page::Hotkey => s.hotkeys.region == "Ctrl+Alt+A",
-            Page::Appearance => s.appearance == crate::config::DEFAULT_APPEARANCE,
-            Page::Translate => {
-                s.translation.base_url.is_empty()
-                    && s.translation.model == "gpt-4o-mini"
-                    && s.translation.target_language == "zh-CN"
-                    && s.translation.prompt.is_empty()
-                    && s.translation.timeout_seconds == 30
-                    && !s.translation.allow_insecure_http
-            }
-            Page::Resources => s.ocr.models_dir.is_none(),
-            Page::Data => {
-                s.history.enabled
-                    && s.history.dir.is_none()
-                    && s.history.retention_days == 7
-                    && s.history.limit == 100
-                    && s.history.max_disk_mib == 1024
-                    && !s.history.keep_permanently
-            }
-            _ => false,
-        };
+            Page::Data => expected.history = default.history.clone(),
+            Page::Hotkey => expected.hotkeys = default.hotkeys.clone(),
+            Page::Appearance => expected.appearance = default.appearance.clone(),
+            Page::Translate => expected.translation = default.translation.clone(),
+            Page::Resources => expected.ocr = default.ocr.clone(),
+            _ => {}
+        }
+        expected
+    }
 
+    /// 全量 serde JSON 对比：任何漏重置的子字段都会被发现，不再靠抽查几个
+    /// 字段（Hotkey 只看 region、annotation 只看 stroke_color）蒙混过关。
+    #[test]
+    fn reset_page_only_touches_fields_the_page_owns() {
         for page in Page::ALL {
-            let mut s = all_non_default();
+            let original = all_non_default();
+            let mut s = original.clone();
             let changed = reset_page(&mut s, page);
+            let actual = serde_json::to_value(&s).expect("serializes");
+            let expected =
+                serde_json::to_value(expected_after_reset(page, &original)).expect("serializes");
             if page.has_config() {
                 assert!(changed, "{page:?} claims config but reset did nothing");
-                assert!(owned(page, &s), "{page:?} did not reset its own fields");
-                // Everything the page does not own stays exactly as it was.
-                match page {
-                    Page::Screenshot => {
-                        assert_eq!(s.screenshot.save_dir.as_deref(), Some("D:/shots".as_ref()));
-                        assert_eq!(s.translation.timeout_seconds, 111);
-                        assert_eq!(
-                            s.ocr.models_dir.as_deref(),
-                            Some("D:/models/custom".as_ref())
-                        );
-                    }
-                    Page::Output => {
-                        assert_eq!(s.screenshot.hidden_toolbar_items, ["text", "redo"]);
-                        assert_eq!(s.translation.model, "qwen-plus");
-                        assert_eq!(s.hotkeys.region, "Ctrl+Shift+1");
-                        // 切图设置由切图窗口管理，输出页重置不能碰它。
-                        assert_eq!(s.screenshot.split.count, 7);
-                        assert_eq!(s.screenshot.split.overlap_width, 6);
-                    }
-                    Page::Hotkey => {
-                        assert_eq!(s.translation.model, "qwen-plus");
-                        assert_eq!(s.screenshot.watermark.text, "机密");
-                    }
-                    Page::Appearance => {
-                        assert_eq!(s.translation.model, "qwen-plus");
-                        assert_eq!(s.hotkeys.fullscreen, "Ctrl+Shift+3");
-                        assert_eq!(s.screenshot.annotation.mosaic_block, 32);
-                    }
-                    Page::Translate => {
-                        assert_eq!(s.hotkeys.fullscreen, "Ctrl+Shift+3");
-                        assert_eq!(s.screenshot.annotation.mosaic_block, 32);
-                    }
-                    Page::Resources => {
-                        assert_eq!(s.translation.base_url, "https://api.example.com/v1");
-                        assert_eq!(s.screenshot.watermark.position, "topLeft");
-                    }
-                    Page::Data => {
-                        assert_eq!(s.translation.model, "qwen-plus");
-                        assert_eq!(s.screenshot.watermark.text, "机密");
-                        assert_eq!(s.hotkeys.region, "Ctrl+Shift+1");
-                    }
-                    _ => {}
-                }
+                assert_eq!(
+                    actual, expected,
+                    "{page:?} must reset exactly its owned fields"
+                );
             } else {
                 assert!(!changed, "{page:?} has no config but reported a reset");
-                assert_eq!(
-                    serde_json::to_value(&s).expect("serializes"),
-                    serde_json::to_value(all_non_default()).expect("serializes"),
-                    "{page:?} must not change any field"
-                );
+                assert_eq!(actual, expected, "{page:?} must not change any field");
             }
         }
     }

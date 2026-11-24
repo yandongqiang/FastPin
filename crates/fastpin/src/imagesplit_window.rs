@@ -226,21 +226,23 @@ impl SplitWindowView {
 
     /// 切图参数落盘。每次都从最新配置出发，只覆盖本窗口管辖的 `split` 字段，
     /// 这样设置页或其它窗口在这期间保存的修改不会被本地副本整体冲掉。
-    fn persist_split(&mut self) {
+    fn persist_split(&mut self, cx: &mut Context<Self>) {
         let mut config = crate::config::get();
         config.screenshot.split = self.settings.clone();
         if let Err(e) = crate::config::save(&config) {
             self.status = format!("设置保存失败：{e}").into();
+            cx.notify();
         }
     }
 
     /// 格式 / 质量属于 `screenshot.export`，与 split 分开写回，但同样基于最新配置。
-    fn persist_export(&mut self) {
+    fn persist_export(&mut self, cx: &mut Context<Self>) {
         let mut config = crate::config::get();
         config.screenshot.export.format = self.format;
         config.screenshot.export.quality = self.quality;
         if let Err(e) = crate::config::save(&config) {
             self.status = format!("设置保存失败：{e}").into();
+            cx.notify();
         }
     }
 
@@ -340,36 +342,36 @@ impl SplitWindowView {
 
     // ---- parameter mutations --------------------------------------------
 
-    fn cycle_direction(&mut self) {
+    fn cycle_direction(&mut self, cx: &mut Context<Self>) {
         self.settings.direction = match self.settings.direction {
             SplitDirection::Vertical => SplitDirection::Horizontal,
             SplitDirection::Horizontal => SplitDirection::Grid,
             SplitDirection::Grid => SplitDirection::Vertical,
         };
         self.recalc();
-        self.persist_split();
+        self.persist_split(cx);
     }
 
-    fn cycle_type(&mut self) {
+    fn cycle_type(&mut self, cx: &mut Context<Self>) {
         self.settings.split_type = match self.settings.split_type {
             SplitType::Equal => SplitType::Precise,
             SplitType::Precise => SplitType::Smart,
             SplitType::Smart => SplitType::Equal,
         };
         self.recalc();
-        self.persist_split();
+        self.persist_split(cx);
     }
 
-    fn cycle_unit(&mut self) {
+    fn cycle_unit(&mut self, cx: &mut Context<Self>) {
         self.settings.unit = match self.settings.unit {
             SplitUnit::Pixels => SplitUnit::Percentage,
             SplitUnit::Percentage => SplitUnit::Pixels,
         };
         self.recalc();
-        self.persist_split();
+        self.persist_split(cx);
     }
 
-    fn cycle_format(&mut self) {
+    fn cycle_format(&mut self, cx: &mut Context<Self>) {
         // Skip formats this machine's WIC cannot encode; offering WebP on a
         // build without it only produces a failed export.
         let all = ImageFormat::ALL;
@@ -387,7 +389,7 @@ impl SplitWindowView {
         self.format = crate::codec::effective_format(self.format);
         self.recalc();
         // 格式 / 质量归属 export，只更新这两个字段，不影响其它配置。
-        self.persist_export();
+        self.persist_export(cx);
     }
 
     fn step_u32(field: &mut u32, delta: i32, min: u32, max: u32) {
@@ -395,49 +397,49 @@ impl SplitWindowView {
         *field = next.clamp(min as i64, max as i64) as u32;
     }
 
-    fn step_count(&mut self, delta: i32) {
+    fn step_count(&mut self, delta: i32, cx: &mut Context<Self>) {
         Self::step_u32(&mut self.settings.count, delta, 1, 20);
         self.recalc();
-        self.persist_split();
+        self.persist_split(cx);
     }
 
-    fn step_rows(&mut self, delta: i32) {
+    fn step_rows(&mut self, delta: i32, cx: &mut Context<Self>) {
         Self::step_u32(&mut self.settings.rows, delta, 1, 20);
         self.recalc();
-        self.persist_split();
+        self.persist_split(cx);
     }
 
-    fn step_columns(&mut self, delta: i32) {
+    fn step_columns(&mut self, delta: i32, cx: &mut Context<Self>) {
         Self::step_u32(&mut self.settings.columns, delta, 1, 20);
         self.recalc();
-        self.persist_split();
+        self.persist_split(cx);
     }
 
-    fn step_pixels(&mut self, delta: i32) {
+    fn step_pixels(&mut self, delta: i32, cx: &mut Context<Self>) {
         Self::step_u32(&mut self.settings.pixels, delta, 16, 4096);
         self.recalc();
-        self.persist_split();
+        self.persist_split(cx);
     }
 
-    fn step_percentage(&mut self, delta: i32) {
+    fn step_percentage(&mut self, delta: i32, cx: &mut Context<Self>) {
         let value = self.settings.percentage.parse::<i32>().unwrap_or(50);
         let next = (value + delta * 5).clamp(5, 95);
         self.settings.percentage = next.to_string();
         self.recalc();
-        self.persist_split();
+        self.persist_split(cx);
     }
 
-    fn step_overlap(&mut self, delta: i32) {
+    fn step_overlap(&mut self, delta: i32, cx: &mut Context<Self>) {
         Self::step_u32(&mut self.settings.overlap_width, delta, 0, 256);
         self.recalc();
-        self.persist_split();
+        self.persist_split(cx);
     }
 
-    fn step_quality(&mut self, delta: i32) {
+    fn step_quality(&mut self, delta: i32, cx: &mut Context<Self>) {
         let next = self.quality as i32 + delta * 5;
         self.quality = next.clamp(1, 100) as u8;
         self.recalc();
-        self.persist_export();
+        self.persist_export(cx);
     }
 
     // ---- rendering -------------------------------------------------------
@@ -518,8 +520,8 @@ impl SplitWindowView {
         label: &'static str,
         value: String,
         cx: &mut Context<Self>,
-        dec: impl Fn(&mut Self) + 'static,
-        inc: impl Fn(&mut Self) + 'static,
+        dec: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        inc: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         let minus_id: SharedString = format!("{id}-dec").into();
         let plus_id: SharedString = format!("{id}-inc").into();
@@ -554,7 +556,7 @@ impl SplitWindowView {
                             .child("−")
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, _, _| dec(this)),
+                                cx.listener(move |this, _, _, cx| dec(this, cx)),
                             ),
                     )
                     .child(
@@ -582,7 +584,7 @@ impl SplitWindowView {
                             .child("+")
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, _, _| inc(this)),
+                                cx.listener(move |this, _, _, cx| inc(this, cx)),
                             ),
                     ),
             )
@@ -660,20 +662,20 @@ impl SplitWindowView {
         );
 
         el = el.child(
-            self.control_row("split-dir", "方向", dir.into(), cx, |this, _| {
-                this.cycle_direction();
+            self.control_row("split-dir", "方向", dir.into(), cx, |this, cx| {
+                this.cycle_direction(cx);
             }),
         );
         el = el.child(
-            self.control_row("split-type", "类型", kind.into(), cx, |this, _| {
-                this.cycle_type();
+            self.control_row("split-type", "类型", kind.into(), cx, |this, cx| {
+                this.cycle_type(cx);
             }),
         );
 
         if precise {
             el = el.child(
-                self.control_row("split-unit", "单位", unit.into(), cx, |this, _| {
-                    this.cycle_unit();
+                self.control_row("split-unit", "单位", unit.into(), cx, |this, cx| {
+                    this.cycle_unit(cx);
                 }),
             );
             if self.settings.unit == SplitUnit::Pixels {
@@ -682,8 +684,8 @@ impl SplitWindowView {
                     "像素步长",
                     self.settings.pixels.to_string(),
                     cx,
-                    |this| this.step_pixels(-16),
-                    |this| this.step_pixels(16),
+                    |this, cx| this.step_pixels(-16, cx),
+                    |this, cx| this.step_pixels(16, cx),
                 ));
             } else {
                 el = el.child(self.stepper_row(
@@ -691,8 +693,8 @@ impl SplitWindowView {
                     "百分比",
                     format!("{}%", self.settings.percentage),
                     cx,
-                    |this| this.step_percentage(-1),
-                    |this| this.step_percentage(1),
+                    |this, cx| this.step_percentage(-1, cx),
+                    |this, cx| this.step_percentage(1, cx),
                 ));
             }
         } else if grid {
@@ -701,16 +703,16 @@ impl SplitWindowView {
                 "行数",
                 self.settings.rows.to_string(),
                 cx,
-                |this| this.step_rows(-1),
-                |this| this.step_rows(1),
+                |this, cx| this.step_rows(-1, cx),
+                |this, cx| this.step_rows(1, cx),
             ));
             el = el.child(self.stepper_row(
                 "split-cols",
                 "列数",
                 self.settings.columns.to_string(),
                 cx,
-                |this| this.step_columns(-1),
-                |this| this.step_columns(1),
+                |this, cx| this.step_columns(-1, cx),
+                |this, cx| this.step_columns(1, cx),
             ));
         } else {
             el = el.child(self.stepper_row(
@@ -718,8 +720,8 @@ impl SplitWindowView {
                 "数量",
                 self.settings.count.to_string(),
                 cx,
-                |this| this.step_count(-1),
-                |this| this.step_count(1),
+                |this, cx| this.step_count(-1, cx),
+                |this, cx| this.step_count(1, cx),
             ));
         }
 
@@ -728,13 +730,13 @@ impl SplitWindowView {
             "重叠像素",
             self.settings.overlap_width.to_string(),
             cx,
-            |this| this.step_overlap(-2),
-            |this| this.step_overlap(2),
+            |this, cx| this.step_overlap(-2, cx),
+            |this, cx| this.step_overlap(2, cx),
         ));
 
         el = el.child(
-            self.control_row("split-format", "格式", fmt.into(), cx, |this, _| {
-                this.cycle_format();
+            self.control_row("split-format", "格式", fmt.into(), cx, |this, cx| {
+                this.cycle_format(cx);
             }),
         );
         if self.format != ImageFormat::Png {
@@ -743,8 +745,8 @@ impl SplitWindowView {
                 "质量",
                 self.quality.to_string(),
                 cx,
-                |this| this.step_quality(-1),
-                |this| this.step_quality(1),
+                |this, cx| this.step_quality(-1, cx),
+                |this, cx| this.step_quality(1, cx),
             ));
         }
 

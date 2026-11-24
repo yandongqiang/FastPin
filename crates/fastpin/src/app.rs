@@ -22,8 +22,8 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    CS_HREDRAW, CS_VREDRAW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, WM_DESTROY, WM_HOTKEY,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    CS_HREDRAW, CS_VREDRAW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, WM_DESTROY,
+    WM_HOTKEY, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 use crate::capture::{
@@ -746,6 +746,26 @@ fn boot_resident(
     Ok(())
 }
 
+/// 统一的可见错误提示。release 构建下 `log_app` 只写一个本地日志文件，
+/// 用户根本看不到；裁剪 / 合成 / 写盘这类"点了按钮却什么都没发生"的失败
+/// 必须用 Win32 消息框直接告知。用一把互斥量串行化，避免多个导出线程同时
+/// 弹出一堆模态框把界面卡死；消息框本身是 `hwnd = NULL` 的顶层框，不会
+/// 依赖任何 GPUI 窗口（失败时截图窗口可能正在关闭）。
+pub fn report_error(msg: &str) {
+    static ERROR_DIALOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ERROR_DIALOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let text = wide(&format!("{msg}\0"));
+    let title = wide("FastPin\0");
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
+}
+
 /// One-time, best-effort visible notice for tray-less mode. Shown on a helper
 /// thread so it never blocks gpui startup; suppress with `FASTPIN_NO_TRAY_HINT`
 /// (e.g. automated smoke tests). Never fake an icon we do not have.
@@ -834,6 +854,8 @@ unsafe extern "system" fn hidden_proc(
         if let Some(action) = action_from_wparam(wparam.0) {
             if let Err(e) = dispatch_action(action) {
                 crate::perf::log_app(&format!("action {action:?} failed: {e}"));
+                // 全屏截图这类同步导出失败此前也只进日志，用户按了热键什么都没发生。
+                report_error(&format!("截图失败：{e}"));
             }
         }
         return LRESULT(0);
@@ -1023,7 +1045,10 @@ pub(crate) fn export_annotated_region(
                 source,
             );
         }
-        Err(e) => crate::perf::log_app(&format!("crop failed: {e}")),
+        Err(e) => {
+            crate::perf::log_app(&format!("crop failed: {e}"));
+            report_error(&format!("截图裁剪失败：{e}"));
+        }
     }
 }
 
@@ -1056,6 +1081,9 @@ fn export_pixels_async(
         }
         if let Err(e) = export_pixels(px, cw, ch, stride, write_file, copy, source) {
             crate::perf::log_app(&format!("export failed: {e}"));
+            // 合成 / 剪贴板失败之前只有日志文件，用户看到的是窗口一闪消失、
+            // 文件也没有。弹框明确告知。写盘失败在写线程里单独上报（见下）。
+            report_error(&format!("截图导出失败：{e}"));
         }
     });
 }
@@ -1078,6 +1106,7 @@ fn export_pixels(
         write_file,
         copy,
         source,
+        None,
     )
 }
 
@@ -1087,6 +1116,9 @@ fn export_pixels(
 /// rendering, so it can hand the same allocation here instead of cloning what
 /// can be a 16384 px tall buffer on the UI thread. Long captures start from a
 /// region selection, so their records carry the `region` source tag.
+/// Kept as the non-reporting wrapper; callers that need a completion signal use
+/// `export_pixels_shared_reported`.
+#[allow(dead_code)]
 pub(crate) fn export_pixels_shared(
     px: std::sync::Arc<Vec<u8>>,
     cw: u32,
@@ -1095,12 +1127,44 @@ pub(crate) fn export_pixels_shared(
     write_file: bool,
     copy: bool,
 ) -> Result<()> {
-    export_pixels_shared_with_source(px, cw, ch, stride, write_file, copy, "region")
+    export_pixels_shared_with_source(px, cw, ch, stride, write_file, copy, "region", None)
+}
+
+/// 与 [`export_pixels_shared`] 相同的导出，但写盘线程结束后通过 `done` 把真实
+/// 结果回传给调用方（长截图预览用它把"保存中…"更新成"已保存"或显示失败）。
+/// 同步失败（路径预留 / 编码 / 剪贴板）也在返回前回传一次，保证调用方一定能
+/// 收到一个终态消息。
+pub(crate) fn export_pixels_shared_reported(
+    px: std::sync::Arc<Vec<u8>>,
+    cw: u32,
+    ch: u32,
+    stride: u32,
+    write_file: bool,
+    copy: bool,
+    done: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+) -> Result<()> {
+    let outcome = export_pixels_shared_with_source(
+        px,
+        cw,
+        ch,
+        stride,
+        write_file,
+        copy,
+        "region",
+        Some(done.clone()),
+    );
+    if let Err(e) = &outcome {
+        // 写线程已经回报过的结果不会被覆盖：路径预留失败时写线程根本没启动，
+        // 剪贴板失败与写盘是独立的两条终态，接收方取到任意一条失败都算如实反馈。
+        let _ = done.send(Err(e.to_string()));
+    }
+    outcome
 }
 
 /// Same as [`export_pixels_shared`] with an explicit capture-origin tag for the
 /// per-source history filter. `&'static str` because every caller passes a
 /// literal, which also keeps the tag safe to move into the export threads.
+#[allow(clippy::too_many_arguments)]
 fn export_pixels_shared_with_source(
     px: std::sync::Arc<Vec<u8>>,
     cw: u32,
@@ -1109,6 +1173,7 @@ fn export_pixels_shared_with_source(
     write_file: bool,
     copy: bool,
     source: &'static str,
+    done: Option<std::sync::mpsc::Sender<std::result::Result<(), String>>>,
 ) -> Result<()> {
     if write_file {
         let mut export = crate::config::get().screenshot.export.clone();
@@ -1139,6 +1204,12 @@ fn export_pixels_shared_with_source(
                 // 免得留下一个永远不会被重命名的 0 字节截图。
                 let _ = std::fs::remove_file(&path);
                 crate::perf::log_app(&format!("image write failed: {e}"));
+                // 这是导出线程里的失败，用户看不到日志文件。弹窗明确告知，
+                // 同时回传给长截图预览（若有）更新状态。
+                report_error(&format!("截图写盘失败：{e}"));
+                if let Some(done) = &done {
+                    let _ = done.send(Err(format!("写盘失败：{e}")));
+                }
                 return;
             }
             // Read back the exact bytes the user saved so the history copy is
@@ -1152,6 +1223,10 @@ fn export_pixels_shared_with_source(
                     ch,
                     source,
                 );
+            }
+            // 真正写盘成功后再回报，绝不提前置「已保存」。
+            if let Some(done) = &done {
+                let _ = done.send(Ok(()));
             }
         });
     }

@@ -993,6 +993,21 @@ fn hist_button(id: &'static str, label: &'static str, danger: bool) -> gpui::Sta
 mod tests {
     use super::*;
 
+    static TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    /// Scratch directory under target/ with an atomic counter: parallel tests
+    /// never race on the same case dir (and %TEMP% is blocked by the sandbox).
+    fn scratch() -> PathBuf {
+        let n = TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("history-window-tests")
+            .join(format!("case-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     #[test]
     fn thumb_height_follows_aspect_ratio_with_clamp() {
         // 16:9 → 176 * 9 / 16 = 99
@@ -1011,11 +1026,7 @@ mod tests {
     /// into a GPUI thumbnail, including the B/R swap the atlas expects.
     #[test]
     fn stored_png_decodes_into_a_bgra_thumbnail() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("history-window-tests")
-            .join(format!("case-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch();
         let path = dir.join("image.png");
         image::RgbaImage::from_pixel(240, 160, image::Rgba([10, 20, 200, 255]))
             .save(&path)
@@ -1024,5 +1035,36 @@ mod tests {
         let thumb = load_thumb(&path).expect("thumbnail decodes");
         let bytes = thumb.as_bytes(0).expect("RenderImage carries the frame");
         assert_eq!(&bytes[..4], &[200, 20, 10, 255]);
+    }
+
+    /// 头部声明超大画布但文件只有几十字节的图片必须在解码前被拒绝：
+    /// `image::open` 会按头部尺寸分配，panic=abort 下会直接结束进程。
+    #[test]
+    fn huge_header_image_is_rejected_before_decoding() {
+        let dir = scratch();
+        let path = dir.join("bomb.bmp");
+        // 54 字节 BMP：BITMAPINFOHEADER 声明 20000×1（超过 MAX_SIDE），
+        // 但完全没有像素数据。load_thumb 只该读头部就拒绝。
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"BM");
+        bytes.extend_from_slice(&54u32.to_le_bytes()); // file size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&54u32.to_le_bytes()); // pixel offset
+        bytes.extend_from_slice(&40u32.to_le_bytes()); // DIB header size
+        bytes.extend_from_slice(&20_000u32.to_le_bytes()); // width
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // height
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // planes
+        bytes.extend_from_slice(&24u16.to_le_bytes()); // bits per pixel
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // image size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // x ppm
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // y ppm
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // colors used
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // important colors
+        assert_eq!(bytes.len(), 54);
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(BUDGET.checked_dims(20_000, 1).is_err());
+        assert!(load_thumb(&path).is_none());
     }
 }

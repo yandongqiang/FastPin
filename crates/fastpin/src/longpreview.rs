@@ -240,6 +240,10 @@ pub struct LongPreviewView {
     zoom: f32,
     saved: bool,
     copied: bool,
+    /// 写盘线程已启动但尚未回报。启动线程不等于保存成功，期间显示"保存中…"。
+    saving: bool,
+    /// 导出失败原因（来自写盘线程回传或同步失败）。
+    save_error: Option<String>,
 }
 
 impl LongPreviewView {
@@ -260,6 +264,8 @@ impl LongPreviewView {
             zoom,
             saved: false,
             copied: false,
+            saving: false,
+            save_error: None,
         }
     }
 
@@ -274,17 +280,56 @@ impl LongPreviewView {
 
     /// Hands the shared buffer to the export thread. `write_file` and `copy`
     /// are independent so the three buttons differ only by these two flags.
+    /// 文件写入在后台线程完成：只有收到写线程的回报才置 `saved`，其间显示
+    /// "保存中…"，失败则由主线程显示原因（写线程自身也会弹可见错误框）。
     fn export(&mut self, write_file: bool, copy: bool, cx: &mut Context<Self>) {
         let (w, h) = self.pixel_size;
-        let result =
-            crate::app::export_pixels_shared(self.pixels.clone(), w, h, w * 4, write_file, copy);
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        let result = crate::app::export_pixels_shared_reported(
+            self.pixels.clone(),
+            w,
+            h,
+            w * 4,
+            write_file,
+            copy,
+            tx,
+        );
         match result {
             Ok(()) => {
-                self.saved |= write_file;
+                // 剪贴板复制是同步完成的；文件是否落盘必须等写线程回报。
                 self.copied |= copy;
+                if write_file {
+                    self.saving = true;
+                    self.save_error = None;
+                    cx.notify();
+                    let task = cx.background_executor().spawn(async move { rx.recv() });
+                    cx.spawn(async move |this, cx| {
+                        let outcome = task.await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.saving = false;
+                            match outcome {
+                                Ok(Ok(())) => this.saved = true,
+                                Ok(Err(e)) => this.save_error = Some(e),
+                                Err(_) => {
+                                    this.save_error = Some("保存线程意外退出".into());
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                } else {
+                    cx.notify();
+                }
+            }
+            Err(e) => {
+                // 同步失败（路径预留 / 编码 / 剪贴板）：这里也要弹框，否则
+                // 用户只看到状态栏一句话，仍以为是程序没反应。
+                crate::perf::log_app(&format!("long preview export: {e}"));
+                self.save_error = Some(e.to_string());
+                crate::app::report_error(&format!("截图导出失败：{e}"));
                 cx.notify();
             }
-            Err(e) => crate::perf::log_app(&format!("long preview export: {e}")),
         }
     }
 
@@ -376,11 +421,17 @@ impl LongPreviewView {
     /// One status sentence on the left, the export actions on the right.
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let percent = (self.zoom * 100.0).round() as i32;
-        let status = match (self.saved, self.copied) {
-            (true, true) => "已保存并复制",
-            (true, false) => "已保存",
-            (false, true) => "已复制",
-            (false, false) => "关闭将丢弃此截图",
+        let status = if let Some(e) = &self.save_error {
+            format!("保存失败：{e}")
+        } else if self.saving {
+            "保存中…".to_string()
+        } else {
+            match (self.saved, self.copied) {
+                (true, true) => "已保存并复制".to_string(),
+                (true, false) => "已保存".to_string(),
+                (false, true) => "已复制".to_string(),
+                (false, false) => "关闭将丢弃此截图".to_string(),
+            }
         };
         div()
             .flex_none()

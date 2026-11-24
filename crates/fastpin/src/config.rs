@@ -1307,55 +1307,278 @@ fn parse(text: &str) -> Settings {
     match serde_json::from_str::<Settings>(text) {
         Ok(settings) => settings,
         Err(e) => {
-            // One wrong field type (say `"timeoutSeconds": "30"`) used to throw
-            // away the whole file: baseUrl, saveDir and history were lost and
-            // the next save overwrote the original. Keep every field whose JSON
-            // type still matches the default shape and drop only the bad ones.
-            eprintln!("settings.json has invalid fields ({e}); keeping the well-typed ones");
-            let default = match serde_json::to_value(Settings::default()) {
-                Ok(value) => value,
-                Err(_) => return Settings::default(),
-            };
+            // 一个坏值（`"captureMode":"banana"`、`"paperSize":"A3XL"`、
+            // `backgroundRgba:[1,2]`）过去会让整份配置归零，连 baseUrl /
+            // history / saveDir 一起丢掉，下次保存又覆盖原文件。这里改为
+            // 逐字段恢复：只有坏字段回退默认，其它好字段全部保留。
+            eprintln!("settings.json has invalid fields ({e}); recovering field by field");
             let input: serde_json::Value = match serde_json::from_str(text) {
                 Ok(value) => value,
                 Err(_) => return Settings::default(),
             };
-            serde_json::from_value(merge_typed(&default, &input)).unwrap_or_default()
+            recover_settings(&input)
         }
     }
 }
 
-/// Merges `input` into the default-shaped tree, keeping only values whose JSON
-/// kind matches the default at that path. Unknown keys are dropped; a bad leaf
-/// falls back to its default instead of poisoning the whole document.
-fn merge_typed(default: &serde_json::Value, input: &serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match (default, input) {
-        (Value::Object(base), Value::Object(over)) => {
-            let mut out = base.clone();
-            for (key, value) in over {
-                if let Some(expected) = base.get(key) {
-                    out.insert(key.clone(), merge_typed(expected, value));
-                }
+/// 读取单个字段：反序列化失败时保留默认值并记日志。各结构体都带
+/// `#[serde(default)]`，因此缺失的键由字段类型自己补齐，未知键被忽略。
+fn recover_field<T: serde::de::DeserializeOwned>(
+    input: &serde_json::Value,
+    key: &str,
+    label: &str,
+) -> Option<T> {
+    let value = input.get(key)?;
+    match serde_json::from_value::<T>(value.clone()) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            eprintln!("settings.json: 字段 {label} 无效（{e}），已回退默认值");
+            None
+        }
+    }
+}
+
+/// 批量恢复一个结构体对象里的字段，避免逐个字段写重复的 fallback 逻辑。
+macro_rules! recover_fields {
+    ($input:expr, $out:expr, $prefix:literal $(, $key:literal => $field:ident)* $(,)?) => {
+        $(
+            if let Some(value) = recover_field($input, $key, concat!($prefix, ".", $key)) {
+                $out.$field = value;
             }
-            Value::Object(out)
-        }
-        (Value::Null, other) => other.clone(),
-        (expected, Value::Null) => expected.clone(),
-        (expected, other) if same_kind(expected, other) => other.clone(),
-        (expected, _) => expected.clone(),
-    }
+        )*
+    };
 }
 
-fn same_kind(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    use serde_json::Value;
-    matches!(
-        (a, b),
-        (Value::Bool(_), Value::Bool(_))
-            | (Value::Number(_), Value::Number(_))
-            | (Value::String(_), Value::String(_))
-            | (Value::Array(_), Value::Array(_))
-    )
+/// 顶层字段逐个恢复。`screenshot` 内部含多个枚举，交给 `recover_screenshot`
+/// 再按二级字段恢复，尽量少丢用户数据。
+fn recover_settings(input: &serde_json::Value) -> Settings {
+    let mut out = Settings::default();
+    if !input.is_object() {
+        eprintln!("settings.json: 根节点不是对象，已回退默认值");
+        return out;
+    }
+    out.ocr = recover_ocr(input.get("ocr"));
+    out.translation = recover_translation(input.get("translation"));
+    out.screenshot = recover_screenshot(input.get("screenshot"));
+    out.history = recover_history(input.get("history"));
+    out.hotkeys = recover_hotkeys(input.get("hotkeys"));
+    if let Some(value) = recover_field(input, "appearance", "appearance") {
+        out.appearance = value;
+    }
+    out
+}
+
+fn recover_ocr(input: Option<&serde_json::Value>) -> Ocr {
+    let mut out = Ocr::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 ocr 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "ocr", "modelsDir" => models_dir);
+    out
+}
+
+fn recover_translation(input: Option<&serde_json::Value>) -> Translation {
+    let mut out = Translation::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 translation 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "translation",
+        "baseUrl" => base_url,
+        "model" => model,
+        "targetLanguage" => target_language,
+        "prompt" => prompt,
+        "timeoutSeconds" => timeout_seconds,
+        "allowInsecureHttp" => allow_insecure_http,
+    );
+    out
+}
+
+fn recover_history(input: Option<&serde_json::Value>) -> History {
+    let mut out = History::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 history 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "history",
+        "enabled" => enabled,
+        "dir" => dir,
+        "retentionDays" => retention_days,
+        "limit" => limit,
+        "maxDiskMib" => max_disk_mib,
+        "keepPermanently" => keep_permanently,
+    );
+    out
+}
+
+fn recover_hotkeys(input: Option<&serde_json::Value>) -> Hotkeys {
+    let mut out = Hotkeys::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 hotkeys 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "hotkeys",
+        "region" => region,
+        "copyOnly" => copy_only,
+        "fullscreen" => fullscreen,
+    );
+    out
+}
+
+/// `screenshot` 是最大的字段：其中每个二级字段独立尝试，坏枚举只回退它自己。
+fn recover_screenshot(input: Option<&serde_json::Value>) -> Screenshot {
+    let mut out = Screenshot::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 screenshot 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "screenshot",
+        "hiddenToolbarItems" => hidden_toolbar_items,
+        "saveDir" => save_dir,
+        "smartSelection" => smart_selection,
+        "captureMode" => capture_mode,
+        "showCursor" => show_cursor,
+        "showGuides" => show_guides,
+        "longCaptureAutoStart" => long_capture_auto_start,
+        "leftDoubleClick" => left_double_click,
+        "middleClick" => middle_click,
+        "clickOutside" => click_outside,
+        "recordHistorySources" => record_history_sources,
+        "toolbarPosition" => toolbar_position,
+        "panelPosition" => panel_position,
+        "toolbarRememberPos" => toolbar_remember_pos,
+        "panelRememberPos" => panel_remember_pos,
+        "showMagnifier" => show_magnifier,
+        "showInfoBar" => show_info_bar,
+        "showShortcutHints" => show_shortcut_hints,
+    );
+    // 这些二级字段本身也是结构体，坏值再往下一层恢复，保住同结构里的好字段。
+    out.annotation = recover_annotation(input.get("annotation"));
+    out.watermark = recover_watermark(input.get("watermark"));
+    out.auto_scroll = recover_auto_scroll(input.get("autoScroll"));
+    out.export = recover_export(input.get("export"));
+    out.collage = recover_collage(input.get("collage"));
+    out.pdf = recover_pdf(input.get("pdf"));
+    // split 定义在 imagesplit 模块，整体尝试即可：坏值只回退切图设置。
+    if let Some(value) = recover_field(input, "split", "screenshot.split") {
+        out.split = value;
+    }
+    out
+}
+
+fn recover_annotation(input: Option<&serde_json::Value>) -> Annotation {
+    let mut out = Annotation::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 screenshot.annotation 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "screenshot.annotation",
+        "strokeWidth" => stroke_width,
+        "strokeColor" => stroke_color,
+        "mosaicBlock" => mosaic_block,
+    );
+    out
+}
+
+fn recover_watermark(input: Option<&serde_json::Value>) -> Watermark {
+    let mut out = Watermark::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 screenshot.watermark 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "screenshot.watermark",
+        "text" => text,
+        "opacity" => opacity,
+        "position" => position,
+        "scale" => scale,
+        "tiled" => tiled,
+        "timestamp" => timestamp,
+        "imagePath" => image_path,
+    );
+    out
+}
+
+fn recover_auto_scroll(input: Option<&serde_json::Value>) -> AutoScroll {
+    let mut out = AutoScroll::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 screenshot.autoScroll 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "screenshot.autoScroll",
+        "intervalMs" => interval_ms,
+        "notches" => notches,
+    );
+    out
+}
+
+fn recover_export(input: Option<&serde_json::Value>) -> Export {
+    let mut out = Export::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 screenshot.export 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "screenshot.export",
+        "format" => format,
+        "quality" => quality,
+        "filenameTemplate" => filename_template,
+        "autoSave" => auto_save,
+        "autoCopy" => auto_copy,
+    );
+    out
+}
+
+fn recover_collage(input: Option<&serde_json::Value>) -> CollageSettings {
+    let mut out = CollageSettings::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 screenshot.collage 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "screenshot.collage",
+        "direction" => direction,
+        "sizing" => sizing,
+        "border" => border,
+        "spacing" => spacing,
+        "backgroundRgba" => background_rgba,
+        "rows" => rows,
+        "columns" => columns,
+    );
+    out
+}
+
+fn recover_pdf(input: Option<&serde_json::Value>) -> PdfSettings {
+    let mut out = PdfSettings::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 screenshot.pdf 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "screenshot.pdf",
+        "stitchingMethod" => stitching_method,
+        "templateType" => template_type,
+        "spacingMm" => spacing_mm,
+        "paperSize" => paper_size,
+        "orientation" => orientation,
+        "customWidthMm" => custom_width_mm,
+        "customHeightMm" => custom_height_mm,
+        "marginTopMm" => margin_top_mm,
+        "marginBottomMm" => margin_bottom_mm,
+        "marginLeftMm" => margin_left_mm,
+        "marginRightMm" => margin_right_mm,
+        "exportMode" => export_mode,
+        "imageQuality" => image_quality,
+    );
+    out
 }
 
 #[cfg(test)]
@@ -1384,7 +1607,7 @@ mod tests {
     }
 
     /// 旧版配置文件里残留的本地翻译字段是未知键：`#[serde(default)]` 负责
-    /// 补齐缺省值，serde 默认忽略未知键，`merge_typed` 也会把它们丢掉。
+    /// 补齐缺省值，serde 默认忽略未知键，逐字段恢复路径也会把它们丢掉。
     /// 用户手动升级设置文件时不能因为这些残留字段而丢失 API 配置。
     #[test]
     fn leftover_local_translate_fields_are_ignored() {
@@ -1406,7 +1629,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             ..Translation::default()
         };
-        // parse 的容错路径（merge_typed）与直接反序列化都不能被未知键影响。
+        // parse 的逐字段恢复路径与直接反序列化都不能被未知键影响。
         assert_eq!(parse(text).translation, expected);
         let direct: Settings = serde_json::from_str(text).expect("unknown keys are ignored");
         assert_eq!(direct.translation, expected);
@@ -1418,7 +1641,7 @@ mod tests {
             serde_json::from_str(weird).expect("unknown keys of any JSON type are ignored");
         assert_eq!(direct.translation, Translation::default());
 
-        // 同时存在坏字段时走 merge_typed 容错路径：未知键仍被丢弃，好字段保留。
+        // 同时存在坏字段时走逐字段恢复路径：未知键仍被丢弃，好字段保留。
         let mixed = r#"{"translation": {
           "baseUrl": "https://api.example.com/v1",
           "timeoutSeconds": "30",
@@ -1455,6 +1678,40 @@ mod tests {
             s.ocr.models_dir.as_deref(),
             Some(std::path::Path::new("D:/models/v6"))
         );
+    }
+
+    /// 坏枚举 / 坏定长数组只能通过 JSON 种类检查，却在第二次反序列化时失败；
+    /// 过去这会让 `unwrap_or_default()` 把整份配置归零。现在只回退坏字段。
+    #[test]
+    fn a_bad_enum_keeps_every_other_field() {
+        let s = parse(
+            r#"{
+              "translation": {"baseUrl": "https://api.example.com/v1"},
+              "history": {"dir": "D:/history"},
+              "screenshot": {
+                "captureMode": "banana",
+                "saveDir": "D:/shots",
+                "collage": {"backgroundRgba": [1, 2], "spacing": 9},
+                "pdf": {"paperSize": "A3XL", "imageQuality": 55}
+              }
+            }"#,
+        );
+        // 好字段一个都不能丢。
+        assert_eq!(s.translation.base_url, "https://api.example.com/v1");
+        assert_eq!(
+            s.history.dir.as_deref(),
+            Some(std::path::Path::new("D:/history"))
+        );
+        assert_eq!(
+            s.screenshot.save_dir.as_deref(),
+            Some(std::path::Path::new("D:/shots"))
+        );
+        assert_eq!(s.screenshot.collage.spacing, 9);
+        assert_eq!(s.screenshot.pdf.image_quality, 55);
+        // 坏枚举与坏定长数组只回退各自字段的默认值。
+        assert_eq!(s.screenshot.capture_mode, CaptureMode::Auto);
+        assert_eq!(s.screenshot.collage.background_rgba, [255, 255, 255, 255]);
+        assert_eq!(s.screenshot.pdf.paper_size, PaperSize::A4);
     }
 
     #[test]

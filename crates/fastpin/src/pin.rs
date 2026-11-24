@@ -17,7 +17,7 @@
 //! which shows a native popup menu and calls back with the chosen command.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -86,9 +86,11 @@ thread_local! {
     /// 快速重开同一 group 时，后一笔的 tiles 必须包含前一笔的标注，
     /// 否则两个后台任务谁最后返回谁就把先前那笔覆盖掉。
     static PENDING_WRITES: RefCell<HashMap<u64, Vec<PendingWrite>>> = RefCell::new(HashMap::new());
-    /// 正在冲刷队列时的重入保护：写回会 notify，途中再次进入 snapshots
-    /// 只读现有 view，外层 flush 会把队列里剩下的部分继续应用完。
-    static FLUSHING_WRITES: Cell<bool> = const { Cell::new(false) };
+    /// 正在冲刷队列的 group 集合。写回会 notify，途中再次进入同一 group 的
+    /// snapshots 只读现有 view，外层 flush 会把队列里剩下的部分继续应用完。
+    /// 按 group 记录而不是一个全局 bool：A 组冲刷时 B 组调用 flush 不该被吞，
+    /// 否则 B 的队列永远留在 PENDING_WRITES 里。
+    static FLUSHING_WRITES: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
     /// group -> 仍在后台 flatten 的完成次数。大于 0 时新的完成必须等它归零
     /// 再抓 tiles，否则 tiles 里还没有前一笔标注，仍会互相覆盖。
     static INFLIGHT_FINISHES: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
@@ -311,12 +313,12 @@ pub fn show_pin(
     stride: u32,
     screen_x: i32,
     screen_y: i32,
-) {
+) -> crate::error::Result<()> {
     let buf = repack_opaque(&pixels, w, h, stride);
     let pixels = Arc::new(buf);
     let Some(image) = render_image(&pixels, w, h) else {
         crate::perf::log_app("pin: pixel buffer size mismatch");
-        return;
+        return Err(crate::error::Error::new("像素缓冲区尺寸不匹配"));
     };
     // A pin keeps one BGRA copy plus the render-image copy for its whole life.
     // Reserve both against the process-wide ceiling so many pins cannot add up
@@ -326,7 +328,7 @@ pub fn show_pin(
         Ok(permit) => permit,
         Err(e) => {
             crate::perf::log_app(&format!("pin refused: {e}"));
-            return;
+            return Err(crate::error::Error::new(format!("内存预算不足：{e}")));
         }
     };
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -359,7 +361,7 @@ pub fn show_pin(
         Ok(handle) => handle,
         Err(e) => {
             crate::perf::log_app(&format!("pin window failed: {e}"));
-            return;
+            return Err(crate::error::Error::new(format!("贴图窗口创建失败：{e}")));
         }
     };
 
@@ -374,7 +376,7 @@ pub fn show_pin(
         crate::platform::hwnd_of(window)
     });
     let Ok(hwnd) = hwnd else {
-        return;
+        return Err(crate::error::Error::new("贴图窗口初始化失败"));
     };
     PINS.with(|slot| {
         slot.borrow_mut().push(PinEntry {
@@ -384,6 +386,7 @@ pub fn show_pin(
             handle,
         })
     });
+    Ok(())
 }
 
 fn render_image(pixels: &Arc<Vec<u8>>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
@@ -597,15 +600,32 @@ pub(crate) fn enqueue_pending_writes(group: u64, writes: Vec<PendingWrite>) {
     });
 }
 
-/// 按入队顺序把像素写回 tile view。正在冲刷时重入直接跳过，外层 flush 会
-/// 继续处理队列里剩下的项，保证同一 group 的写回永远是先进先出。
+/// 进入 `group` 的冲刷临界区。已在该集合中说明同一 group 正被冲刷（重入），
+/// 返回 false；不同 group 互不干扰，各自都能拿到自己的冲刷机会。
+fn begin_flush(group: u64) -> bool {
+    FLUSHING_WRITES.with(|slot| slot.borrow_mut().insert(group))
+}
+
+/// 离开 `group` 的冲刷临界区。
+fn end_flush(group: u64) {
+    FLUSHING_WRITES.with(|slot| slot.borrow_mut().remove(&group));
+}
+
+/// 取出 `group` 的待写回队列（按入队顺序）。单独抽出来便于单测验证 FIFO。
+fn take_pending_writes(group: u64) -> Vec<PendingWrite> {
+    PENDING_WRITES
+        .with(|slot| slot.borrow_mut().remove(&group))
+        .unwrap_or_default()
+}
+
+/// 按入队顺序把像素写回 tile view。同一 group 正在冲刷时重入直接跳过，外层
+/// flush 会继续处理队列里剩下的项，保证同一 group 的写回永远是先进先出。
+/// 不同 group 的冲刷彼此独立，不会被对方的重入保护吞掉。
 pub(crate) fn flush_pending_writes(cx: &mut App, group: u64) {
-    if FLUSHING_WRITES.with(|f| f.replace(true)) {
+    if !begin_flush(group) {
         return;
     }
-    let writes = PENDING_WRITES
-        .with(|slot| slot.borrow_mut().remove(&group))
-        .unwrap_or_default();
+    let writes = take_pending_writes(group);
     for (id, px, w, h, zoom) in writes {
         let Some(handle) = entry_handle(id) else {
             continue;
@@ -617,7 +637,7 @@ pub(crate) fn flush_pending_writes(cx: &mut App, group: u64) {
             cx.notify();
         });
     }
-    FLUSHING_WRITES.with(|f| f.set(false));
+    end_flush(group);
 }
 
 /// pin_edit::finish_async 在生成后台任务前登记，写回完成后解除。
@@ -2322,6 +2342,39 @@ mod tests {
         end_finish(42); // 多余解除不能把别的组状态带坏
         assert!(!has_inflight_finish(41));
         assert!(!has_inflight_finish(42));
+    }
+
+    /// 冲刷的重入保护必须按 group 隔离：A 组冲刷途中 B 组仍能冲刷，
+    /// 同一 group 的重入才被跳过，否则队列会永久卡住。
+    #[test]
+    fn flush_guard_is_per_group_not_global() {
+        assert!(begin_flush(41));
+        assert!(begin_flush(42), "B 组不该被 A 组的冲刷吞掉");
+        assert!(!begin_flush(41), "同一 group 的重入必须被跳过");
+        assert!(!begin_flush(42));
+        end_flush(41);
+        assert!(begin_flush(41), "A 组结束后应能再次冲刷");
+        assert!(!begin_flush(42), "B 组仍在冲刷中");
+        end_flush(41);
+        end_flush(42);
+        assert!(begin_flush(41));
+        assert!(begin_flush(42));
+        end_flush(41);
+        end_flush(42);
+    }
+
+    /// 待写回队列按入队顺序取出，且按 group 分开。
+    #[test]
+    fn pending_writes_are_drained_fifo_and_per_group() {
+        let write = |id: u64| (id, Vec::<u8>::new(), 2u32, 2u32, 1.0f32);
+        enqueue_pending_writes(41, vec![write(1), write(2)]);
+        enqueue_pending_writes(42, vec![write(3)]);
+        enqueue_pending_writes(41, vec![write(4)]);
+        let a = take_pending_writes(41);
+        assert_eq!(a.iter().map(|w| w.0).collect::<Vec<_>>(), vec![1, 2, 4]);
+        assert!(take_pending_writes(41).is_empty(), "取出后队列应清空");
+        let b = take_pending_writes(42);
+        assert_eq!(b.iter().map(|w| w.0).collect::<Vec<_>>(), vec![3]);
     }
 
     /// The eight hot zones: four sides, four corners, nothing inside.

@@ -180,6 +180,23 @@ fn message_content(json: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// `{"error":{"message":"..."}}` —— 网关失败时真正的原因在这里（401 只显示
+/// 状态码会把"API Key 无效"这类信息丢掉）。与 `message_content` 一样容错：
+/// 非 JSON / HTML 错误页一律忽略，文本经去敏、截断后才给用户看。
+fn error_message(json: &str) -> Option<String> {
+    if json.trim_start().starts_with('<') {
+        return None;
+    }
+    let root: serde_json::Value = serde_json::from_str(json).ok()?;
+    let msg = root
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .or_else(|| root.get("error"))
+        .and_then(|v| v.as_str())?;
+    let msg = crate::net::redact_api_message(msg.trim());
+    (!msg.is_empty()).then_some(msg)
+}
+
 /// Closes on every path, including the error returns below.
 struct Handle(*mut c_void);
 
@@ -245,7 +262,7 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
         // One budget for the whole exchange, matching the C# provider, which
         // times the request rather than each socket phase.
         let ms = (timeout_seconds * 1000) as i32;
-        WinHttpSetTimeouts(session.0, ms, ms, ms, ms)?;
+        WinHttpSetTimeouts(session.0, ms, ms, ms, ms).map_err(|e| crate::net::winhttp_error(&e))?;
 
         let host_w = nul_terminated_from(&host);
         let connect = Handle(WinHttpConnect(
@@ -285,8 +302,10 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
             body.len() as u32,
             body.len() as u32,
             0,
-        )?;
-        WinHttpReceiveResponse(request.0, std::ptr::null_mut())?;
+        )
+        .map_err(|e| crate::net::winhttp_error(&e))?;
+        WinHttpReceiveResponse(request.0, std::ptr::null_mut())
+            .map_err(|e| crate::net::winhttp_error(&e))?;
 
         let mut status = 0u32;
         let mut size = std::mem::size_of::<u32>() as u32;
@@ -297,14 +316,20 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
             Some(&mut status as *mut u32 as *mut c_void),
             &mut size,
             std::ptr::null_mut(),
-        )?;
+        )
+        .map_err(|e| crate::net::winhttp_error(&e))?;
 
         let payload = crate::net::read_response(request.0, crate::net::MAX_RESPONSE_BYTES)?;
 
         if !(200..300).contains(&status) {
-            // The body often names the real cause (bad key, unknown model), but
-            // it is the provider's text — keep it short and never log the key.
-            return Err(Error::new(format!("Translation API failed ({status}).")));
+            // 401 只报状态码会丢掉"API Key 无效"这类真正原因。附上服务端
+            // error.message（已去敏、截断），HTML 错误页等无法解析的情况则
+            // 退回原来的简短状态码提示。
+            let detail = String::from_utf8_lossy(&payload);
+            let detail = error_message(&detail)
+                .map(|m| format!("：{m}"))
+                .unwrap_or_default();
+            return Err(Error::new(format!("翻译失败（HTTP {status}）{detail}")));
         }
         String::from_utf8(payload)
             .map_err(|_| Error::new("Translation API returned invalid UTF-8."))
@@ -391,6 +416,23 @@ mod tests {
             message_content(r#"{"output_text":"responses api"}"#).as_deref(),
             Some("responses api")
         );
+    }
+
+    #[test]
+    fn error_message_extracts_and_redacts_the_providers_reason() {
+        let json = r#"{"error":{"message":"Incorrect API key provided: sk-abcdefghijklmnop"}}"#;
+        let msg = error_message(json).expect("error.message is present");
+        assert!(msg.contains("Incorrect API key"));
+        assert!(!msg.contains("sk-abcdefghijklmnop"));
+        assert!(msg.contains("***"));
+        // 直接是字符串、HTML 错误页、缺字段都要容错。
+        assert_eq!(
+            error_message(r#"{"error":"model not found"}"#).as_deref(),
+            Some("model not found")
+        );
+        assert!(error_message("<html>502 Bad Gateway</html>").is_none());
+        assert!(error_message(r#"{"error":{}}"#).is_none());
+        assert!(error_message("{").is_none());
     }
 
     #[test]

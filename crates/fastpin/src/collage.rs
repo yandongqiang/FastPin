@@ -638,14 +638,17 @@ pub fn calculate_collage_layout(
             let total_h = sizes
                 .iter()
                 .fold(0u32, |acc, (_, h)| acc.saturating_add(*h));
-            let spacing_total = settings.spacing * (items.len().saturating_sub(1) as u32);
+            let spacing_total = settings
+                .spacing
+                .saturating_mul(items.len().saturating_sub(1) as u32);
+            let border2 = settings.border.saturating_mul(2);
             let h = total_h
                 .saturating_add(spacing_total)
-                .saturating_add(settings.border * 2);
+                .saturating_add(border2);
 
             let mut y = settings.border;
             for (w, item_h) in sizes {
-                let x = settings.border + (max_w - w) / 2;
+                let x = settings.border.saturating_add((max_w - w) / 2);
                 layout.rects.push(RectPx {
                     x,
                     y,
@@ -654,7 +657,7 @@ pub fn calculate_collage_layout(
                 });
                 y = y.saturating_add(item_h).saturating_add(settings.spacing);
             }
-            layout.size = (max_w + settings.border * 2, h);
+            layout.size = (max_w.saturating_add(border2), h);
         }
         Direction::Horizontal => {
             let max_h = items
@@ -676,14 +679,17 @@ pub fn calculate_collage_layout(
             let total_w = sizes
                 .iter()
                 .fold(0u32, |acc, (w, _)| acc.saturating_add(*w));
-            let spacing_total = settings.spacing * (items.len().saturating_sub(1) as u32);
+            let spacing_total = settings
+                .spacing
+                .saturating_mul(items.len().saturating_sub(1) as u32);
+            let border2 = settings.border.saturating_mul(2);
             let w = total_w
                 .saturating_add(spacing_total)
-                .saturating_add(settings.border * 2);
+                .saturating_add(border2);
 
             let mut x = settings.border;
             for (item_w, h) in sizes {
-                let y = settings.border + (max_h - h) / 2;
+                let y = settings.border.saturating_add((max_h - h) / 2);
                 layout.rects.push(RectPx {
                     x,
                     y,
@@ -692,7 +698,7 @@ pub fn calculate_collage_layout(
                 });
                 x = x.saturating_add(item_w).saturating_add(settings.spacing);
             }
-            layout.size = (w, max_h + settings.border * 2);
+            layout.size = (w, max_h.saturating_add(border2));
         }
         Direction::Custom => {
             // Grid: rows × columns.
@@ -711,16 +717,17 @@ pub fn calculate_collage_layout(
                 .max()
                 .unwrap_or(0);
 
+            let border2 = settings.border.saturating_mul(2);
             let w = max_cell_w
                 .saturating_mul(cols)
                 // spacing * (n-1) 手改配置时可能回绕成很小的值，进而让拼版
                 // 越界；这里按饱和乘法算，让尺寸顶到上限而不是绕回去。
                 .saturating_add(settings.spacing.saturating_mul(cols - 1))
-                .saturating_add(settings.border * 2);
+                .saturating_add(border2);
             let h = max_cell_h
                 .saturating_mul(rows)
                 .saturating_add(settings.spacing.saturating_mul(rows - 1))
-                .saturating_add(settings.border * 2);
+                .saturating_add(border2);
 
             let cols_usize = cols as usize;
             for (idx, item) in items.iter().enumerate() {
@@ -734,12 +741,16 @@ pub fn calculate_collage_layout(
                     item_w = ((item_w as f32 * scale).round() as u32).max(1);
                     item_h = ((item_h as f32 * scale).round() as u32).max(1);
                 }
-                let x = settings.border
-                    + col * (max_cell_w + settings.spacing)
-                    + (max_cell_w - item_w) / 2;
-                let y = settings.border
-                    + row * (max_cell_h + settings.spacing)
-                    + (max_cell_h - item_h) / 2;
+                // 手改配置里的 spacing 可能是 u32::MAX；饱和运算让格子顶到
+                // 上限而不是在 debug 下溢出 panic / release 下回绕越界。
+                let x = settings
+                    .border
+                    .saturating_add(col.saturating_mul(max_cell_w.saturating_add(settings.spacing)))
+                    .saturating_add((max_cell_w - item_w) / 2);
+                let y = settings
+                    .border
+                    .saturating_add(row.saturating_mul(max_cell_h.saturating_add(settings.spacing)))
+                    .saturating_add((max_cell_h - item_h) / 2);
                 layout.rects.push(RectPx {
                     x,
                     y,
@@ -888,6 +899,34 @@ mod tests {
                 height: 100
             }
         );
+    }
+
+    /// 手工改配置时 spacing 可能被写成 u32::MAX。乘法必须饱和到上限，
+    /// 不能回绕成一个很小的值让拼版越界（也不能在 debug 下溢出 panic）。
+    #[test]
+    fn extreme_spacing_saturates_instead_of_wrapping() {
+        let items = [item(1, 100, 100, "a"), item(2, 100, 100, "b")];
+        let settings = CollageSettings {
+            direction: Direction::Custom,
+            rows: 2,
+            columns: 2,
+            spacing: u32::MAX,
+            border: 5,
+            ..Default::default()
+        };
+        let layout = calculate_collage_layout(&items, &settings);
+        assert_eq!(layout.size, (u32::MAX, u32::MAX));
+        // 矩形坐标同样不能回绕成负数附近的小值。
+        assert!(layout.rects.iter().all(|r| r.x >= 5 && r.y >= 5));
+
+        let horizontal = CollageSettings {
+            direction: Direction::Horizontal,
+            spacing: u32::MAX,
+            border: 5,
+            ..Default::default()
+        };
+        let layout = calculate_collage_layout(&items, &horizontal);
+        assert_eq!(layout.size.0, u32::MAX);
     }
 
     #[test]

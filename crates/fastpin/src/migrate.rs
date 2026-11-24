@@ -4,14 +4,16 @@
 //! upgrading in place keeps their settings, history, autostart entry and
 //! translation key. Every step is best-effort and idempotent:
 //!
-//! * a destination that already exists is never touched, so repeated starts
-//!   cannot copy over newer data;
+//! * a destination that already holds real data is never touched, so repeated
+//!   starts cannot copy over newer data; an empty leftover folder does not
+//!   block the one-time migration;
 //! * the legacy folder is kept when `rename` fails and the copy succeeds, so a
 //!   half-migrated profile is never the only copy;
 //! * failures are logged and never abort startup.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Folder name the old build used under `%LOCALAPPDATA%` and `Pictures`.
 const LEGACY_DIR: &str = "Zshot";
@@ -52,8 +54,8 @@ pub fn migrate_legacy_paths() -> Vec<String> {
 
     for note in &notes {
         // Writing to app.log creates the data folder. Only do that once every
-        // folder step is done: an early empty FastPin folder would make the
-        // next start think the migration had already happened.
+        // folder step is done; an early FastPin folder would otherwise look
+        // like a real destination to `has_real_content` on the next start.
         if complete {
             crate::perf::log_app(&format!("migrate: {note}"));
         } else {
@@ -63,23 +65,27 @@ pub fn migrate_legacy_paths() -> Vec<String> {
     notes
 }
 
-/// Moves `old` to `new` when `new` does not exist yet.
+/// Moves `old` to `new` when `new` holds no real data yet.
 ///
 /// `rename` is atomic and free; when it fails (cross-volume profile, a file
 /// held open by a still-running old build) the tree is copied into a staging
 /// folder and only renamed into place once complete. The old folder is left
 /// behind in that case — the user can delete it, and a retry next start is a
-/// no-op because `new` now exists.
+/// no-op because `new` now holds real data.
+///
+/// A bare `new.exists()` check used to skip the whole migration when an
+/// installer (or a crash before the rename) left an empty folder behind.
 pub(crate) fn migrate_dir(old: &Path, new: &Path) -> Result<Vec<String>, String> {
-    if !old.is_dir() || new.exists() {
-        return Ok(Vec::new());
+    let mut notes = Vec::new();
+    cleanup_stale_staging(new, &mut notes, STALE_STAGING_AFTER);
+    if !old.is_dir() || has_real_content(new) {
+        return Ok(notes);
     }
     match fs::rename(old, new) {
-        Ok(()) => Ok(vec![format!(
-            "renamed {} -> {}",
-            old.display(),
-            new.display()
-        )]),
+        Ok(()) => {
+            notes.push(format!("renamed {} -> {}", old.display(), new.display()));
+            Ok(notes)
+        }
         Err(rename_err) => {
             let staging = staging_path(new);
             let copied = copy_tree(old, &staging).and_then(|n| {
@@ -87,11 +93,14 @@ pub(crate) fn migrate_dir(old: &Path, new: &Path) -> Result<Vec<String>, String>
                 Ok(n)
             });
             match copied {
-                Ok(n) => Ok(vec![format!(
-                    "copied {n} files {} -> {} ({rename_err}); legacy folder kept",
-                    old.display(),
-                    new.display()
-                )]),
+                Ok(n) => {
+                    notes.push(format!(
+                        "copied {n} files {} -> {} ({rename_err}); legacy folder kept",
+                        old.display(),
+                        new.display()
+                    ));
+                    Ok(notes)
+                }
                 Err(copy_err) => {
                     let _ = fs::remove_dir_all(&staging);
                     Err(format!(
@@ -100,6 +109,61 @@ pub(crate) fn migrate_dir(old: &Path, new: &Path) -> Result<Vec<String>, String>
                     ))
                 }
             }
+        }
+    }
+}
+
+/// 只有 settings.json、历史目录或其它任何条目才算真实内容；空目录（安装器
+/// 残留 / 上次崩溃）不能挡住一次迁移，否则用户的旧配置会被永久遗弃。
+fn has_real_content(dir: &Path) -> bool {
+    if dir.join("settings.json").exists() || dir.join("capture_history").is_dir() {
+        return true;
+    }
+    fs::read_dir(dir)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_some()
+}
+
+/// 迁移暂存目录至少老化一天才回收，避免误删另一个进程正在进行的复制。
+const STALE_STAGING_AFTER: Duration = Duration::from_secs(24 * 3600);
+
+/// 清理上次崩溃遗留的 `<new>.migrating-<pid>` 目录。当前进程自己的暂存目录
+/// 可能仍在使用，绝不删除；只处理名字匹配且已老化的兄弟目录。
+fn cleanup_stale_staging(new: &Path, notes: &mut Vec<String>, stale_after: Duration) {
+    let Some(parent) = new.parent() else { return };
+    let Some(name) = new.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let prefix = format!("{name}.migrating-");
+    let own = format!("{prefix}{}", std::process::id());
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if !file_name.starts_with(&prefix) || file_name == own {
+            continue;
+        }
+        let aged = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(|modified| {
+                modified
+                    .elapsed()
+                    .map(|age| age > stale_after)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !aged {
+            continue;
+        }
+        match fs::remove_dir_all(entry.path()) {
+            Ok(()) => notes.push(format!("清理遗留暂存目录 {}", entry.path().display())),
+            Err(e) => notes.push(format!(
+                "无法清理遗留暂存目录 {}（{e}）",
+                entry.path().display()
+            )),
         }
     }
 }
@@ -221,6 +285,51 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(!root.join("FastPin").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 空的目标目录（安装器或崩溃残留）不能让整次迁移被跳过。
+    #[test]
+    fn empty_destination_does_not_block_migration() {
+        let root = scratch("empty-dest");
+        let old = root.join("Zshot");
+        let new = root.join("FastPin");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("settings.json"), "{\"a\":1}").unwrap();
+        fs::create_dir_all(&new).unwrap();
+
+        let first = migrate_dir(&old, &new).unwrap();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(
+            fs::read_to_string(new.join("settings.json")).unwrap(),
+            "{\"a\":1}"
+        );
+        // 第二次启动目标里已有真实数据，必须是 no-op。
+        assert!(migrate_dir(&old, &new).unwrap().is_empty());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stale_staging_directory_is_reclaimed() {
+        let root = scratch("staging");
+        let new = root.join("FastPin");
+        fs::create_dir_all(&new).unwrap();
+        let stale = root.join(format!("FastPin.migrating-{}", std::process::id() + 1));
+        fs::create_dir_all(stale.join("nested")).unwrap();
+        fs::write(stale.join("nested").join("shot.png"), [1u8]).unwrap();
+
+        let mut notes = Vec::new();
+        cleanup_stale_staging(&new, &mut notes, Duration::ZERO);
+        assert!(!stale.exists(), "aged staging directory must be removed");
+        assert!(notes.iter().any(|n| n.contains("清理遗留暂存目录")));
+
+        // 当前进程自己的暂存目录可能正在使用，不能删。
+        let own = root.join(format!("FastPin.migrating-{}", std::process::id()));
+        fs::create_dir_all(&own).unwrap();
+        cleanup_stale_staging(&new, &mut notes, Duration::ZERO);
+        assert!(own.exists());
+
         fs::remove_dir_all(&root).unwrap();
     }
 

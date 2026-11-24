@@ -65,7 +65,9 @@ pub(crate) fn read_response(request: *mut c_void, cap: usize) -> Result<Vec<u8>>
     let mut payload = Vec::new();
     loop {
         let mut available = 0u32;
-        unsafe { WinHttpQueryDataAvailable(request, &mut available)? };
+        unsafe {
+            WinHttpQueryDataAvailable(request, &mut available).map_err(|e| winhttp_error(&e))?
+        };
         if available == 0 {
             break;
         }
@@ -85,7 +87,8 @@ pub(crate) fn read_response(request: *mut c_void, cap: usize) -> Result<Vec<u8>>
                 payload.as_mut_ptr().add(at) as *mut c_void,
                 available,
                 &mut read,
-            )?;
+            )
+            .map_err(|e| winhttp_error(&e))?;
         }
         payload.truncate(at + read as usize);
         if read == 0 {
@@ -112,6 +115,76 @@ pub fn redact_url(url: &str) -> String {
         return url.to_string();
     }
     format!("{scheme}***@{authority}")
+}
+
+/// WinHTTP 的失败经 `error.rs` 只剩一个裸 HRESULT（例如 0x80072EE2），用户
+/// 完全看不懂。把常见码翻成中文，其余保留原始码便于排查。
+pub fn winhttp_error(e: &windows::core::Error) -> Error {
+    // Win32 错误被包成 0x80070000 | code；低 16 位就是 WinHTTP 错误码。
+    const BASE: u32 = 12000;
+    const TIMEOUT: u32 = BASE + 2; // 12002
+    const NAME_NOT_RESOLVED: u32 = BASE + 7; // 12007
+    const CANNOT_CONNECT: u32 = BASE + 29; // 12029
+    const CONNECTION_ERROR: u32 = BASE + 30; // 12030
+    const CERT_DATE_INVALID: u32 = BASE + 37; // 12037
+    const CERT_CN_INVALID: u32 = BASE + 38; // 12038
+    const SECURE_FAILURE: u32 = BASE + 175; // 12175
+
+    let code = e.code().0 as u32;
+    let text = match code & 0x0000_FFFF {
+        TIMEOUT => "连接超时，请检查网络或在设置里增大超时",
+        NAME_NOT_RESOLVED => "无法解析服务器地址（DNS）",
+        CANNOT_CONNECT => "无法连接到服务器",
+        CONNECTION_ERROR => "连接中断或被重置",
+        CERT_DATE_INVALID => "HTTPS 证书已过期或尚未生效",
+        CERT_CN_INVALID => "HTTPS 证书域名不匹配",
+        SECURE_FAILURE => "HTTPS 证书校验失败",
+        _ => "网络请求失败",
+    };
+    Error::new(format!("{text}（0x{code:08X}）"))
+}
+
+/// API 返回的错误正文是服务端文本，偶尔会回显请求里的 Key 或带凭据的 URL。
+/// 附加到用户可见的错误消息前先去敏，并截断到一屏以内。
+pub fn redact_api_message(text: &str) -> String {
+    /// 替换一个分词里的敏感串，但保留它前后的空白。
+    fn replace(piece: &str, replacement: &str) -> String {
+        let lead = piece.len() - piece.trim_start().len();
+        let trail = piece.len() - piece.trim_end().len();
+        format!(
+            "{}{}{}",
+            &piece[..lead],
+            replacement,
+            &piece[piece.len() - trail..]
+        )
+    }
+
+    let mut out = String::new();
+    let mut hide_next = false;
+    for piece in text.split_inclusive(|c: char| c.is_whitespace()) {
+        let core = piece.trim();
+        if core.eq_ignore_ascii_case("Bearer") {
+            hide_next = true;
+            out.push_str(piece);
+            continue;
+        }
+        if hide_next || core.starts_with("sk-") {
+            out.push_str(&replace(piece, "***"));
+            hide_next = false;
+        } else if core.contains("://") && core.contains('@') {
+            out.push_str(&replace(piece, &redact_url(core)));
+        } else {
+            out.push_str(piece);
+        }
+    }
+    let out = out.trim().to_string();
+    if out.chars().count() > 300 {
+        let mut short: String = out.chars().take(300).collect();
+        short.push('…');
+        short
+    } else {
+        out
+    }
 }
 
 /// File name for a downloaded asset: the URL's last path segment, with
@@ -180,14 +253,17 @@ pub(crate) fn stream_body_to_file(
 
     loop {
         let mut available = 0u32;
-        unsafe { WinHttpQueryDataAvailable(request, &mut available)? };
+        unsafe {
+            WinHttpQueryDataAvailable(request, &mut available).map_err(|e| winhttp_error(&e))?
+        };
         if available == 0 {
             break;
         }
         let to_read = available.min(DOWNLOAD_CHUNK_BYTES);
         let mut read = 0u32;
         unsafe {
-            WinHttpReadData(request, buf.as_mut_ptr() as *mut c_void, to_read, &mut read)?;
+            WinHttpReadData(request, buf.as_mut_ptr() as *mut c_void, to_read, &mut read)
+                .map_err(|e| winhttp_error(&e))?;
         }
         if read == 0 {
             break;
@@ -310,7 +386,7 @@ fn begin_get(url: &str) -> Result<GetHandles> {
             return Err(Error::new("WinHttpOpen failed"));
         }
         let ms = (DOWNLOAD_TIMEOUT_SECONDS * 1000) as i32;
-        WinHttpSetTimeouts(session.0, ms, ms, ms, ms)?;
+        WinHttpSetTimeouts(session.0, ms, ms, ms, ms).map_err(|e| winhttp_error(&e))?;
 
         let connect = Handle(WinHttpConnect(
             session.0,
@@ -338,8 +414,8 @@ fn begin_get(url: &str) -> Result<GetHandles> {
             return Err(Error::new("WinHttpOpenRequest failed"));
         }
 
-        WinHttpSendRequest(request.0, None, None, 0, 0, 0)?;
-        WinHttpReceiveResponse(request.0, std::ptr::null_mut())?;
+        WinHttpSendRequest(request.0, None, None, 0, 0, 0).map_err(|e| winhttp_error(&e))?;
+        WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(|e| winhttp_error(&e))?;
 
         let status = query_u32_header(request.0, WINHTTP_QUERY_STATUS_CODE).unwrap_or(0);
         let total = query_u32_header(request.0, WINHTTP_QUERY_CONTENT_LENGTH).map(u64::from);
@@ -548,5 +624,40 @@ mod tests {
         assert!(resolve_download_redirect(base, "  ").is_err());
         // 无网络调用：无效 URL 在 WinHTTP 之前就被拒绝。
         assert!(download_url_to("file:///C:/x", Path::new("x"), |_| {}).is_err());
+    }
+
+    #[test]
+    fn winhttp_errors_become_readable_chinese() {
+        // 12002 / 12029 / 12175 是超时、连不上、证书失败的常见码。
+        let timeout = windows::core::Error::from_hresult(windows::core::HRESULT(
+            (0x8007_0000u32 | 12002) as i32,
+        ));
+        assert!(winhttp_error(&timeout).to_string().contains("超时"));
+        let connect = windows::core::Error::from_hresult(windows::core::HRESULT(
+            (0x8007_0000u32 | 12029) as i32,
+        ));
+        assert!(winhttp_error(&connect).to_string().contains("无法连接"));
+        let cert = windows::core::Error::from_hresult(windows::core::HRESULT(
+            (0x8007_0000u32 | 12175) as i32,
+        ));
+        assert!(winhttp_error(&cert).to_string().contains("证书"));
+        // 未知码仍保留原始 HRESULT，便于排查。
+        let other = windows::core::Error::from_hresult(windows::core::HRESULT(-2147467259));
+        assert!(winhttp_error(&other).to_string().contains("0x"));
+    }
+
+    #[test]
+    fn api_error_text_is_redacted_and_truncated() {
+        let msg = "bad key sk-abcdefghijklmnopqrstuvwxyz Bearer tok-1234567890 @ https://u:p@api.example/v1";
+        let redacted = redact_api_message(msg);
+        assert!(!redacted.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        assert!(!redacted.contains("tok-1234567890"));
+        assert!(!redacted.contains("u:p@"));
+        assert!(redacted.contains("***"));
+        // 超长正文被截断到一屏以内。
+        let long = "x".repeat(1000);
+        let short = redact_api_message(&long);
+        assert!(short.chars().count() <= 301);
+        assert!(short.ends_with('…'));
     }
 }

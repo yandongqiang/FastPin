@@ -484,6 +484,25 @@ mod tests {
         assert_eq!(hit_test_x(120.0, 40.0, range, canvas), TrimHit::None);
     }
 
+    /// 越界 / NaN 坐标必须落到 None：不能因为 NaN 的比较全为 false 就误判
+    /// 成手柄或 band，让拖拽逻辑拿到一个根本不存在的命中目标。
+    #[test]
+    fn horizontal_hit_test_rejects_out_of_range_and_nan() {
+        let canvas = 1000u32;
+        let range = TrimRange {
+            top: 200,
+            bottom: 600,
+        };
+        let dw = 200.0f32;
+        assert_eq!(hit_test_x(-100.0, dw, range, canvas), TrimHit::None);
+        assert_eq!(hit_test_x(dw + 100.0, dw, range, canvas), TrimHit::None);
+        assert_eq!(hit_test_x(f32::NAN, dw, range, canvas), TrimHit::None);
+        assert_eq!(hit_test_x(f32::INFINITY, dw, range, canvas), TrimHit::None);
+        // 退化尺寸同样不命中，避免 scale 变成 NaN/无穷后放大出假手柄。
+        assert_eq!(hit_test_x(40.0, 0.0, range, canvas), TrimHit::None);
+        assert_eq!(hit_test_x(40.0, dw, range, 0), TrimHit::None);
+    }
+
     #[test]
     fn thumbnail_rows_map_back_to_canvas_rows() {
         // 1000 canvas rows in 100 px: a drag to y=35 selects row 350.

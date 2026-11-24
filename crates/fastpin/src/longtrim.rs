@@ -73,7 +73,7 @@ impl TrimRange {
             },
             TrimEdge::Bottom => TrimRange {
                 top: self.top,
-                bottom: row.max(self.top + 1),
+                bottom: row.max(self.top.saturating_add(1)),
             },
         };
         candidate.clamped(canvas)
@@ -88,7 +88,7 @@ impl TrimRange {
     pub fn after_append(self, canvas: u32) -> Option<Self> {
         TrimRange {
             top: self.top,
-            bottom: canvas.max(self.top + 1),
+            bottom: canvas.max(self.top.saturating_add(1)),
         }
         .clamped(canvas)
     }
@@ -636,5 +636,24 @@ mod tests {
     fn delta_conversion_handles_a_zero_sized_thumbnail() {
         assert_eq!(rows_for_delta(10.0, 0.0, 1000), 0);
         assert_eq!(rows_for_delta(10.0, 100.0, 0), 0);
+    }
+
+    /// top == u32::MAX 时 `top + 1` 在 debug 下 panic、release 下回绕成 0。
+    /// 两处「至少留一行」的加法必须饱和。
+    #[test]
+    fn extreme_top_uses_saturating_add() {
+        let range = TrimRange {
+            top: u32::MAX,
+            bottom: u32::MAX,
+        };
+        let moved = range
+            .with_edge(TrimEdge::Bottom, u32::MAX, u32::MAX)
+            .unwrap();
+        assert_eq!(moved.top, u32::MAX - 1);
+        assert_eq!(moved.bottom, u32::MAX);
+
+        let grown = range.after_append(u32::MAX).unwrap();
+        assert_eq!(grown.top, u32::MAX - 1);
+        assert_eq!(grown.bottom, u32::MAX);
     }
 }

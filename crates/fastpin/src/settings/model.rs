@@ -158,7 +158,7 @@ pub const ROWS: &[RowMeta] = &[
     RowMeta {
         page: Page::Screenshot,
         title: "截屏模式",
-        desc: "选择截屏时使用的捕获方式。自动模式会根据系统环境选择最佳方式。",
+        desc: "仅影响长截图是否保持持续捕获会话；WGC/DXGI 项当前均走自动选择。",
     },
     RowMeta {
         page: Page::Screenshot,
@@ -198,7 +198,7 @@ pub const ROWS: &[RowMeta] = &[
     RowMeta {
         page: Page::Screenshot,
         title: "记录截屏历史",
-        desc: "选择自动记录到历史图片的截屏类型；成功复制、保存或创建图片贴图后才会记录。",
+        desc: "选择自动记录到历史图片的截屏类型；成功复制或保存后才会记录。",
     },
     RowMeta {
         page: Page::Screenshot,
@@ -243,12 +243,12 @@ pub const ROWS: &[RowMeta] = &[
     RowMeta {
         page: Page::Screenshot,
         title: "放大镜",
-        desc: "在鼠标附近显示像素放大预览和当前颜色信息。",
+        desc: "在鼠标附近显示像素放大预览。",
     },
     RowMeta {
         page: Page::Screenshot,
         title: "信息栏",
-        desc: "在选区附近显示尺寸、圆角和比例等信息。",
+        desc: "在选区附近显示坐标、尺寸与取色值。",
     },
     RowMeta {
         page: Page::Screenshot,
@@ -295,7 +295,7 @@ pub const ROWS: &[RowMeta] = &[
     RowMeta {
         page: Page::Output,
         title: "水印文字",
-        desc: "导出 PNG 时烧录的文字，留空则仅当勾选时间或设置了图片时显示。",
+        desc: "导出时烧录的文字，留空则仅当勾选时间或设置了图片时显示。",
     },
     RowMeta {
         page: Page::Output,
@@ -442,7 +442,7 @@ pub const ROWS: &[RowMeta] = &[
     // 贴图
     RowMeta {
         page: Page::Pin,
-        title: "贴图工具栏按钮",
+        title: "自定义工具栏",
         desc: "贴图编辑沿用「截屏 → 工具栏按钮」的显隐设置。",
     },
     RowMeta {
@@ -548,7 +548,7 @@ pub const ROWS: &[RowMeta] = &[
     RowMeta {
         page: Page::Data,
         title: "保留期限",
-        desc: "超过该天数的历史记录会在启动时和保存后自动清理；选择“永久”等同于开启“始终保留”。",
+        desc: "超过该天数的历史记录会在启动时、保存后以及更改后立即清理已有记录；选择“永久”等同于开启“始终保留”。",
     },
     RowMeta {
         page: Page::Data,

@@ -2780,7 +2780,7 @@ impl SettingsView {
             cx,
             SelectId::CaptureMode,
             "截屏模式",
-            "长截图使用的捕获方式；普通截图自动选择最佳方式。",
+            "仅影响长截图是否保持持续捕获会话；WGC/DXGI 项当前均走自动选择。",
             self.settings.screenshot.capture_mode,
             &CaptureMode::ALL,
             CaptureMode::id,
@@ -2796,16 +2796,19 @@ impl SettingsView {
         );
 
         // 2 捕获鼠标光标
-        let show_cursor =
-            widgets::row("捕获鼠标光标", "在截屏结果中显示鼠标光标。").child(widgets::control(
-                widgets::toggle("toggle-show-cursor", self.settings.screenshot.show_cursor)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.toggle_screenshot_bool(ScreenshotToggle::ShowCursor, cx)
-                        }),
-                    ),
-            ));
+        let show_cursor = widgets::row(
+            "捕获鼠标光标",
+            "在截屏结果中显示鼠标光标；DXGI 回退时无效（平台限制）。",
+        )
+        .child(widgets::control(
+            widgets::toggle("toggle-show-cursor", self.settings.screenshot.show_cursor)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_screenshot_bool(ScreenshotToggle::ShowCursor, cx)
+                    }),
+                ),
+        ));
 
         // 3 未选区时显示辅助线
         let show_guides = widgets::row(
@@ -2923,7 +2926,7 @@ impl SettingsView {
             .collect();
         let record_history = widgets::stack(
             "记录截屏历史",
-            "选择自动记录到历史图片的截屏类型；成功复制、保存或创建图片贴图后才会记录。",
+            "选择自动记录到历史图片的截屏类型；成功复制或保存后才会记录。",
         )
         .child(
             div()
@@ -2975,8 +2978,8 @@ impl SettingsView {
         );
 
         // 13 放大镜
-        let show_magnifier = widgets::row("放大镜", "在鼠标附近显示像素放大预览和当前颜色信息。")
-            .child(widgets::control(
+        let show_magnifier =
+            widgets::row("放大镜", "在鼠标附近显示像素放大预览。").child(widgets::control(
                 widgets::toggle(
                     "toggle-show-magnifier",
                     self.settings.screenshot.show_magnifier,
@@ -2990,8 +2993,8 @@ impl SettingsView {
             ));
 
         // 14 信息栏
-        let show_info_bar = widgets::row("信息栏", "在选区附近显示尺寸、圆角和比例等信息。").child(
-            widgets::control(
+        let show_info_bar =
+            widgets::row("信息栏", "在选区附近显示坐标、尺寸与取色值。").child(widgets::control(
                 widgets::toggle(
                     "toggle-show-info-bar",
                     self.settings.screenshot.show_info_bar,
@@ -3002,25 +3005,22 @@ impl SettingsView {
                         this.toggle_screenshot_bool(ScreenshotToggle::ShowInfoBar, cx)
                     }),
                 ),
-            ),
-        );
+            ));
 
         // 15 快捷键提示
         let show_shortcut_hints =
-            widgets::row("快捷键提示", "每次开始截屏时显示当前阶段可用的快捷键提示。").child(
-                widgets::control(
-                    widgets::toggle(
-                        "toggle-show-shortcut-hints",
-                        self.settings.screenshot.show_shortcut_hints,
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.toggle_screenshot_bool(ScreenshotToggle::ShowShortcutHints, cx)
-                        }),
-                    ),
+            widgets::row("快捷键提示", "显示常用操作提示。").child(widgets::control(
+                widgets::toggle(
+                    "toggle-show-shortcut-hints",
+                    self.settings.screenshot.show_shortcut_hints,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_screenshot_bool(ScreenshotToggle::ShowShortcutHints, cx)
+                    }),
                 ),
-            );
+            ));
 
         // 8 元素检测：复用 smart_selection 配置，只改标题与选项文案。
         let element_detection = self.enum_select_row(
@@ -3203,7 +3203,7 @@ impl SettingsView {
             cx,
             SelectId::HistoryRetention,
             "保留期限",
-            "超过该天数的历史记录会在启动时和保存后自动清理；选择“永久”等同于开启“始终保留”。",
+            "超过该天数的历史记录会在启动时、保存后以及更改后立即清理已有记录；选择“永久”等同于开启“始终保留”。",
             current,
             rows,
         )
@@ -4021,7 +4021,7 @@ impl SettingsView {
     fn page_pin(&self, cx: &mut Context<Self>) -> impl IntoElement {
         widgets::rows(vec![
             widgets::row(
-                "贴图工具栏按钮",
+                "自定义工具栏",
                 "贴图编辑沿用「截屏 → 工具栏按钮」的显隐设置。",
             )
             .child(widgets::control(
@@ -5021,10 +5021,12 @@ impl SettingsView {
 
 /// 设置页落盘前的合并：从最新配置出发，只覆盖本页拥有的字段。
 ///
-/// 设置窗口持有的是打开时的快照，拼图 / 切图窗口期间可能已经各自保存过
-/// collage / pdf / split。直接保存快照会把这些改动整体回滚。
-/// screenshot 内部这三块由对应窗口拥有，保留最新值；export 的格式 / 质量 /
-/// 文件名 / 自动保存 / 自动复制在本页有控件，用快照值。其余字段同样归本页。
+/// 设置窗口持有的是打开时的快照，切图窗口期间可能已经保存过 split。
+/// 直接保存快照会把这些改动整体回滚。screenshot 内部只有 split 由切图窗口
+/// 拥有，保留最新值；collage / pdf 在本页有完整控件（含下拉写回与重置），
+/// 归本页用快照值——否则这些控件只改内存、落盘时被 latest 覆盖回去，完全
+/// 无效，重置回默认也会被旧值盖掉。export 的格式 / 质量 / 文件名 / 自动
+/// 保存 / 自动复制同样在本页有控件，用快照值。其余字段同样归本页。
 fn settings_persist_merge(latest: &Settings, snapshot: &Settings) -> Settings {
     let mut merged = latest.clone();
     merged.ocr = snapshot.ocr.clone();
@@ -5034,8 +5036,7 @@ fn settings_persist_merge(latest: &Settings, snapshot: &Settings) -> Settings {
     merged.appearance = snapshot.appearance.clone();
 
     let mut screenshot = snapshot.screenshot.clone();
-    screenshot.collage = latest.screenshot.collage.clone();
-    screenshot.pdf = latest.screenshot.pdf.clone();
+    // 只有切图窗口拥有的 split 保留最新值，避免回滚切图期间的改动。
     screenshot.split = latest.screenshot.split.clone();
     merged.screenshot = screenshot;
     merged
@@ -5161,9 +5162,10 @@ mod tests {
         assert_eq!(&*snapshot.dir, "未找到");
     }
 
-    /// 设置页保存时不能把拼图 / 切图窗口期间保存的改动回滚。
+    /// 设置页保存时：拼图 / PDF 是设置页自己的控件，要用快照值；切图由切图
+    /// 窗口单独拥有，要保留最新值，不能被快照回滚。
     #[test]
-    fn persist_merge_keeps_other_windows_fields_and_uses_snapshot_for_owned_ones() {
+    fn persist_merge_uses_snapshot_for_collage_pdf_and_latest_for_split() {
         let mut latest = Settings::default();
         latest.screenshot.collage.spacing = 33;
         latest.screenshot.pdf.paper_size = crate::config::PaperSize::Letter;
@@ -5180,12 +5182,13 @@ mod tests {
         snapshot.hotkeys.region = "Ctrl+Shift+1".into();
 
         let merged = settings_persist_merge(&latest, &snapshot);
-        // collage / pdf / split 由其它窗口拥有：保留最新值。
-        assert_eq!(merged.screenshot.collage.spacing, 33);
+        // collage / pdf 在本页有控件：改过的值必须来自快照，能真正落盘。
+        assert_eq!(merged.screenshot.collage.spacing, 11);
         assert_eq!(
             merged.screenshot.pdf.paper_size,
-            crate::config::PaperSize::Letter
+            crate::config::PaperSize::A5
         );
+        // split 由切图窗口拥有：保留最新值，不被快照回滚。
         assert_eq!(merged.screenshot.split.count, 9);
         // 设置页拥有的顶层字段与 export 用快照值。
         assert_eq!(merged.translation.base_url, "https://snapshot/v1");

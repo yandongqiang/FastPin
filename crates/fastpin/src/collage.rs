@@ -457,6 +457,17 @@ pub fn calculate_pdf_composed_page(
     page
 }
 
+/// 宽或高为 0（或无穷/NaN）时宽高比会变成 NaN/inf，接着 `h * img_aspect`
+/// 会把 NaN 几何写进 `PdfCell`，整页布局都失效。退化成 1:1 方形排布，既
+/// 不产生 NaN，也不会丢掉这张图片。
+fn safe_aspect(w: f32, h: f32) -> f32 {
+    if w == 0.0 || h == 0.0 || !w.is_finite() || !h.is_finite() {
+        1.0
+    } else {
+        w / h
+    }
+}
+
 fn compute_page_based_layout(
     items: &[CollageItem],
     settings: &PdfSettings,
@@ -485,8 +496,8 @@ fn compute_page_based_layout(
 
         // Image fills the cell with aspect preservation.
         let (img_w, img_h) = item.transformed_size();
-        let img_aspect = img_w as f32 / img_h as f32;
-        let cell_aspect = cell_w / cell_h;
+        let img_aspect = safe_aspect(img_w as f32, img_h as f32);
+        let cell_aspect = safe_aspect(cell_w, cell_h);
 
         let (draw_w, draw_h, draw_x, draw_y) = if img_aspect > cell_aspect {
             // Image wider than cell: fit width.
@@ -561,8 +572,8 @@ fn compute_template_based_layout(
         let y = content.y + row as f32 * (cell_h + spacing);
 
         let (img_w, img_h) = item.transformed_size();
-        let img_aspect = img_w as f32 / img_h as f32;
-        let cell_aspect = cell_w / cell_h;
+        let img_aspect = safe_aspect(img_w as f32, img_h as f32);
+        let cell_aspect = safe_aspect(cell_w, cell_h);
 
         let (draw_w, draw_h, draw_x, draw_y) = if img_aspect > cell_aspect {
             let w = cell_w;
@@ -1039,5 +1050,36 @@ mod tests {
         let page = calculate_pdf_composed_page(&items, &settings, 0);
         assert!(page.is_valid());
         assert!(page.page_mm.0 > 0.0 && page.page_mm.1 > 0.0);
+    }
+
+    /// 0×0 的图片若直接做除法会得到 NaN 宽高比，`h * img_aspect` 把 NaN 写进
+    /// PdfCell。两种排版都必须产生有限坐标，不能把整页几何污染掉。
+    #[test]
+    fn zero_sized_items_do_not_produce_nan_geometry() {
+        let items = [item(1, 0, 0, "empty"), item(2, 100, 100, "ok")];
+        for method in [StitchingMethod::PageBased, StitchingMethod::TemplateBased] {
+            let settings = PdfSettings {
+                stitching_method: method,
+                template_type: TemplateType::TwoImages,
+                paper_size: PaperSize::A4,
+                ..Default::default()
+            };
+            let page = calculate_pdf_composed_page(&items, &settings, 0);
+            assert!(page.is_valid(), "layout must stay valid: {:?}", page.error);
+            assert_eq!(page.cells.len(), 2);
+            for cell in &page.cells {
+                let values = [
+                    cell.clip_mm.x,
+                    cell.clip_mm.y,
+                    cell.clip_mm.width,
+                    cell.clip_mm.height,
+                    cell.image_mm.x,
+                    cell.image_mm.y,
+                    cell.image_mm.width,
+                    cell.image_mm.height,
+                ];
+                assert!(values.iter().all(|v| v.is_finite()), "NaN 几何: {cell:?}");
+            }
+        }
     }
 }

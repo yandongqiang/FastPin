@@ -372,7 +372,8 @@ pub fn show_pin(
             let group = group_of(id).unwrap_or(id);
             // 系统级关闭（Alt+F4 / 任务栏）不走 Esc、双击那条 finish 路径。
             // 先按 group 撤销编辑：否则 EDITS 里的 backdrop 和工具栏窗口会
-            // 一直留着，Pin 侧的 INFLIGHT_FINISHES 也会让后续完成无限等待。
+            // 一直留着。写回账本由 abort_group 收尾，但有在途 finish 时它会
+            // 保留 INFLIGHT 等 worker 自己归零，避免丢掉还没写回的标注。
             pin_edit::abort_group(cx, group);
             forget(&[id]);
             cx.refresh_windows();
@@ -478,20 +479,12 @@ fn detach(id: u64) {
 }
 
 fn forget(ids: &[u64]) {
-    // 先记下这批窗口所属的 group，再把条目移除；否则就拿不到 group 了。
-    let groups: HashSet<u64> = PINS.with(|slot| {
-        slot.borrow()
-            .iter()
-            .filter(|e| ids.contains(&e.id))
-            .map(|e| e.group)
-            .collect()
-    });
+    // 只摘掉窗口条目。写回账本不在这里清：正常「完成」后 worker 会经
+    // end_finish 自己归零；若在途 flatten 还没写回就关窗（Alt+F4），清掉
+    // INFLIGHT/PENDING 会让下一笔完成不再等本次写回，第一笔标注被覆盖。
+    // 异常路径的收尾统一交给 pin_edit::abort_group → clear_group_writes，
+    // 后者在存在在途 finish 时会保留账本。
     PINS.with(|slot| slot.borrow_mut().retain(|e| !ids.contains(&e.id)));
-    // 正常路径是先 finish 再 forget，队列此时已空，这里是幂等的收尾；
-    // 系统关闭等异常路径则靠这里清掉残留的 PENDING/INFLIGHT 账本。
-    for group in groups {
-        clear_group_writes(group);
-    }
 }
 
 fn client_rect(hwnd: HWND) -> Option<IRect> {
@@ -629,10 +622,17 @@ fn end_flush(group: u64) {
     FLUSHING_WRITES.with(|slot| slot.borrow_mut().remove(&group));
 }
 
-/// 丢弃一个 group 的全部写回账本。窗口被关闭后队列里的写回永远等不到收件人，
-/// 残留的 FLUSHING/INFLIGHT 标记更会让 finish_edit_deferred 的等待循环永不归零。
-/// 由 pin_edit::abort_group 与 forget 共同调用，二者都是幂等的。
+/// 丢弃一个 group 的全部写回账本。幂等，由 pin_edit::abort_group（系统级关闭
+/// 等异常路径的收尾）调用。
+///
+/// 关键：只要该 group 还有在途 finish（点过「完成」，后台 flatten 尚未写回），
+/// 就必须整体跳过。worker 的 end_finish 会自己把 INFLIGHT 归零；提前清掉
+/// INFLIGHT/PENDING 会让下一笔完成不再等待本次写回，第一笔标注随即被覆盖。
+/// 即使关掉的是多贴图 group 中的一张，其余成员的写回也必须按原顺序落盘。
 pub(crate) fn clear_group_writes(group: u64) {
+    if has_inflight_finish(group) {
+        return;
+    }
     PENDING_WRITES.with(|slot| {
         slot.borrow_mut().remove(&group);
     });
@@ -2375,6 +2375,34 @@ mod tests {
         end_finish(42); // 多余解除不能把别的组状态带坏
         assert!(!has_inflight_finish(41));
         assert!(!has_inflight_finish(42));
+    }
+
+    /// 有在途 finish 时清账本必须整体跳过：worker 写完会自己 end_finish，
+    /// 提前清掉 INFLIGHT/PENDING 会让下一笔完成不等本次写回，标注互相覆盖。
+    #[test]
+    fn clear_group_writes_keeps_ledgers_while_finish_is_inflight() {
+        let write = |id: u64| (id, Vec::<u8>::new(), 2u32, 2u32, 1.0f32);
+        enqueue_pending_writes(44, vec![write(7)]);
+        begin_finish(44);
+
+        clear_group_writes(44);
+        assert!(has_inflight_finish(44), "在途完成不能被清掉");
+        assert_eq!(
+            take_pending_writes(44)
+                .iter()
+                .map(|w| w.0)
+                .collect::<Vec<_>>(),
+            vec![7],
+            "待写回队列不能被清掉"
+        );
+
+        end_finish(44);
+        assert!(!has_inflight_finish(44));
+        // 没有在途 finish 时才正常清空残留账本。
+        enqueue_pending_writes(44, vec![write(8)]);
+        clear_group_writes(44);
+        assert!(!has_inflight_finish(44));
+        assert!(take_pending_writes(44).is_empty());
     }
 
     /// 冲刷的重入保护必须按 group 隔离：A 组冲刷途中 B 组仍能冲刷，

@@ -90,6 +90,36 @@ fn next_id(now: u64) -> String {
     format!("{now:013x}-{n:06x}")
 }
 
+/// 记录 id 的宽松上限。`next_id` 实际只产出 20 个字符（13 位十六进制毫秒 +
+/// `-` + 6 位十六进制序号），留这么多余量是为了兼容将来扩展的 id 格式。
+const MAX_RECORD_ID_LEN: usize = 64;
+
+/// 历史记录允许出现的图片文件名。`add()` 只会写这些名字；索引里出现别的
+/// 名字一律视为被篡改，拒绝参与读图。
+const HISTORY_IMAGE_FILES: [&str; 4] = ["image.png", "image.jpg", "image.jpeg", "image.webp"];
+
+/// 校验来自 index.json 的记录 id。id 会被拼到 `records/` 下面，而
+/// `PathBuf::join` 会吞掉绝对路径与 `..`；一旦篡改的索引写进 `"..\\..\\x"`，
+/// 下游的 `remove_dir_all` 就能删掉历史目录之外的任意目录。只允许 ASCII
+/// 字母/数字/连字符，顺带拒绝空串、超长串、路径分隔符与 `..`。
+fn valid_record_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_RECORD_ID_LEN
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !id.contains("..")
+        && !Path::new(id).is_absolute()
+}
+
+/// 校验来自 index.json 的图片文件名：必须恰好是 `image.<已知扩展名>`。
+/// 文件名直接决定缩略图解码读哪个文件，绝不能让索引把它指向
+/// `C:\secret.png` 之类的绝对路径或带 `..` 的相对路径。
+fn valid_image_file(file: &str) -> bool {
+    HISTORY_IMAGE_FILES.contains(&file)
+        && !file.contains('/')
+        && !file.contains('\\')
+        && !Path::new(file).is_absolute()
+}
+
 /// Human-readable UTC timestamp for the UI. The civil-from-days algorithm
 /// avoids pulling a date crate in for a single label.
 pub fn format_utc(ms: u64) -> String {
@@ -163,6 +193,34 @@ impl Default for Index {
     }
 }
 
+impl Index {
+    /// 在读取边界剔除被篡改的索引项。id 用于目录删除，文件名用于读图，二者
+    /// 都必须先过白名单。id 非法的记录直接丢弃；id 合法但文件名非法的记录
+    /// 留在索引里（其目录仍可按安全 id 删除），只是不会出现在 `list()` 中。
+    fn sanitize(&mut self) {
+        self.records.retain(|r| {
+            if !valid_record_id(&r.id) {
+                eprintln!("history: 索引含非法记录 id，已跳过：{:?}", r.id);
+                return false;
+            }
+            if !valid_image_file(&r.file) {
+                eprintln!(
+                    "history: 记录 {:?} 的图片文件名非法，已禁止读图：{:?}",
+                    r.id, r.file
+                );
+            }
+            true
+        });
+        self.pending_deletions.retain(|p| {
+            if !valid_record_id(&p.id) {
+                eprintln!("history: 待删除项含非法 id，已跳过：{:?}", p.id);
+                return false;
+            }
+            true
+        });
+    }
+}
+
 /// Retention knobs, mirrored from config into the store so the store itself
 /// stays independent of the settings cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,8 +263,14 @@ impl HistoryStore {
         self.root.join(RECORDS_DIR)
     }
 
-    fn record_dir(&self, id: &str) -> PathBuf {
-        self.records_dir().join(id)
+    /// `records/<id>`。id 必须先通过白名单校验；非法 id 直接拒绝，绝不交给
+    /// `PathBuf::join`（它会把绝对路径或 `..` 当成合法路径组件）。
+    fn record_dir(&self, id: &str) -> Result<PathBuf> {
+        if !valid_record_id(id) {
+            eprintln!("history: 拒绝非法记录 id：{id:?}");
+            return Err(Error::new("非法历史记录 id"));
+        }
+        Ok(self.records_dir().join(id))
     }
 
     /// Reads the index. A missing file is an empty index; a future/unknown
@@ -218,13 +282,17 @@ impl HistoryStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Index::default()),
             Err(e) => return Err(e.into()),
         };
-        let index: Index = serde_json::from_str(&text).map_err(|e| Error::new(format!("{e}")))?;
+        let mut index: Index =
+            serde_json::from_str(&text).map_err(|e| Error::new(format!("{e}")))?;
         if index.format_version != INDEX_VERSION {
             return Err(Error::new(format!(
                 "unsupported history index version {} (expected {INDEX_VERSION})",
                 index.format_version
             )));
         }
+        // 索引文件位于用户可写目录，可能被别的程序或手工编辑改坏。所有下游
+        // 消费（删除、读图、清理、清理待删项）都在这一道过滤之后进行。
+        index.sanitize();
         Ok(index)
     }
 
@@ -241,7 +309,14 @@ impl HistoryStore {
     /// Newest first. The index is kept in insertion order; sorting here keeps
     /// `add` O(1) and makes the UI independent of on-disk order.
     pub fn list(&self) -> Result<Vec<HistoryRecord>> {
-        let mut records = self.read_index()?.records;
+        let mut records: Vec<HistoryRecord> = self
+            .read_index()?
+            .records
+            .into_iter()
+            // 双保险：`read_index` 已经在读取时过滤过，这里再挡一次，
+            // 保证 UI 绝不会拿到一个会令 `image_path` 读任意文件的记录。
+            .filter(|r| valid_record_id(&r.id) && valid_image_file(&r.file))
+            .collect();
         records.sort_by(|a, b| {
             b.created_ms
                 .cmp(&a.created_ms)
@@ -267,12 +342,17 @@ impl HistoryStore {
         std::fs::create_dir_all(self.records_dir())?;
         let now = now_ms();
         let id = next_id(now);
-        let dir = self.record_dir(&id);
+        let dir = self.record_dir(&id)?;
+        let file = format!("image.{}", extension);
+        // 扩展名来自配置/导出管线；只写白名单里的名字，避免索引里出现
+        // UI 之后会拒绝读取的文件名，也避免拼接出带路径分隔符的文件名。
+        if !valid_image_file(&file) {
+            return Err(Error::new(format!("不支持的历史图片扩展名：{extension:?}")));
+        }
         if let Err(e) = std::fs::create_dir_all(&dir) {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(e.into());
         }
-        let file = format!("image.{}", extension);
         let path = dir.join(&file);
         if let Err(e) = std::fs::write(&path, bytes) {
             let _ = std::fs::remove_dir_all(&dir);
@@ -300,9 +380,28 @@ impl HistoryStore {
         Ok(record)
     }
 
+    /// 校验过的结果：只有 id 与文件名都在白名单里才返回真实路径。这是会给
+    /// 出「拒绝」信号的公开接口；下面的 `image_path` 为兼容现有调用方保留了
+    /// 返回 `PathBuf` 的旧签名。
+    pub fn image_path_checked(&self, record: &HistoryRecord) -> Result<PathBuf> {
+        if !valid_record_id(&record.id) || !valid_image_file(&record.file) {
+            eprintln!(
+                "history: 拒绝非法记录路径：id={:?}, file={:?}",
+                record.id, record.file
+            );
+            return Err(Error::new("非法历史记录路径"));
+        }
+        Ok(self.record_dir(&record.id)?.join(&record.file))
+    }
+
     /// Absolute path to a record's image, for the UI to decode.
+    ///
+    /// 非法记录返回一个位于 `records/` 下、不存在的哨兵路径：调用方只会读图
+    /// 失败，绝不会按索引里写的绝对路径或 `..` 去读任意文件。需要区分
+    /// 「被拒绝」的调用方请用 [`Self::image_path_checked`]。
     pub fn image_path(&self, record: &HistoryRecord) -> PathBuf {
-        self.record_dir(&record.id).join(&record.file)
+        self.image_path_checked(record)
+            .unwrap_or_else(|_| self.records_dir().join("__invalid_record__"))
     }
 
     /// Two-phase removal: commit the record's disappearance to the index,
@@ -347,7 +446,11 @@ impl HistoryStore {
         HISTORY_REVISION.fetch_add(1, Ordering::Release);
 
         for id in &to_remove {
-            let dir = self.record_dir(id);
+            let dir = match self.record_dir(id) {
+                Ok(dir) => dir,
+                // 非法 id 已在 record_dir 记日志；绝不传给 remove_dir_all。
+                Err(_) => continue,
+            };
             if let Err(e) = std::fs::remove_dir_all(&dir) {
                 // 删除失败（目录被占用等）时 pending 条目会保留，下次启动重试。
                 eprintln!("history: 删除记录目录 {} 失败：{e}", dir.display());
@@ -359,7 +462,11 @@ impl HistoryStore {
         let mut index = self.read_index()?;
         index
             .pending_deletions
-            .retain(|p| self.record_dir(&p.id).exists());
+            .retain(|p| match self.record_dir(&p.id) {
+                Ok(dir) => dir.exists(),
+                // 非法 id 不再保留；它的目录也绝不会被触碰。
+                Err(_) => false,
+            });
         self.write_index(&index)?;
         Ok(())
     }
@@ -383,7 +490,11 @@ impl HistoryStore {
         let mut index = self.read_index()?;
         let before = index.pending_deletions.len();
         index.pending_deletions.retain(|p| {
-            let dir = self.record_dir(&p.id);
+            let dir = match self.record_dir(&p.id) {
+                Ok(dir) => dir,
+                // 非法 id 已记日志：安全跳过，不删任何目录也不检查存在性。
+                Err(_) => return false,
+            };
             if !dir.exists() {
                 // 目录已不存在：两步删除的第二步其实已完成。
                 return false;
@@ -422,7 +533,11 @@ impl HistoryStore {
 
         let now = now_ms();
         let cutoff = now.saturating_sub(retention.retention_days.saturating_mul(86_400_000));
-        let total: u64 = ordered.iter().map(|r| r.bytes).sum();
+        // 损坏/被篡改的索引可能把 bytes 写成接近 u64::MAX 的值；普通求和在
+        // debug 下溢出 panic、release 下回绕成很小的值，导致错误的清理决策。
+        let total: u64 = ordered
+            .iter()
+            .fold(0u64, |acc, r| acc.saturating_add(r.bytes));
         let mut count = ordered.len();
         let mut bytes = total;
         let mut victims = Vec::new();
@@ -759,5 +874,115 @@ mod tests {
     fn utc_format_is_stable() {
         // 2020-01-01 00:00:00 UTC = 1577836800000 ms.
         assert_eq!(format_utc(1_577_836_800_000), "2020-01-01 00:00 UTC");
+    }
+
+    #[test]
+    fn record_id_validation_rejects_traversal_and_absolute_paths() {
+        assert!(valid_record_id("0000000000001-000000")); // next_id 的真实格式
+        assert!(valid_record_id("2026-11-24"));
+        assert!(!valid_record_id(""));
+        assert!(!valid_record_id(".."));
+        assert!(!valid_record_id("../evil"));
+        assert!(!valid_record_id(r"..\..\evil"));
+        assert!(!valid_record_id(r"C:\Windows\Temp"));
+        assert!(!valid_record_id("/etc/passwd"));
+        assert!(!valid_record_id("a b"));
+        assert!(!valid_record_id("a.b"));
+        assert!(!valid_record_id(&"a".repeat(MAX_RECORD_ID_LEN + 1)));
+    }
+
+    #[test]
+    fn image_file_validation_accepts_only_known_names() {
+        for file in ["image.png", "image.jpg", "image.jpeg", "image.webp"] {
+            assert!(valid_image_file(file), "{file:?}");
+        }
+        for file in [
+            r"C:\secret.png",
+            "../image.png",
+            r"..\image.png",
+            "image.gif",
+            "evil.png",
+            "image.png.bak",
+            "",
+        ] {
+            assert!(!valid_image_file(file), "{file:?}");
+        }
+    }
+
+    /// 被篡改的索引：id 带 `..` 想借 cleanup_pending 删掉历史目录之外的目录，
+    /// file 是绝对路径想借缩略图读取任意文件。两者都必须被拒绝。
+    #[test]
+    fn a_tampered_index_cannot_delete_or_read_arbitrary_paths() {
+        let root = scratch();
+        let store = HistoryStore::new(root.clone());
+        // 受害者目录位于 root 之外：`records\..\..\evil` 若拼接成功就会命中它。
+        let victim_name = format!("evil-{}", std::process::id());
+        let victim = root.parent().unwrap().join(&victim_name);
+        let _ = std::fs::remove_dir_all(&victim);
+        std::fs::create_dir_all(&victim).unwrap();
+
+        let evil_id = format!(r"..\..\{victim_name}");
+        let mut index = store.read_index().unwrap();
+        index.pending_deletions.push(PendingDeletion {
+            id: evil_id.clone(),
+            bytes: 0,
+        });
+        index.records.push(HistoryRecord {
+            id: evil_id.clone(),
+            created_ms: now_ms(),
+            width: 1,
+            height: 1,
+            bytes: 0,
+            extension: "png".into(),
+            file: r"C:\secret.png".into(),
+            source: "region".into(),
+        });
+        store.write_index(&index).unwrap();
+
+        assert!(store.record_dir(&evil_id).is_err());
+        assert!(store.image_path_checked(&index.records[0]).is_err());
+        // 公开接口退化成不存在的哨兵路径，绝不指向索引写的绝对路径。
+        let safe = store.image_path(&index.records[0]);
+        assert_eq!(
+            safe.file_name().unwrap().to_string_lossy(),
+            "__invalid_record__"
+        );
+        assert!(!safe.to_string_lossy().contains("secret"));
+        assert!(!safe.to_string_lossy().contains(".."));
+        // 非法项既不出现在列表里，也不参与删除。
+        assert!(store.list().unwrap().is_empty());
+        store.cleanup_pending().unwrap();
+        assert!(victim.exists(), "非法 id 不得删除历史目录之外的目录");
+        let _ = std::fs::remove_dir_all(&victim);
+    }
+
+    /// bytes 被写成 u64::MAX 时普通 `.sum()` 在 debug 下溢出 panic、release 下
+    /// 回绕；饱和求和必须让 prune 正常完成。
+    #[test]
+    fn pruning_does_not_overflow_when_bytes_are_corrupt() {
+        let store = HistoryStore::new(scratch());
+        let mut index = store.read_index().unwrap();
+        for i in 0..2 {
+            index.records.push(HistoryRecord {
+                id: next_id(now_ms() + i),
+                created_ms: now_ms(),
+                width: 1,
+                height: 1,
+                bytes: u64::MAX,
+                extension: "png".into(),
+                file: "image.png".into(),
+                source: "region".into(),
+            });
+        }
+        store.write_index(&index).unwrap();
+        let removed = store
+            .prune(&Retention {
+                limit: 100,
+                retention_days: 0,
+                max_disk_bytes: u64::MAX,
+                keep_permanently: true,
+            })
+            .unwrap();
+        assert_eq!(removed, 0);
     }
 }

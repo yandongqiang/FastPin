@@ -105,9 +105,28 @@ pub fn hit_test(selection: Rect, point: Point, handle_size: f64) -> SelectionHit
     SelectionHitKind::None
 }
 
+/// `f64::clamp` 在 `min > max` 时 panic，边界为 NaN 时也会 panic。几何参数来自
+/// 鼠标坐标与手写配置，外部完全可能传入这种组合；此时退化成「不钳制」，
+/// 保证这些 pub 函数对任意 f64 输入都不会崩，常规调用行为完全不变。
+fn clamp_safe(value: f64, min: f64, max: f64) -> f64 {
+    if min > max || min.is_nan() || max.is_nan() {
+        value
+    } else {
+        value.clamp(min, max)
+    }
+}
+
 pub fn move_rect(selection: Rect, dx: f64, dy: f64, bounds: Rect) -> Rect {
-    let x = (selection.x + dx).clamp(bounds.x, bounds.x + bounds.width - selection.width);
-    let y = (selection.y + dy).clamp(bounds.y, bounds.y + bounds.height - selection.height);
+    let x = clamp_safe(
+        selection.x + dx,
+        bounds.x,
+        bounds.x + bounds.width - selection.width,
+    );
+    let y = clamp_safe(
+        selection.y + dy,
+        bounds.y,
+        bounds.y + bounds.height - selection.height,
+    );
     Rect { x, y, ..selection }
 }
 
@@ -126,25 +145,25 @@ pub fn resize_rect(
 
     match hit {
         SelectionHitKind::West | SelectionHitKind::NorthWest | SelectionHitKind::SouthWest => {
-            left = pointer.x.clamp(bounds.x, right - min);
+            left = clamp_safe(pointer.x, bounds.x, right - min);
         }
         _ => {}
     }
     match hit {
         SelectionHitKind::East | SelectionHitKind::NorthEast | SelectionHitKind::SouthEast => {
-            right = pointer.x.clamp(left + min, bounds.x + bounds.width);
+            right = clamp_safe(pointer.x, left + min, bounds.x + bounds.width);
         }
         _ => {}
     }
     match hit {
         SelectionHitKind::North | SelectionHitKind::NorthWest | SelectionHitKind::NorthEast => {
-            top = pointer.y.clamp(bounds.y, bottom - min);
+            top = clamp_safe(pointer.y, bounds.y, bottom - min);
         }
         _ => {}
     }
     match hit {
         SelectionHitKind::South | SelectionHitKind::SouthWest | SelectionHitKind::SouthEast => {
-            bottom = pointer.y.clamp(top + min, bounds.y + bounds.height);
+            bottom = clamp_safe(pointer.y, top + min, bounds.y + bounds.height);
         }
         _ => {}
     }
@@ -231,5 +250,55 @@ mod tests {
         let dip = Rect::new(0.0, 0.0, 10.0, 10.0);
         let (x, y, w, h) = physical_source_rect(dip, true, 10.0, 10.0, 10, 10);
         assert_eq!((x, y, w, h), (0, 0, 10, 10));
+    }
+
+    /// min > max 或任一边界为 NaN 时 `f64::clamp` 会 panic。这两个 pub 函数
+    /// 直接吃外部坐标，必须退化成不钳制而不是崩掉。
+    #[test]
+    fn move_rect_survives_inverted_and_nan_bounds() {
+        let r = Rect::new(10.0, 10.0, 20.0, 20.0);
+        let inverted = Rect::new(0.0, 0.0, -100.0, -100.0);
+        let moved = move_rect(r, 5.0, 6.0, inverted);
+        assert_eq!((moved.x, moved.y), (15.0, 16.0));
+
+        let nan_x = Rect::new(f64::NAN, 0.0, 100.0, 100.0);
+        let moved = move_rect(r, 1.0, 2.0, nan_x);
+        assert_eq!((moved.x, moved.y), (11.0, 12.0));
+
+        let nan_width = Rect::new(0.0, 0.0, f64::NAN, 100.0);
+        let moved = move_rect(r, 1.0, 2.0, nan_width);
+        assert_eq!((moved.x, moved.y), (11.0, 12.0));
+    }
+
+    #[test]
+    fn resize_rect_survives_inverted_and_nan_bounds() {
+        let r = Rect::new(10.0, 10.0, 40.0, 40.0);
+        let inverted = Rect::new(0.0, 0.0, -100.0, -100.0);
+        let out = resize_rect(
+            r,
+            SelectionHitKind::East,
+            Point { x: 12.0, y: 30.0 },
+            inverted,
+            8.0,
+        );
+        assert!(out.width.is_finite());
+
+        let nan_bounds = Rect::new(f64::NAN, 0.0, 200.0, 200.0);
+        let out = resize_rect(
+            r,
+            SelectionHitKind::East,
+            Point { x: 12.0, y: 30.0 },
+            nan_bounds,
+            8.0,
+        );
+        assert_eq!((out.x, out.width), (10.0, 2.0));
+        let out = resize_rect(
+            r,
+            SelectionHitKind::North,
+            Point { x: 30.0, y: 12.0 },
+            nan_bounds,
+            8.0,
+        );
+        assert!(out.height.is_finite());
     }
 }

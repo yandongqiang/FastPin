@@ -687,9 +687,23 @@ pub enum ExportMode {
     PerPage,
 }
 
+/// 文件名主干的长度上限。模板会被手工改得很长，截到 200 个字符可以给目录、
+/// 扩展名和 MAX_PATH 留出充足余量，正常模板完全不受影响。
+const MAX_FILENAME_STEM_CHARS: usize = 200;
+
+/// Windows 保留设备名。即使后面带扩展名（如 `con.txt`）也不能作为文件名，
+/// `CreateFile` 会直接失败；大小写不敏感，这里统一按大写比较。
+const WINDOWS_RESERVED_STEMS: [&str; 24] = [
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+    "LPT9",
+];
+
 /// Replaces the characters Windows refuses in a file name, and strips trailing
 /// dots/spaces that `CreateFile` would otherwise reject. Returns
-/// [`DEFAULT_FILENAME_TEMPLATE`] if nothing usable survives.
+/// [`DEFAULT_FILENAME_TEMPLATE`] if nothing usable survives. Also caps the
+/// length and escapes reserved device names so a hand-edited template cannot
+/// produce an unsaveable path.
 fn sanitize_stem(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
@@ -701,10 +715,30 @@ fn sanitize_stem(raw: &str) -> String {
         .collect();
     let trimmed = cleaned.trim().trim_end_matches(['.', ' ']);
     if trimmed.is_empty() {
-        DEFAULT_FILENAME_TEMPLATE.to_string()
-    } else {
-        trimmed.to_string()
+        return DEFAULT_FILENAME_TEMPLATE.to_string();
     }
+    // 按字符截断（不是字节），避免把一个多字节汉字切成两半；截断后可能
+    // 又留下尾部点/空格，再修一次。
+    let mut stem: String = trimmed.chars().take(MAX_FILENAME_STEM_CHARS).collect();
+    let end = stem.trim_end_matches(['.', ' ']).len();
+    stem.truncate(end);
+    if stem.is_empty() {
+        return DEFAULT_FILENAME_TEMPLATE.to_string();
+    }
+    // `CON` / `NUL` / `COM1` 等即使带扩展名也不能使用；在保留名后插入下划线，
+    // 例如 `con.txt` -> `con_.txt`，正常文件名一个字符都不变。
+    let dot = stem.find('.').unwrap_or(stem.len());
+    let (upper, insert_at) = {
+        let base = stem[..dot].trim_end_matches([' ', '.']);
+        (base.to_ascii_uppercase(), base.len())
+    };
+    if WINDOWS_RESERVED_STEMS.contains(&upper.as_str()) {
+        // Drop trailing spaces/dots between the reserved name and its extension
+        // (`"CON .txt"` -> `"CON_.txt"`), then insert the escaping underscore.
+        stem.replace_range(insert_at..dot, "");
+        stem.insert(insert_at, '_');
+    }
+    stem
 }
 
 /// Screenshot history retention. Mirrors snow-shot's `CaptureHistoryPolicy`
@@ -2060,5 +2094,38 @@ mod tests {
         assert_eq!(back.position, "topLeft");
         assert_eq!(back.scale, 2.0);
         assert_eq!(back.image_path, Some(PathBuf::from("D:/a/b.png")));
+    }
+
+    /// 手写模板可能长达上万字符（超过 MAX_PATH），也可能正好是 Windows
+    /// 保留设备名。截断 + 转义后保存才不会失败，正常文件名保持不变。
+    #[test]
+    fn sanitize_stem_caps_length_and_escapes_reserved_names() {
+        let long = "a".repeat(10_000);
+        let out = sanitize_stem(&long);
+        assert_eq!(out.chars().count(), MAX_FILENAME_STEM_CHARS);
+
+        for name in ["CON", "nul", "COM1", "Lpt9", "aux", "prn", "CONIN$"] {
+            let out = sanitize_stem(name);
+            assert_ne!(out, name, "{name:?} 必须转义");
+            assert!(out.starts_with(name), "{name:?} 不应被改写正文");
+            assert!(out.ends_with('_'), "{name:?} 应加下划线后缀");
+        }
+        assert_eq!(sanitize_stem("con.txt"), "con_.txt");
+        assert_eq!(sanitize_stem("CON .txt"), "CON_.txt");
+
+        let export = Export {
+            filename_template: long,
+            ..Default::default()
+        };
+        assert_eq!(
+            export.expand_name("20260101", "120000").chars().count(),
+            MAX_FILENAME_STEM_CHARS
+        );
+        // 默认模板（以及任何普通名字）一个字符都不变。
+        let normal = Export::default();
+        assert_eq!(
+            normal.expand_name("20260101", "120000"),
+            "FastPin_20260101_120000"
+        );
     }
 }

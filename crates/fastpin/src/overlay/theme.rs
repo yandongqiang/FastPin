@@ -9,17 +9,16 @@
 //! Everything is a snapshot rather than a `cx` lookup because most of these
 //! helpers are called from pure element builders that never see the app.
 //!
-//! `themes/*.json` 由 build.rs 生成 `include_str!` 列表编译进二进制，`init_themes`
-//! 把它们注册进 gpui-kit 的 `ThemeRegistry`；下拉和切换都以 registry 为唯一来源，
-//! 不再扫描运行时目录，也不再自己维护族映射表。
+//! themes 目录的主题由 gpui-kit 的 `ThemeRegistry` 加载与监听：启动时同步读入
+//! 目录里的所有 `*.json`（默认浅色 / 深色之外还有 20+ 变体），再交给 registry
+//! 的 `watch_dir` 做热重载。查找主题时用各 JSON `themes` 数组条目的 `name`
+//! （如 `Ayu Light`）——registry 正是以这个名字作为键。
 
+use std::path::PathBuf;
 use std::sync::RwLock;
 
-use gpui::{hsla, rgb, Hsla, Pixels, SharedString};
+use gpui::{hsla, rgb, App, Hsla, Pixels, SharedString};
 use gpui_kit::component::{Theme, ThemeColor, ThemeMode, ThemeRegistry};
-
-// build.rs 扫描仓库根的 themes 目录生成；主题文本随二进制发布，换目录运行也能加载。
-include!(concat!(env!("OUT_DIR"), "/themes_included.rs"));
 
 /// Colours the chrome needs, already resolved from the theme's colour tokens.
 ///
@@ -186,22 +185,26 @@ pub fn available_themes() -> Vec<(String, String)> {
     theme_options_from_keys(&guard)
 }
 
-/// 把编译进二进制的 `themes/*.json` 全部注册进 gpui-kit，并把 registry 里的
-/// 主题名记到快照里供下拉使用。单个文件注册失败时静默跳过；没有 registry
-/// 时只清空快照，绝不 panic。
-pub fn init_themes(cx: &mut gpui::App) {
-    // 正常由 init() 在 gpui_kit::init 之后调用；单独调用时不 panic，静默跳过。
-    if !cx.has_global::<ThemeRegistry>() {
-        *theme_keys().write().unwrap_or_else(|e| e.into_inner()) = Vec::new();
-        return;
-    }
+/// 仓库内的 themes 目录（编译期路径），供开发运行与发布包缺失时回退。
+const REPO_THEMES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../themes");
 
-    for &(_, text) in INCLUDED_THEMES {
-        let _ = ThemeRegistry::global_mut(cx).load_themes_from_str(text);
+/// 解析 themes 目录：先找 exe 旁的 `themes/`（发布布局），找不到再用仓库内的
+/// 副本（开发运行）。和 ocr 的模型目录同一套策略，换目录运行也能加载主题。
+fn themes_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(base) = exe.parent() {
+            let shipped = base.join("themes");
+            if shipped.is_dir() {
+                return shipped;
+            }
+        }
     }
+    PathBuf::from(REPO_THEMES)
+}
 
-    // 下拉完全来自 registry：默认两项在前，其余按名字排序；不排除默认，
-    // 让用户也能从其它主题切回 gpui-kit 自带外观。
+/// 把主题名快照从 registry 刷新一次，供下拉使用。纯过程，无 `cx` 参数即可在
+/// 热重载回调外复用；有 registry 时收集全部注册名（默认两项 + themes 变体）。
+fn refresh_theme_keys(cx: &App) {
     let keys = sorted_theme_names(
         ThemeRegistry::global(cx)
             .themes()
@@ -212,9 +215,44 @@ pub fn init_themes(cx: &mut gpui::App) {
     *theme_keys().write().unwrap_or_else(|e| e.into_inner()) = keys;
 }
 
-/// Initializes gpui-kit (GPUI base, components and their globals), registers
-/// the embedded themes, and applies the appearance persisted in `settings.json`.
-/// Call once per `App`, before any window opens.
+/// 通过 gpui-kit 的 `ThemeRegistry` 加载并监听 themes 目录：启动时先同步读入
+/// 所有 `*.json`（保证首次打开设置页下拉就完整），再交给 registry 的 `watch_dir`
+/// 做热重载，文件变动时刷新主题名快照并重绘窗口。找不到 registry 时清空快照，
+/// 绝不 panic。
+pub fn init_themes(cx: &mut gpui::App) {
+    // 正常由 init() 在 gpui_kit::init 之后调用；单独调用时不 panic，静默跳过。
+    if !cx.has_global::<ThemeRegistry>() {
+        *theme_keys().write().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        return;
+    }
+
+    let dir = themes_dir();
+    // 同步读入，避免 watch_dir 的后台加载让首次下拉为空。单个文件解析失败时
+    // 跳过，不阻断其余主题。
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let _ = ThemeRegistry::global_mut(cx).load_themes_from_str(&text);
+            }
+        }
+    }
+
+    refresh_theme_keys(cx);
+
+    // 后续文件变更由 registry 自己在后台监听 + 重载；回调里更新下拉快照并重绘。
+    let _ = ThemeRegistry::watch_dir(dir, cx, |cx| {
+        refresh_theme_keys(cx);
+        cx.refresh_windows();
+    });
+}
+
+/// Initializes gpui-kit (GPUI base, components and their globals), loads and
+/// watches the theme directory, and applies the appearance persisted in
+/// `settings.json`. Call once per `App`, before any window opens.
 pub fn init(cx: &mut gpui::App) {
     gpui_kit::init(cx);
     init_themes(cx);
@@ -224,10 +262,11 @@ pub fn init(cx: &mut gpui::App) {
 /// Switches appearance at runtime through the component theme, refreshes the
 /// snapshot, and asks every window (settings included) to repaint.
 ///
-/// `name` 是 registry 里的主题注册名（下拉直接写这个名字），gpui-kit 默认
-/// 浅色 / 深色两项也始终可选。明暗与颜色一概取自 registry 里的 `ThemeConfig`，
-/// 不再叠加任何族映射或人造 tint。找不到的名字回退到 gpui-kit 默认浅色变体，
-/// 并把修正后的名字写回配置（记日志），让配置与实际外观始终一致；绝不 panic。
+/// `name` 是 registry 里的主题注册名，即 themes 目录里各 `themes` 条目的 `name`
+/// （如 `Ayu Light`）或 gpui-kit 默认浅色 / 深色。明暗与颜色一概取自 registry
+/// 里的 `ThemeConfig`，不再叠加任何族映射或人造 tint。找不到的名字回退到
+/// gpui-kit 默认浅色，并把修正后的名字写回配置（记日志），让配置与实际外观
+/// 始终一致；绝不 panic。
 pub fn set_appearance(cx: &mut gpui::App, name: &str) {
     let key = name.trim();
     let (cfg, fallback_name) = {

@@ -3,8 +3,8 @@
 ;   ISCC.exe installer\fastpin.iss
 ; Payload mirrors the portable layout: FastPin.exe + DirectML.dll + models\v6
 ; plus LICENSE / NOTICE / COPYRIGHT.snow-shot for GPL attribution. The models
-; are exactly what ocr::models_dir expects next to the exe. Themes are
-; compiled into the binary by build.rs, so no themes\ directory is shipped.
+; are exactly what ocr::models_dir expects next to the exe. The themes\ directory
+; is loaded at runtime by gpui-kit's ThemeRegistry, so it ships next to the exe.
 
 // release.yml injects /DAppVersion=<tag>; the fallback matches Cargo.toml.
 #ifndef AppVersion
@@ -50,6 +50,7 @@ Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\COPYRIGHT.snow-shot"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\models\v6\*"; DestDir: "{app}\models\v6"; Flags: ignoreversion recursesubdirs createallSubdirs
+Source: "..\themes\*"; DestDir: "{app}\themes"; Flags: ignoreversion recursesubdirs createallSubdirs
 
 [Icons]
 Name: "{group}\FastPin"; Filename: "{app}\FastPin.exe"

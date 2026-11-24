@@ -28,6 +28,9 @@ jobs:
           Copy-Item COPYRIGHT.snow-shot $dir
           New-Item -ItemType Directory -Force "$dir/models/v6" | Out-Null
           Copy-Item models/v6/* "$dir/models/v6"
+          # Appearance themes are loaded at runtime by ThemeRegistry from themes\
+          # next to the exe, so ship the directory too.
+          Copy-Item themes $dir -Recurse
           Compress-Archive -Path $dir -DestinationPath "dist/FastPin-${{ github.ref_name }}-x64.zip"
       # Build the installer on the runner so every released artifact is
       # reproducible from the tagged commit (a SignPath requirement).

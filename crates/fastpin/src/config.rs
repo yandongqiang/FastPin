@@ -21,10 +21,10 @@ pub struct Settings {
     pub screenshot: Screenshot,
     pub history: History,
     pub hotkeys: Hotkeys,
-    /// UI 外观：编译进二进制并注册到 gpui-kit 的主题变体名（如
-    /// `"Catppuccin Latte"`、`"Tokyo Moon"`），默认 `"Default Light"`。
-    /// 纯字符串保持配置文件可手改；未知值在启动时回退到默认浅色主题，
-    /// 不会让整个配置文件失效。
+    /// UI 外观：gpui-kit 主题注册名（themes 目录里各 `themes` 条目的 `name`，
+    /// 如 `"Ayu Light"`，以及默认 `"Default Light"` / `"Default Dark"`），默认
+    /// `"Default Light"`。纯字符串保持配置文件可手改；未知值在启动时回退到
+    /// 默认浅色主题，不会让整个配置文件失效。
     pub appearance: String,
 }
 
@@ -39,7 +39,7 @@ pub fn appearance_dark(name: &str) -> bool {
     name.trim().to_ascii_lowercase().contains("dark")
 }
 
-/// 兼容用途：真实变体的标签就是注册名本身，下拉由 `theme::available_themes`
+/// 兼容用途：主题标签就是 registry 里的注册名，下拉由 `theme::available_themes`
 /// 提供；这里原样返回手改的配置值，方便在设置页发现拼写错误。
 pub fn appearance_label(name: &str) -> String {
     name.trim().to_string()

@@ -4,7 +4,7 @@
 //! The API key is deliberately absent: it stays in the Windows credential
 //! vault, shared with the C# build. See `translate::api_key`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
@@ -1294,7 +1294,16 @@ pub fn get() -> Settings {
             return settings.clone();
         }
     }
-    let loaded = parse(&read_file());
+    let text = read_file();
+    // 语法错误 / 非对象根节点会让 parse 直接回默认值；若放任不管，下一次
+    // 保存会把默认值整份写回，原配置永久丢失。先把损坏文件改名留档，
+    // 之后的 save 写的是新文件，用户仍可从 .broken-* 备份恢复。
+    if is_broken_config(&text) {
+        if let Ok(p) = path() {
+            quarantine_broken(&p, &text);
+        }
+    }
+    let loaded = parse(&text);
     let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
     guard.get_or_insert(loaded).clone()
 }
@@ -1332,13 +1341,71 @@ fn read_file() -> String {
         .unwrap_or_default()
 }
 
+/// 文本非空但 JSON 语法错误（尾逗号、半截文件）或根节点不是对象时，`parse`
+/// 只能回默认值。这类文件必须在加载路径上隔离，否则下一次保存会覆盖它。
+fn is_broken_config(text: &str) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+    !matches!(serde_json::from_str::<serde_json::Value>(text), Ok(value) if value.is_object())
+}
+
+/// 把损坏配置改名成同目录下的 `settings.json.broken-<pid>-<unix秒>`，
+/// 撞名再加序号，避免多进程 / 多次启动互相覆盖。`rename` 而非复制，
+/// 让后续 `save` 写一份全新的 settings.json。成功记一条 app 日志，
+/// 失败静默返回 false（调用方照常用默认配置继续运行）。
+fn quarantine_broken(path: &Path, text: &str) -> bool {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    let mut name = file_name.to_os_string();
+    name.push(format!(".broken-{}-{}", std::process::id(), secs));
+    let base = path.with_file_name(name);
+
+    // 读取与隔离之间文件可能被另一进程修好：内容变了就不要动它，
+    // 更不能把一份有效配置搬走。
+    if std::fs::read_to_string(path).ok().as_deref() != Some(text) {
+        return false;
+    }
+    for seq in 0..1024u32 {
+        let candidate = if seq == 0 {
+            base.clone()
+        } else {
+            let mut suffixed = base.clone().into_os_string();
+            suffixed.push(format!("-{seq}"));
+            PathBuf::from(suffixed)
+        };
+        // Windows 的 rename 会替换已存在的目标，所以先查重、撞名换序号，
+        // 保证先前的备份不会被这一次覆盖。
+        if candidate.exists() {
+            continue;
+        }
+        match std::fs::rename(path, &candidate) {
+            Ok(()) => {
+                crate::perf::log_app(&format!(
+                    "settings.json 语法错误或根节点不是对象，已隔离到 {}",
+                    candidate.display()
+                ));
+                return true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 /// A missing or malformed file falls back to defaults — a screenshot tool must
 /// still capture when its settings are broken.
 fn parse(text: &str) -> Settings {
     if text.trim().is_empty() {
         return Settings::default();
     }
-    match serde_json::from_str::<Settings>(text) {
+    let mut settings = match serde_json::from_str::<Settings>(text) {
         Ok(settings) => settings,
         Err(e) => {
             // 一个坏值（`"captureMode":"banana"`、`"paperSize":"A3XL"`、
@@ -1352,7 +1419,10 @@ fn parse(text: &str) -> Settings {
             };
             recover_settings(&input)
         }
-    }
+    };
+    // 直接反序列化也会把超大数组完整收进缓存，这里与恢复路径一样截断。
+    cap_settings_vecs(&mut settings);
+    settings
 }
 
 /// 读取单个字段：反序列化失败时保留默认值并记日志。各结构体都带
@@ -1381,6 +1451,37 @@ macro_rules! recover_fields {
             }
         )*
     };
+}
+
+/// 只有这两个字符串数组没有 schema 上限：手改的超大数组会拖慢启动。
+const MAX_STRING_VEC_LEN: usize = 256;
+
+fn cap_string_vec(items: &mut Vec<String>, label: &str) {
+    if items.len() > MAX_STRING_VEC_LEN {
+        eprintln!(
+            "settings.json: 字段 {label} 有 {} 项，超过 {MAX_STRING_VEC_LEN} 项，已截断",
+            items.len()
+        );
+        items.truncate(MAX_STRING_VEC_LEN);
+    }
+}
+
+fn cap_settings_vecs(settings: &mut Settings) {
+    cap_string_vec(
+        &mut settings.screenshot.hidden_toolbar_items,
+        "screenshot.hiddenToolbarItems",
+    );
+    cap_string_vec(
+        &mut settings.screenshot.record_history_sources,
+        "screenshot.recordHistorySources",
+    );
+}
+
+/// `recover_field` 之外的专用恢复：先按类型恢复，再限制数组长度。
+fn recover_string_vec(input: &serde_json::Value, key: &str, label: &str) -> Option<Vec<String>> {
+    let mut items = recover_field(input, key, label)?;
+    cap_string_vec(&mut items, label);
+    Some(items)
 }
 
 /// 顶层字段逐个恢复。`screenshot` 内部含多个枚举，交给 `recover_screenshot`
@@ -1473,7 +1574,6 @@ fn recover_screenshot(input: Option<&serde_json::Value>) -> Screenshot {
         return out;
     }
     recover_fields!(input, out, "screenshot",
-        "hiddenToolbarItems" => hidden_toolbar_items,
         "saveDir" => save_dir,
         "smartSelection" => smart_selection,
         "captureMode" => capture_mode,
@@ -1483,7 +1583,6 @@ fn recover_screenshot(input: Option<&serde_json::Value>) -> Screenshot {
         "leftDoubleClick" => left_double_click,
         "middleClick" => middle_click,
         "clickOutside" => click_outside,
-        "recordHistorySources" => record_history_sources,
         "toolbarPosition" => toolbar_position,
         "panelPosition" => panel_position,
         "toolbarRememberPos" => toolbar_remember_pos,
@@ -1492,6 +1591,19 @@ fn recover_screenshot(input: Option<&serde_json::Value>) -> Screenshot {
         "showInfoBar" => show_info_bar,
         "showShortcutHints" => show_shortcut_hints,
     );
+    // 两个数组字段需要额外的长度上限，避免损坏文件里的大数组拖慢启动。
+    if let Some(value) =
+        recover_string_vec(input, "hiddenToolbarItems", "screenshot.hiddenToolbarItems")
+    {
+        out.hidden_toolbar_items = value;
+    }
+    if let Some(value) = recover_string_vec(
+        input,
+        "recordHistorySources",
+        "screenshot.recordHistorySources",
+    ) {
+        out.record_history_sources = value;
+    }
     // 这些二级字段本身也是结构体，坏值再往下一层恢复，保住同结构里的好字段。
     out.annotation = recover_annotation(input.get("annotation"));
     out.watermark = recover_watermark(input.get("watermark"));
@@ -1499,10 +1611,8 @@ fn recover_screenshot(input: Option<&serde_json::Value>) -> Screenshot {
     out.export = recover_export(input.get("export"));
     out.collage = recover_collage(input.get("collage"));
     out.pdf = recover_pdf(input.get("pdf"));
-    // split 定义在 imagesplit 模块，整体尝试即可：坏值只回退切图设置。
-    if let Some(value) = recover_field(input, "split", "screenshot.split") {
-        out.split = value;
-    }
+    // split 也逐字段恢复：坏 count 不再连方向 / 单位 / 网格一起丢掉。
+    out.split = recover_split(input.get("split"));
     out
 }
 
@@ -1611,6 +1721,29 @@ fn recover_pdf(input: Option<&serde_json::Value>) -> PdfSettings {
         "marginRightMm" => margin_right_mm,
         "exportMode" => export_mode,
         "imageQuality" => image_quality,
+    );
+    out
+}
+
+/// `split` 定义在 imagesplit 模块，同样逐字段恢复，保持与 annotation /
+/// collage 等结构体一致的退化方式：坏子字段回默认，好字段全部保留。
+fn recover_split(input: Option<&serde_json::Value>) -> crate::imagesplit::SplitSettings {
+    let mut out = crate::imagesplit::SplitSettings::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 screenshot.split 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "screenshot.split",
+        "direction" => direction,
+        "splitType" => split_type,
+        "unit" => unit,
+        "count" => count,
+        "rows" => rows,
+        "columns" => columns,
+        "pixels" => pixels,
+        "percentage" => percentage,
+        "overlapWidth" => overlap_width,
     );
     out
 }
@@ -2127,5 +2260,136 @@ mod tests {
             normal.expand_name("20260101", "120000"),
             "FastPin_20260101_120000"
         );
+    }
+
+    /// 语法错误不能只回默认值：下一次保存会把默认值整份写回原文件。
+    /// 加载路径必须先把损坏文件改名留档，且不覆盖已有备份。
+    #[test]
+    fn broken_config_is_quarantined_before_defaults_are_saved() {
+        let unique = format!(
+            "settings-quarantine-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("{unique}.json"));
+        let prefix = format!("{unique}.json.broken-");
+
+        fn backups(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+            let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+                .expect("reads temp dir")
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(prefix))
+                })
+                .collect();
+            found.sort();
+            found
+        }
+
+        // 尾逗号是语法错误，parse 会直接回默认值，必须先隔离原文件。
+        let first = "{\"appearance\": \"Default Light\",}";
+        std::fs::write(&path, first).expect("writes broken file");
+        assert!(quarantine_broken(&path, first));
+        assert!(!path.exists(), "损坏文件应已被移走");
+        let first_backups = backups(&dir, &prefix);
+        assert_eq!(first_backups.len(), 1, "应留下一份备份");
+        let saved = std::fs::read_to_string(&first_backups[0]).expect("reads backup");
+        assert_eq!(saved, first, "备份内容必须原样保留");
+        assert!(is_broken_config(first));
+
+        // 第二次损坏要另建备份（撞名加序号），不得覆盖第一次的内容。
+        let second = "{\"screenshot\":";
+        std::fs::write(&path, second).expect("writes second broken file");
+        assert!(quarantine_broken(&path, second));
+        assert!(!path.exists());
+        let all = backups(&dir, &prefix);
+        assert_eq!(all.len(), 2, "第二次隔离应另建备份");
+        let first_saved = std::fs::read_to_string(&all[0]).expect("reads first backup");
+        let second_saved = std::fs::read_to_string(&all[1]).expect("reads second backup");
+        assert_eq!(first_saved, first, "旧备份不能被覆盖");
+        assert_eq!(second_saved, second);
+
+        // 合法对象与空文件都不该被隔离。
+        assert!(!is_broken_config(r#"{"appearance":"Default Light"}"#));
+        assert!(!is_broken_config("   "));
+
+        for backup in all {
+            let _ = std::fs::remove_file(backup);
+        }
+    }
+
+    #[test]
+    fn a_bad_split_field_keeps_the_other_split_fields() {
+        let s = parse(
+            r#"{
+              "screenshot": {
+                "saveDir": "D:/shots",
+                "split": {
+                  "direction": "grid",
+                  "splitType": "precise",
+                  "unit": "pixels",
+                  "count": "2",
+                  "rows": 3,
+                  "columns": 4,
+                  "pixels": 32,
+                  "percentage": "70",
+                  "overlapWidth": 2
+                }
+              }
+            }"#,
+        );
+        assert_eq!(
+            s.screenshot.save_dir.as_deref(),
+            Some(std::path::Path::new("D:/shots"))
+        );
+        assert_eq!(
+            s.screenshot.split.direction,
+            crate::imagesplit::SplitDirection::Grid
+        );
+        assert_eq!(
+            s.screenshot.split.split_type,
+            crate::imagesplit::SplitType::Precise
+        );
+        assert_eq!(
+            s.screenshot.split.unit,
+            crate::imagesplit::SplitUnit::Pixels
+        );
+        assert_eq!(s.screenshot.split.count, 2, "坏字段回默认");
+        assert_eq!(s.screenshot.split.rows, 3);
+        assert_eq!(s.screenshot.split.columns, 4);
+        assert_eq!(s.screenshot.split.pixels, 32);
+        assert_eq!(s.screenshot.split.percentage, "70");
+        assert_eq!(s.screenshot.split.overlap_width, 2);
+    }
+
+    #[test]
+    fn oversized_string_vecs_are_capped() {
+        let mut before = Settings::default();
+        before.screenshot.hidden_toolbar_items = (0..300).map(|i| format!("tool-{i}")).collect();
+        before.screenshot.record_history_sources = (0..300).map(|i| format!("src-{i}")).collect();
+        let json = serde_json::to_string(&before).expect("serializes");
+
+        // 合法但超大的数组仍会被完整反序列化，parse 出口也要截断。
+        let direct = parse(&json);
+        assert_eq!(direct.screenshot.hidden_toolbar_items.len(), 256);
+        assert_eq!(direct.screenshot.hidden_toolbar_items[255], "tool-255");
+        assert_eq!(direct.screenshot.record_history_sources.len(), 256);
+        assert_eq!(direct.screenshot.record_history_sources[255], "src-255");
+
+        // 逐字段恢复路径同样截断。
+        let mut broken: serde_json::Value = serde_json::from_str(&json).expect("parses");
+        broken["screenshot"]["captureMode"] = serde_json::json!("banana");
+        let recovered = parse(&broken.to_string());
+        assert_eq!(recovered.screenshot.capture_mode, CaptureMode::Auto);
+        assert_eq!(recovered.screenshot.hidden_toolbar_items.len(), 256);
+        assert_eq!(recovered.screenshot.hidden_toolbar_items[0], "tool-0");
+        assert_eq!(recovered.screenshot.record_history_sources.len(), 256);
+        assert_eq!(recovered.screenshot.record_history_sources[0], "src-0");
     }
 }

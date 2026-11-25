@@ -790,8 +790,8 @@ pub struct PinView {
     /// Tight BGRA at native size, kept for compositing a group.
     pixels: Arc<Vec<u8>>,
     /// Process-wide ledger reservation for the two buffers held by this pin.
-    /// `Option` so `replace_pixels` can hand the old permit back to the ledger
-    /// before reserving the new one, without losing it if the reserve fails.
+    /// `replace_pixels` resizes it in place, so the old and new buffers are
+    /// never counted twice; `None` only for a pin built without a reservation.
     permit: Option<crate::image_budget::MemoryPermit>,
     /// Physical pixel size of the flattened crop.
     pixel_size: (u32, u32),
@@ -881,20 +881,24 @@ impl PinView {
             return;
         };
         let held = (pixels.len() as u64).saturating_mul(2);
-        // 先预留新额度、成功后才归还旧许可：新额度失败时旧 permit 原封不动，
-        // self.pixels/self.image 也没被换掉，状态完全不变。
-        // 若反过来先归还再补回，两次预留都失败就会丢掉 permit，而两份缓冲
-        // 仍占着内存，LIVE_BYTES 少记会让后续 pin/长截图突破全局上限。
-        // 短暂的双倍计费偏保守，正是安全方向。
-        let permit = match crate::image_budget::try_reserve(held) {
-            Ok(permit) => permit,
-            Err(e) => {
+        // 就地把旧许可调整为新字节数：单一 CAS 不会要求 old + new 同时
+        // 装进全局上限，也没有预留到归还之间的双倍计费窗口。失败时旧
+        // permit、self.pixels/self.image 全都不变，编辑安全地放弃。
+        if let Some(permit) = self.permit.as_mut() {
+            if let Err(e) = permit.resize(held) {
                 crate::perf::log_app(&format!("pin edit refused: {e}"));
                 return;
             }
-        };
-        drop(self.permit.take());
-        self.permit = Some(permit);
+        } else {
+            let permit = match crate::image_budget::try_reserve(held) {
+                Ok(permit) => permit,
+                Err(e) => {
+                    crate::perf::log_app(&format!("pin edit refused: {e}"));
+                    return;
+                }
+            };
+            self.permit = Some(permit);
+        }
         self.pixels = pixels;
         self.image = image;
         self.pixel_size = (w.max(1), h.max(1));

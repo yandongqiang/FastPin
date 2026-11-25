@@ -1267,12 +1267,6 @@ impl SettingsView {
         let before_reset = self.settings.clone();
         let baseline_before = self.baseline.clone();
         if model::reset_page(&mut self.settings, self.page) {
-            if self.page == Page::Translate {
-                // The key lives in the credential vault, not settings.json:
-                // a page reset must remove it too, not just blank the field.
-                let _ = crate::translate::set_api_key("");
-                self.saved_api_key.clear();
-            }
             // 外观页重置回默认主题变体；重新应用（即使值没变）可让工具栏、
             // 弹层和本窗口一起刷新，无需再点一次。
             theme::set_appearance(cx, &self.settings.appearance);
@@ -1299,7 +1293,22 @@ impl SettingsView {
                 self.refresh_engine_status(true, cx);
             }
             if saved {
-                self.ok(format!("已重置「{}」", self.page.title()));
+                // API Key 存在密钥库而非 settings.json，删除是不可逆的外部副作用，
+                // 必须等配置成功落盘后才执行；保存失败时凭据与缓存都保持原样。
+                if self.page == Page::Translate {
+                    if let Err(e) = crate::translate::set_api_key("") {
+                        // 失败提示自带「已重置」语义，不能再叠加成功提示覆盖它。
+                        self.fail(format!(
+                            "已重置「{}」，但清除 API Key 失败：{e}",
+                            self.page.title()
+                        ));
+                    } else {
+                        self.saved_api_key.clear();
+                        self.ok(format!("已重置「{}」", self.page.title()));
+                    }
+                } else {
+                    self.ok(format!("已重置「{}」", self.page.title()));
+                }
             }
         } else {
             self.ok("本页没有可重置的配置");
@@ -1309,10 +1318,6 @@ impl SettingsView {
 
     fn reset_all(&mut self, cx: &mut Context<Self>) {
         model::reset_all(&mut self.settings);
-        // Resetting everything includes the API Key stored in the vault.
-        let _ = crate::translate::set_api_key("");
-        self.saved_api_key.clear();
-        let autostart_error = system::set_autostart(false).err();
         theme::set_appearance(cx, &self.settings.appearance);
         self.autostart = system::autostart_enabled();
         self.sync_inputs(cx);
@@ -1328,9 +1333,26 @@ impl SettingsView {
         crate::ocr::invalidate_engine();
         self.refresh_engine_status(true, cx);
         if saved {
-            match autostart_error {
-                Some(e) => self.fail(format!("所有设置已恢复默认，但关闭开机启动失败：{e}")),
-                None => self.ok("所有设置已恢复默认"),
+            // 配置已成功落盘，此时才执行不可逆的外部副作用：清除密钥库中的
+            // 凭据、关闭开机启动。保存失败时两者都保持原样，避免用户数据丢失。
+            let key_error = crate::translate::set_api_key("").err();
+            if key_error.is_none() {
+                self.saved_api_key.clear();
+            }
+            let autostart_error = system::set_autostart(false).err();
+            self.autostart = system::autostart_enabled();
+            // 两类失败分别收集，避免一个失败掩盖另一个，也保留原有提示文案风格。
+            let mut failures = Vec::new();
+            if let Some(e) = key_error {
+                failures.push(format!("清除 API Key 失败：{e}"));
+            }
+            if let Some(e) = autostart_error {
+                failures.push(format!("关闭开机启动失败：{e}"));
+            }
+            if failures.is_empty() {
+                self.ok("所有设置已恢复默认");
+            } else {
+                self.fail(format!("所有设置已恢复默认，但{}", failures.join("；")));
             }
         }
         // 保存失败时 persist 已显示「设置保存失败」，不再用成功文案覆盖，

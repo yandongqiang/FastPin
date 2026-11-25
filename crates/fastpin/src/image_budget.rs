@@ -443,6 +443,44 @@ pub fn try_reserve(bytes: u64) -> Result<MemoryPermit, BudgetError> {
     }
 }
 
+impl MemoryPermit {
+    /// 用单次 CAS 把这份预留调整为 new_bytes。失败时 self 与全局账本都不变。
+    pub fn resize(&mut self, new_bytes: u64) -> Result<(), BudgetError> {
+        let limit = global_limit();
+        let mut live = LIVE_BYTES.load(Ordering::Relaxed);
+        loop {
+            // `live` 已含 self.bytes；只有 permit 被重复释放才可能下溢，仍
+            // 防御性地拒绝，避免把账本少记后绕过全局上限。
+            let base = live.checked_sub(self.bytes).ok_or(BudgetError::Overflow {
+                width: self.bytes,
+                height: 1,
+                bytes_per_pixel: 1,
+            })?;
+            let next = base.checked_add(new_bytes).ok_or(BudgetError::Overflow {
+                width: new_bytes,
+                height: 1,
+                bytes_per_pixel: 1,
+            })?;
+            if next > limit {
+                return Err(BudgetError::GlobalLimit {
+                    needed: new_bytes,
+                    live: base,
+                    limit,
+                });
+            }
+            // 一次 CAS 同时归还旧额度并预留新额度，没有旧+新双倍计费窗口。
+            match LIVE_BYTES.compare_exchange_weak(live, next, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    self.bytes = new_bytes;
+                    return Ok(());
+                }
+                Err(actual) => live = actual,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +647,90 @@ mod tests {
         let permit = try_reserve(4096).expect("a small reservation fits");
         assert!(live_bytes() >= before + 4096);
         drop(permit); // balanced; other tests may reserve concurrently
+    }
+
+    #[test]
+    fn resize_replaces_the_reservation_and_drop_releases_the_new_size() {
+        // global_limit() 取决于可用物理内存，所有额度都从它推导，不硬编码。
+        let before = live_bytes();
+        let chunk = global_limit().saturating_sub(before) / 4;
+        assert!(chunk > 0, "the global limit must leave room for a permit");
+        let mut permit = try_reserve(chunk).expect("a quarter of the remaining budget fits");
+        assert_eq!(
+            live_bytes(),
+            before + chunk,
+            "a new permit must add its bytes to the ledger"
+        );
+
+        let grown = chunk * 2;
+        permit
+            .resize(grown)
+            .expect("resizing within the global limit fits");
+        assert_eq!(
+            live_bytes(),
+            before + grown,
+            "resize must replace the old bytes, not add to them"
+        );
+
+        drop(permit);
+        assert_eq!(
+            live_bytes(),
+            before,
+            "dropping a resized permit must release the new byte count"
+        );
+    }
+
+    #[test]
+    fn resize_past_the_global_limit_keeps_the_ledger_and_permit_unchanged() {
+        let before = live_bytes();
+        let limit = global_limit();
+        let granted = limit.saturating_sub(before) / 4;
+        assert!(granted > 0, "the global limit must leave room for a permit");
+        let mut permit = try_reserve(granted).expect("a quarter of the remaining budget fits");
+        let observed = live_bytes();
+
+        // 请求超过整个上限，因此无论已有多少 live 都必然被拒。
+        let too_big = limit.saturating_add(1);
+        let err = permit.resize(too_big).unwrap_err();
+        assert!(matches!(err, BudgetError::GlobalLimit { .. }), "{err}");
+        match err {
+            BudgetError::GlobalLimit {
+                needed,
+                live,
+                limit: reported,
+            } => {
+                assert_eq!(
+                    needed, too_big,
+                    "the error must report the requested byte count"
+                );
+                assert_eq!(
+                    live,
+                    observed - granted,
+                    "the reported live bytes must exclude this permit"
+                );
+                assert_eq!(
+                    reported, limit,
+                    "the error must report the current global limit"
+                );
+            }
+            other => panic!("expected GlobalLimit, got {other}"),
+        }
+        assert_eq!(
+            permit.bytes, granted,
+            "a refused resize must leave the permit unchanged"
+        );
+        assert_eq!(
+            live_bytes(),
+            observed,
+            "a refused resize must leave the global ledger unchanged"
+        );
+
+        drop(permit);
+        assert_eq!(
+            live_bytes(),
+            before,
+            "the original permit must still release its own bytes"
+        );
     }
 
     #[test]

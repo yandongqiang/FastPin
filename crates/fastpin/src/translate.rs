@@ -7,12 +7,13 @@ use std::ffi::c_void;
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Security::Credentials::{PasswordCredential, PasswordVault};
+#[cfg(test)]
+use windows::Win32::Networking::WinHttp::WINHTTP_INTERNET_SCHEME_HTTP;
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
     WinHttpQueryHeaders, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
     URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
-    WINHTTP_INTERNET_SCHEME_HTTP, WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
 use crate::config;
@@ -60,12 +61,16 @@ pub fn translate(text: &str) -> Result<String> {
         .ok_or_else(|| Error::new("翻译接口返回空结果，请检查模型名称与提示词配置。"))
 }
 
-/// Whether the configured Base URL uses plaintext HTTP. Used by both the
-/// runtime guard and the settings warning banner so the two cannot disagree.
+/// Whether the actual request would be plaintext — anything that is not HTTPS.
+/// Used by both the runtime guard and the settings warning banner so the two
+/// cannot disagree.
 ///
-/// 判定来源必须与 `post_json` 一致：后者用 `WinHttpCrackUrl` 解出的 `nScheme`
-/// 决定是否加 `WINHTTP_FLAG_SECURE`。纯字符串前缀判断会被 `http:\host\v1`
-/// 绕过——WinHTTP 把 `\` 当分隔符，仍按明文 HTTP 把 Authorization 发出去。
+/// 判定必须与 `post_json` 的 `WINHTTP_FLAG_SECURE` 判定同源：后者只在
+/// `parts.nScheme == WINHTTP_INTERNET_SCHEME_HTTPS` 时加安全标志，其余 scheme
+/// （`http`、`ftp` 等）都会把 `Authorization: Bearer <key>` 明文发出。
+/// 因此这里问的不是"字面是不是 http"，而是"非 HTTPS 即明文"。解析失败也
+/// 按不安全处理——此时 `post_json` 同样会失败，不会真的发出请求。
+/// 函数名中的 `http` 是历史遗留，保持原名以免改动调用点。
 pub fn is_insecure_http(base_url: &str) -> bool {
     let wide: Vec<u16> = base_url.trim().encode_utf16().chain([0]).collect();
     let mut parts = URL_COMPONENTS {
@@ -78,11 +83,11 @@ pub fn is_insecure_http(base_url: &str) -> bool {
         ..Default::default()
     };
     if unsafe { WinHttpCrackUrl(&wide, 0, &mut parts) }.is_ok() {
-        return parts.nScheme == WINHTTP_INTERNET_SCHEME_HTTP;
+        return parts.nScheme != WINHTTP_INTERNET_SCHEME_HTTPS;
     }
-    // 解析失败时 post_json 同样会失败，不会真的发出请求；这里按前缀保守
-    // 兜底，宁可多提示一次也不能把可疑地址当成安全的 HTTPS 放行。
-    base_url.trim().to_ascii_lowercase().starts_with("http")
+    // 解析失败时 post_json 同样会失败，不会真的发出请求；这里保守兜底为
+    // true，宁可多提示一次也不能把可疑地址当成安全的 HTTPS 放行。
+    true
 }
 
 /// The vault entry is optional: local gateways commonly take no key.
@@ -122,6 +127,9 @@ pub fn set_api_key(key: &str) -> Result<()> {
 /// `FastPin.Translation`, then drops the old entry. A missing legacy entry is
 /// the normal case (fresh install), not an error. Best-effort: every failure is
 /// reported as a note for the caller to log and never blocks startup.
+/// A new entry with an empty/unreadable password is not a migration: it is
+/// replaced with the legacy value (or removed together with an empty legacy
+/// value) so a broken entry cannot lose the user's key.
 pub(crate) fn migrate_legacy_vault() -> Vec<String> {
     let vault = match PasswordVault::new() {
         Ok(v) => v,
@@ -139,20 +147,36 @@ pub(crate) fn migrate_legacy_vault() -> Vec<String> {
     let Ok(password) = old.Password() else {
         return vec!["vault: legacy translation key unreadable".into()];
     };
-    // Never overwrite a key the new build already saved.
-    let already = vault.Retrieve(&current, &account).is_ok();
+    // Retrieve 成功只说明条目存在，不代表 key 可用：Credential Manager 里
+    // 可能残留一条空密码的坏条目。只有非空密码才算"已迁移"，否则必须用
+    // legacy 的值补写，避免删掉 legacy 后用户的 key 彻底丢失。
+    let existing = vault.Retrieve(&current, &account).ok();
+    let already = existing.as_ref().is_some_and(|cred| {
+        cred.RetrievePassword().is_ok() && cred.Password().is_ok_and(|p| !p.is_empty())
+    });
     if !already {
-        let cred = match PasswordCredential::CreatePasswordCredential(&current, &account, &password)
-        {
-            Ok(c) => c,
-            Err(e) => return vec![format!("vault: could not create FastPin entry ({e})")],
-        };
-        if let Err(e) = vault.Add(&cred) {
-            return vec![format!("vault: could not save FastPin entry ({e})")];
+        // Add 不接受同名条目：先删掉不可用的旧条目（若存在），保证幂等。
+        if let Some(cred) = existing {
+            if let Err(e) = vault.Remove(&cred) {
+                return vec![format!(
+                    "vault: could not remove broken FastPin entry ({e})"
+                )];
+            }
+        }
+        if !password.is_empty() {
+            let cred =
+                match PasswordCredential::CreatePasswordCredential(&current, &account, &password) {
+                    Ok(c) => c,
+                    Err(e) => return vec![format!("vault: could not create FastPin entry ({e})")],
+                };
+            if let Err(e) = vault.Add(&cred) {
+                return vec![format!("vault: could not save FastPin entry ({e})")];
+            }
         }
     }
     match vault.Remove(&old) {
         Ok(()) if already => vec!["vault: duplicate legacy translation key removed".into()],
+        Ok(()) if password.is_empty() => vec!["vault: empty legacy translation key removed".into()],
         Ok(()) => vec!["vault: moved translation key to FastPin.Translation".into()],
         Err(_) => vec!["vault: FastPin key written, legacy entry not removed".into()],
     }
@@ -394,6 +418,27 @@ fn nul_terminated_from(s: &[u16]) -> Vec<u16> {
     s.iter().copied().chain([0]).collect()
 }
 
+/// Test-only probe: the scheme WinHTTP actually resolved, or `None` when it
+/// refuses the URL. Keeps the backslash-URL test tied to real parser behavior
+/// instead of an assumption about it.
+#[cfg(test)]
+fn cracked_scheme(url: &str) -> Option<u16> {
+    let wide: Vec<u16> = url.trim().encode_utf16().chain([0]).collect();
+    let mut parts = URL_COMPONENTS {
+        dwStructSize: std::mem::size_of::<URL_COMPONENTS>() as u32,
+        dwSchemeLength: u32::MAX,
+        dwHostNameLength: u32::MAX,
+        dwUrlPathLength: u32::MAX,
+        dwExtraInfoLength: u32::MAX,
+        ..Default::default()
+    };
+    if unsafe { WinHttpCrackUrl(&wide, 0, &mut parts) }.is_ok() {
+        Some(parts.nScheme.0 as u16)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,8 +470,19 @@ mod tests {
         assert!(is_insecure_http("http://localhost:11434"));
         assert!(is_insecure_http("  HTTP://gateway.local/v1 "));
         assert!(!is_insecure_http("https://api.openai.com/v1"));
-        assert!(!is_insecure_http(""));
-        // WinHTTP 把反斜杠当分隔符：前缀检查漏掉，但请求实际走明文 HTTP。
+        // 非 HTTPS 一律按明文处理：post_json 只在 HTTPS 时加 WINHTTP_FLAG_SECURE。
+        assert!(is_insecure_http("ftp://gateway.local/v1"));
+        // 解析失败（含空串）时 post_json 同样失败，保守兜底为 true。
+        assert!(is_insecure_http(""));
+        // 反斜杠形式：本机实测 WinHttpCrackUrl 返回 12005（解析失败），
+        // 因此不构成绕过；其他版本若真解析为 HTTP，scheme 必须是 HTTP。
+        if let Some(scheme) = cracked_scheme("http:\\gateway.local\\v1") {
+            assert_eq!(
+                scheme, WINHTTP_INTERNET_SCHEME_HTTP.0 as u16,
+                "WinHTTP 若解析该 URL，必须按明文 HTTP 判为不安全"
+            );
+        }
+        // None 时 post_json 不会发请求；两种情形守卫都必须返回 true。
         assert!(is_insecure_http("http:\\gateway.local\\v1"));
     }
 

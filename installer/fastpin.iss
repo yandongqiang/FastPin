@@ -2,9 +2,11 @@
 ; "C:\Program Files (x86)\Inno Setup 6" / "%LOCALAPPDATA%\Programs\Inno Setup 6"):
 ;   ISCC.exe installer\fastpin.iss
 ; Payload mirrors the portable layout: FastPin.exe + DirectML.dll + models\v6
-; plus LICENSE / NOTICE / COPYRIGHT.snow-shot for GPL attribution. The models
-; are exactly what ocr::models_dir expects next to the exe. The themes\ directory
-; is loaded at runtime by gpui-kit's ThemeRegistry, so it ships next to the exe.
+; plus LICENSE / NOTICE / COPYRIGHT.snow-shot for GPL attribution, README.md for
+; the source/build instructions, and LICENSE-APACHE for the vendored GPUI code.
+; The models are exactly what ocr::models_dir expects next to the exe. The
+; themes\ directory is loaded at runtime by gpui-kit's ThemeRegistry, so it
+; ships next to the exe.
 
 // release.yml injects /DAppVersion=<tag>; the fallback matches Cargo.toml.
 #ifndef AppVersion
@@ -49,6 +51,8 @@ Source: "..\target\release\DirectML.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\COPYRIGHT.snow-shot"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\third_party\gpui\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\models\v6\*"; DestDir: "{app}\models\v6"; Flags: ignoreversion recursesubdirs createallSubdirs
 Source: "..\themes\*"; DestDir: "{app}\themes"; Flags: ignoreversion recursesubdirs createallSubdirs
 

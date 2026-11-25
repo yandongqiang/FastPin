@@ -31,6 +31,10 @@ jobs:
           Copy-Item LICENSE $dir
           Copy-Item NOTICE $dir
           Copy-Item COPYRIGHT.snow-shot $dir
+          # GPLv3 §6 source offer / build instructions and Apache-2.0 text for
+          # the vendored GPUI code (the README's attribution list has the rest).
+          Copy-Item README.md $dir
+          Copy-Item third_party/gpui/LICENSE-APACHE $dir
           New-Item -ItemType Directory -Force "$dir/models/v6" | Out-Null
           Copy-Item models/v6/* "$dir/models/v6"
           # Appearance themes are loaded at runtime by ThemeRegistry from themes\

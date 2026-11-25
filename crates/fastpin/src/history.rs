@@ -10,6 +10,7 @@
 //! The store layer is pure filesystem + serde: no GPUI, no threads, no global
 //! state, which keeps it trivially testable with a scratch directory.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -423,7 +424,7 @@ impl HistoryStore {
         // 第一阶段（持锁、只动索引）：把记录从 index 摘下并追加到 pending，
         // 目录路径只做成快照交给锁外。这里不广播 revision——磁盘文件还没删完，
         // UI 提前移除卡片会让人误以为已经删干净了。
-        let (to_remove, removed_any) = {
+        let (mut to_remove, removed_any) = {
             let _guard = lock();
             let mut index = self.read_index()?;
             let mut removed = Vec::new();
@@ -443,19 +444,38 @@ impl HistoryStore {
                 return Ok(());
             }
             // 非法 id 已在 record_dir 记日志；绝不把拼接出的路径交给 remove_dir_all。
-            let dirs: Vec<PathBuf> = removed
+            // 保留 id 与目录的配对，锁外删除前还能再核对一次 id 是否已被并发写回。
+            let targets: Vec<(String, PathBuf)> = removed
                 .iter()
-                .filter_map(|p| self.record_dir(&p.id).ok())
+                .filter_map(|p| self.record_dir(&p.id).ok().map(|dir| (p.id.clone(), dir)))
                 .collect();
             index.pending_deletions.extend(removed);
             self.write_index(&index)?;
-            (dirs, removed_any)
+            (targets, removed_any)
         };
         // guard 已离开作用域：下面阻塞的删除不再持有全局锁。
 
         // 第二阶段（锁外）：真正删目录。失败只记日志，pending 条目保留，
         // 下次 cleanup_pending 或删除时重试。
-        for dir in &to_remove {
+        // 删除前短暂持锁核对：阶段一已把这些 id 从 records 摘掉，但锁外期间
+        // 若被并发 add / 脏索引重新写回，绝不能删掉在用记录的图片目录。
+        {
+            let _guard = lock();
+            let live_ids: HashSet<String> = self
+                .read_index()?
+                .records
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            to_remove.retain(|(id, _)| {
+                if live_ids.contains(id) {
+                    eprintln!("history: 待删 id 重新出现在记录中，跳过删除：{id:?}");
+                    return false;
+                }
+                true
+            });
+        }
+        for (_, dir) in &to_remove {
             if let Err(e) = std::fs::remove_dir_all(dir) {
                 eprintln!("history: 删除记录目录 {} 失败：{e}", dir.display());
             }
@@ -466,13 +486,24 @@ impl HistoryStore {
         // 写盘成功后才广播，UI 看到的"已删除"才与磁盘状态一致。
         let _guard = lock();
         let mut index = self.read_index()?;
-        index
-            .pending_deletions
-            .retain(|p| match self.record_dir(&p.id) {
+        // 与 cleanup_pending 同理：id 仍在 records 里的 pending 是自相矛盾的
+        // 脏数据，finalize 时必须清掉，否则下次启动会被当成待删项重试而误删
+        // 在用记录的目录；也不能把它当作"目录被占用"继续保留。
+        let live_ids: HashSet<String> = index.records.iter().map(|r| r.id.clone()).collect();
+        index.pending_deletions.retain(|p| {
+            if live_ids.contains(&p.id) {
+                eprintln!(
+                    "history: 待删除项 id 仍在使用中，已清除脏 pending：{:?}",
+                    p.id
+                );
+                return false;
+            }
+            match self.record_dir(&p.id) {
                 Ok(dir) => dir.exists(),
                 // 非法 id 不再保留；它的目录也绝不会被触碰。
                 Err(_) => false,
-            });
+            }
+        });
         self.write_index(&index)?;
         if removed_any {
             HISTORY_REVISION.fetch_add(1, Ordering::Release);
@@ -502,8 +533,20 @@ impl HistoryStore {
             let _guard = lock();
             let mut index = self.read_index()?;
             let before = index.pending_deletions.len();
+            // 自相矛盾的索引可能让同一个 id 同时出现在 records 与 pending：
+            // 若只按目录存在性把它当待删项锁外重试，就会删掉在用记录的图片，
+            // 而索引仍列着这条记录，用户点开历史项发现图片丢失。先把 live ids
+            // 收集出来，这类脏 pending 直接清除，既不删目录也不进删除快照。
+            let live_ids: HashSet<String> = index.records.iter().map(|r| r.id.clone()).collect();
             let mut dirs = Vec::new();
             index.pending_deletions.retain(|p| {
+                if live_ids.contains(&p.id) {
+                    eprintln!(
+                        "history: 待删除项 id 仍在使用中，已清除脏 pending：{:?}",
+                        p.id
+                    );
+                    return false;
+                }
                 let dir = match self.record_dir(&p.id) {
                     Ok(dir) => dir,
                     // 非法 id 已记日志：安全跳过，不删任何目录也不检查存在性。
@@ -539,13 +582,19 @@ impl HistoryStore {
         // 避免覆盖锁外期间其它线程写入的记录；删除成功的 pending 才清除。
         let _guard = lock();
         let mut index = self.read_index()?;
-        index
-            .pending_deletions
-            .retain(|p| match self.record_dir(&p.id) {
+        // 锁外期间该 id 若被写回 records，同样不能继续当待删项保留，
+        // 否则下一次 cleanup_pending 又会尝试删掉在用记录的目录。
+        let live_ids: HashSet<String> = index.records.iter().map(|r| r.id.clone()).collect();
+        index.pending_deletions.retain(|p| {
+            if live_ids.contains(&p.id) {
+                return false;
+            }
+            match self.record_dir(&p.id) {
                 Ok(dir) => dir.exists(),
                 // 非法 id 不再保留；它的目录也绝不会被触碰。
                 Err(_) => false,
-            });
+            }
+        });
         self.write_index(&index)?;
         Ok(())
     }
@@ -815,6 +864,72 @@ mod tests {
         store.cleanup_pending().unwrap();
         assert!(!dir.exists(), "pending directory must be removed");
         assert_eq!(store.pending_count(), 0);
+    }
+
+    /// 脏索引里同一个 id 既在 records 又在 pending_deletions 时，
+    /// cleanup_pending 必须只清掉 pending，绝不能删掉仍在使用的记录目录。
+    #[test]
+    fn cleanup_pending_keeps_a_record_still_listed_in_the_index() {
+        let root = scratch();
+        let store = HistoryStore::new(root.clone());
+        let rec = sample(&store, 8, 8);
+        let dir = store.image_path(&rec).parent().unwrap().to_path_buf();
+        let png = vec![0x89, b'P', b'N', b'G'];
+
+        // 人为制造自相矛盾的索引：记录仍在，却又被标成待删除。
+        let mut index = store.read_index().unwrap();
+        index.pending_deletions.push(PendingDeletion {
+            id: rec.id.clone(),
+            bytes: rec.bytes,
+        });
+        store.write_index(&index).unwrap();
+        assert!(dir.exists(), "precondition: 记录目录存在");
+        assert_eq!(store.pending_count(), 1);
+
+        store.cleanup_pending().unwrap();
+        assert_eq!(
+            store.pending_count(),
+            0,
+            "自相矛盾的脏 pending 应被直接清除"
+        );
+        assert!(dir.exists(), "在用记录的目录不能被 cleanup 删掉");
+        let list = store.list().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, rec.id);
+        assert_eq!(
+            std::fs::read(store.image_path(&list[0])).unwrap(),
+            png,
+            "记录的图片仍应可读"
+        );
+    }
+
+    /// remove_many 的 finalize 不能把仍在 records 里的 id 当待删项保留，
+    /// 否则下一次启动重试 cleanup 时会误删在用记录。
+    #[test]
+    fn remove_many_clears_pending_ids_that_are_still_live() {
+        let root = scratch();
+        let store = HistoryStore::new(root.clone());
+        let live = sample(&store, 4, 4);
+        let victim = sample(&store, 5, 5);
+        let live_dir = store.image_path(&live).parent().unwrap().to_path_buf();
+
+        let mut index = store.read_index().unwrap();
+        index.pending_deletions.push(PendingDeletion {
+            id: live.id.clone(),
+            bytes: live.bytes,
+        });
+        store.write_index(&index).unwrap();
+
+        store.remove(&victim.id).unwrap();
+        assert_eq!(
+            store.pending_count(),
+            0,
+            "finalize 必须清掉仍在使用中 id 的脏 pending"
+        );
+        assert!(live_dir.exists(), "在用记录的目录不能被动过");
+        let list = store.list().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, live.id);
     }
 
     /// 索引损坏时 `add` 必须在写图片之前失败，否则会留下永远无人回收的目录。

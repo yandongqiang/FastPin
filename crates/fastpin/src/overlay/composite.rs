@@ -50,7 +50,7 @@ pub fn apply_annotations(
             local.bounds.x -= origin_x;
             local.bounds.y -= origin_y;
             match &mut local.shape {
-                Shape::Arrow { start, end, .. } => {
+                Shape::Arrow { start, end, .. } | Shape::Line { start, end } => {
                     start.x -= origin_x;
                     start.y -= origin_y;
                     end.x -= origin_x;
@@ -2064,6 +2064,49 @@ mod tests {
         assert_ne!(
             element_mask(&ellipse(LineStyle::Solid)).unwrap().data,
             element_mask(&ellipse(LineStyle::Dashed)).unwrap().data
+        );
+    }
+
+    /// A Line drawn in full-image coordinates must follow the crop origin into
+    /// the exported pixels, exactly where the overlay preview (the same element
+    /// under the same -origin mapping) shows it. Arrow/Pen already translated;
+    /// without the Line branch the stroke stayed offset by (origin_x, origin_y).
+    #[test]
+    fn line_annotation_follows_crop_origin() {
+        let (w, h) = (96u32, 64u32);
+        let (plain, stride) = solid(w, h, [0, 0, 0, 255]);
+        let line = |sx: f64, sy: f64, ex: f64, ey: f64| Element {
+            stroke_enabled: true,
+            fill: None,
+            arrow_ends: Default::default(),
+            arrow_head: Default::default(),
+            id: 12,
+            bounds: Rect::new(0.0, 0.0, w as f64, h as f64),
+            stroke: 0xFFFF_FFFF,
+            stroke_width: 3.0,
+            line_style: LineStyle::Solid,
+            shape: Shape::Line {
+                start: Point { x: sx, y: sy },
+                end: Point { x: ex, y: ey },
+            },
+        };
+        // Full-image geometry with the crop starting at (80, 40). In crop space
+        // the same stroke runs (10, 10) -> (50, 10).
+        let full = line(90.0, 50.0, 130.0, 50.0);
+        let in_crop = line(10.0, 10.0, 50.0, 10.0);
+
+        let mut exported = plain.clone();
+        apply_annotations(&mut exported, w, h, stride, 80.0, 40.0, &[full]);
+        let mut previewed = plain.clone();
+        apply_annotations(&mut previewed, w, h, stride, 0.0, 0.0, &[in_crop]);
+
+        assert_ne!(
+            exported, plain,
+            "line did not burn any pixels into the crop"
+        );
+        assert_eq!(
+            exported, previewed,
+            "line landed away from the previewed crop pixels"
         );
     }
 

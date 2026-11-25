@@ -1952,11 +1952,14 @@ impl OverlayView {
         // to release, even after it leaves the thumbnail. Recomputing from the
         // press-time range keeps the pointer delta authoritative.
         if let Some(drag) = self.long.as_ref().and_then(|s| s.trim_drag.as_ref()) {
+            // start_ptr was captured from event.position in logical pixels and
+            // thumb_extent is measured in logical pixels too; converting the
+            // pointer again would put the drag delta in the wrong unit.
             let pointer = f32::from(if drag.axis == Axis::Horizontal {
                 event.position.x
             } else {
                 event.position.y
-            }) / window.scale_factor();
+            });
             let delta = pointer - drag.start_ptr;
             let edge = drag.edge;
             let start_range = drag.start_range;
@@ -3871,7 +3874,9 @@ impl OverlayView {
         // handles drag the top and bottom edges. GPUI does not hand a mouse
         // handler its element's bounds, so the handlers work in thumbnail
         // coordinates obtained from the pointer minus the position the bar was
-        // laid out at -- the same placement the element uses.
+        // laid out at -- the same placement the element uses. Mouse events report
+        // that same logical-pixel space, so no second scale division belongs in
+        // the hit tests below; dividing twice lands handles at physical/scale².
         let preview_el: gpui::AnyElement = if let Some((image, pw, ph)) = &state.preview {
             const MAX_W: f32 = 240.0;
             const MAX_H: f32 = 170.0;
@@ -3924,12 +3929,14 @@ impl OverlayView {
                         })
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                                // event.position is already in GPUI logical pixels,
+                                // the same space thumb_left / thumb_top use.
                                 let pointer = f32::from(if horizontal {
                                     event.position.x
                                 } else {
                                     event.position.y
-                                }) / window.scale_factor();
+                                });
                                 let along =
                                     pointer - (if horizontal { thumb_left } else { thumb_top });
                                 let Some(state) = this.long.as_mut() else {
@@ -3978,18 +3985,20 @@ impl OverlayView {
                         // full resolution. Tracking only while no trim drag is
                         // active keeps one pointer from doing two jobs.
                         .on_mouse_move(cx.listener(
-                            move |this, event: &MouseMoveEvent, window, cx| {
+                            move |this, event: &MouseMoveEvent, _window, cx| {
                                 let Some(state) = this.long.as_mut() else {
                                     return;
                                 };
                                 if state.trim_drag.is_some() {
                                     return;
                                 }
+                                // Logical pixels, matching thumb_top / thumb_left -- no
+                                // second scale division or the hover row drifts.
                                 let pointer = f32::from(if horizontal {
                                     event.position.x
                                 } else {
                                     event.position.y
-                                }) / window.scale_factor();
+                                });
                                 let canvas = state.total_height.max(1) as u32;
                                 // One viewport-tall band, along the stitch axis:
                                 // the height of a vertical capture, the width of a

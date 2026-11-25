@@ -5,6 +5,12 @@ SPDX-License-Identifier: GPL-3.0-or-later
 This project is licensed under the GNU General Public License, version 3 or
 (at your option) any later version. The complete license text is in LICENSE.
 
+=== 源码获取 / Source offer (GPLv3 §6) ===
+
+FastPin 源码：https://github.com/yandongqiang/FastPin
+本项目按 GPL-3.0-or-later 授权。二进制分发期间，我们按 GPLv3 §6 向下游用户提供对应完整源码，承诺有效期至少三年（自该版本发布之日起）。
+构建步骤见随分发包附带的 README.md 中「从源码构建」一节。
+
 === Upstream attribution ===
 
 FastPin was originally built by secondary development on Zshot (the source
@@ -53,3 +59,14 @@ scroll stepping, adaptive capture cadence and other modules:
     snow-crates/ in the Snow Shot repository; the additional modules listed
     above are ported into FastPin itself. See COPYRIGHT.snow-shot and the
     LICENSE files inside those crate directories for full notices.
+
+=== 第三方组件 / Third-party components ===
+
+本项目分发包含以下第三方组件，按其各自许可证提供；Apache License 2.0 全文见
+随分发包附带的 LICENSE-APACHE（源自 third_party/gpui/LICENSE-APACHE）。
+
+- GPUI (https://github.com/zed-industries/zed) — Zed 编辑器的 GPU 加速 UI 框架，Apache-2.0。
+- ONNX Runtime (https://github.com/microsoft/onnxruntime) — MIT。
+- PaddleOCR (https://github.com/PaddlePaddle/PaddleOCR) — PP-OCRv6 模型（Apache-2.0）。
+
+完整致谢列表见随分发包附带的 README.md「致谢」一节。

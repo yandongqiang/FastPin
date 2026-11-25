@@ -469,7 +469,9 @@ fn resolve_export_directory(parent: &Path, image_name: &str) -> std::io::Result<
         } else {
             format!("{base} ({suffix})")
         };
-        let candidate = parent.join(&name);
+        // 父目录可能刚好低于阈值；加上目录名后已超 MAX_PATH，必须按最终路径
+        // 再判一次（extended_path 幂等）。
+        let candidate = crate::config::extended_path(&parent.join(&name));
         match candidate.try_exists() {
             Ok(false) => return Ok(candidate),
             Ok(true) => {
@@ -501,13 +503,11 @@ fn publish_staging_directory(
     let mut final_dir = first_choice;
     for _ in 0..64 {
         // Windows 上 rename 到已存在的空目录也会失败，先移除空壳。
-        if final_dir.is_dir() && is_empty_dir(&final_dir).unwrap_or(false) {
-            let _ = std::fs::remove_dir(crate::config::extended_path(&final_dir));
+        let final_dir_io = crate::config::extended_path(&final_dir);
+        if final_dir_io.is_dir() && is_empty_dir(&final_dir_io).unwrap_or(false) {
+            let _ = std::fs::remove_dir(&final_dir_io);
         }
-        match std::fs::rename(
-            crate::config::extended_path(staging),
-            crate::config::extended_path(&final_dir),
-        ) {
+        match std::fs::rename(crate::config::extended_path(staging), final_dir_io) {
             Ok(()) => return Ok(final_dir),
             Err(e)
                 if e.kind() == std::io::ErrorKind::AlreadyExists
@@ -532,6 +532,9 @@ fn create_staging_directory(parent: &Path) -> std::io::Result<PathBuf> {
     let parent = crate::config::extended_path(parent);
     for suffix in 0..i32::MAX {
         let candidate = parent.join(format!(".Split Images_tmp-{}-{suffix}", std::process::id()));
+        // 父目录低于阈值也不代表完整路径安全：staging 名本身很长，按最终
+        // 路径再加前缀，否则目录落盘失败、整批导出被误报为参数错误。
+        let candidate = crate::config::extended_path(&candidate);
         match std::fs::create_dir(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,

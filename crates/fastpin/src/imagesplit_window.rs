@@ -327,12 +327,11 @@ impl SplitWindowView {
             let _ = this.update(cx, |this, cx| {
                 this.exporting = false;
                 if result.succeeded() {
-                    this.status = format!(
-                        "已导出 {} 张到 {}",
-                        result.saved_count,
-                        result.directory.display()
-                    )
-                    .into();
+                    // 导出目录内部可能是 `\\?\` 长路径，状态栏只显示 Shell
+                    // 能识别的普通路径，避免把前缀暴露给用户。
+                    let shown = crate::config::shell_path(&result.directory);
+                    this.status =
+                        format!("已导出 {} 张到 {}", result.saved_count, shown.display()).into();
                 } else {
                     this.status = format!("导出失败：{}", result.error).into();
                 }

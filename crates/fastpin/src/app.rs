@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{App, Application, QuitMode};
 
@@ -697,6 +697,11 @@ fn run_tray() -> Result<()> {
     // （Windows 下 FILE_SHARE_DELETE 允许跨进程删除未关闭句柄的文件），令截图丢失。
     // 放在 CoInitializeEx 之后：默认截图目录要走 SHGetKnownFolderPath。
     cleanup_stale_image_temps();
+    // 回收崩溃/强杀后没人认领的拖出临时目录（FastPin-drag-*）。拖出文件由
+    // 接收方持有句柄，不能像截图临时文件那样启动时立即删；按 24h 龄清理。
+    // 同样必须在 acquire 成功之后，否则第二实例早退前会删掉第一实例正在
+    // 供接收方读取的拖出文件。
+    cleanup_stale_drag_files();
     // 清理上次写盘失败残留的 settings.tmp-*，同样必须在 acquire 成功之后，
     // 否则第二实例早退前会删掉第一实例正在写的临时配置。
     crate::config::cleanup_stale_temp_files();
@@ -872,9 +877,24 @@ fn show_tray_unavailable_hint() {
                 "紧急退出热键被占用, 无法使用。\n\
                  退出程序: 请在任务管理器结束 FastPin.exe。"
             };
+            // 双通道全失败（LL hook 装不上、RegisterHotKey 兜底又被占用）时
+            // 不能再宣称「热键截图仍可用」。take 是取走即清空，这里只在构造
+            // 启动提示时调用一次；截图专属标志把「仅紧急退出键被占用」排除，
+            // 那种情况下截图热键确实仍可用，保留原文案。
+            let hotkey_detail = crate::hotkey::take_fallback_register_failure();
+            let screenshot_failed = crate::hotkey::fallback_screenshot_failed();
+            let hotkey_hint = if screenshot_failed {
+                let detail = hotkey_detail.unwrap_or_else(|| "注册失败".into());
+                format!(
+                    "热键注册失败（{detail}），截图热键不可用，请在设置中重新绑定或检查冲突软件。\n\n"
+                )
+            } else {
+                "热键截图仍可用。\n\n".to_string()
+            };
             let text = wide(&format!(
-                "FastPin 已在后台运行，热键截图仍可用，但托盘图标未能创建 \
+                "FastPin 已在后台运行，但托盘图标未能创建 \
                  (Shell_NotifyIconW(NIM_ADD) 被系统拒绝, 0x80070005)。\n\n\
+                 {hotkey_hint}\
                  {quit_hint}\n\
                  详情见 %LOCALAPPDATA%\\FastPin\\logs\\app.log。\0"
             ));
@@ -1471,20 +1491,60 @@ fn cleanup_stale_image_temps() {
     let Ok(dir) = crate::config::screenshot_dir() else {
         return;
     };
-    // 启动清理同样要能穿透深目录；entry.path() 已继承前缀，remove_file 处
-    // 仍再转一次以保证幂等。
+    // 启动清理同样要能穿透深目录；对每个最终路径（不只是父目录）调用
+    // extended_path：父目录低于阈值时未加前缀，但拼上临时名可能已超 260，
+    // is_file() / remove_file 对这种裸长路径都会返回 false。
     let dir = crate::config::extended_path(&dir);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
+        let path = crate::config::extended_path(&entry.path());
         let is_temp = path
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with(IMAGE_TMP_PREFIX));
         if is_temp && path.is_file() {
-            let _ = std::fs::remove_file(crate::config::extended_path(&path));
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// 拖出临时目录前缀，与 dragexport::stage_in 的命名保持一致。
+const DRAG_TMP_PREFIX: &str = "FastPin-drag-";
+/// 拖出文件可能仍被接收方打开，只有满 24h 未修改的目录才判定为孤儿。
+const DRAG_STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// 按修改时间判断拖出临时目录是否已成孤儿。时钟回拨（modified 在未来）时
+/// duration_since 返回 Err，宁可保留也不误删仍被使用的文件。
+fn is_stale_drag_dir(modified: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(modified)
+        .is_ok_and(|age| age >= DRAG_STALE_AGE)
+}
+
+/// 启动时回收上次崩溃遗留的拖出临时目录。必须在单实例 acquire 成功之后调用：
+/// 第二实例早退前若也清理，会删掉第一实例正在给接收方读取的拖出文件。
+/// 只处理临时目录下带 FastPin-drag- 前缀、且满 24h 未修改的目录；失败一律静默。
+fn cleanup_stale_drag_files() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_drag = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(DRAG_TMP_PREFIX));
+        if !is_drag || !path.is_dir() {
+            continue;
+        }
+        let modified = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if is_stale_drag_dir(modified, now) {
+            let _ = std::fs::remove_dir_all(path);
         }
     }
 }
@@ -1613,6 +1673,27 @@ mod tests {
         assert_eq!(
             export.expand_name("20260828", "143052"),
             "FastPin_20260828_143052"
+        );
+    }
+
+    #[test]
+    fn stale_drag_dir_uses_24h_age_boundary() {
+        // 固定时钟避免测试受真实时间影响；取足够大的纪元偏移，减法不会下溢。
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let day = DRAG_STALE_AGE;
+
+        assert!(
+            !is_stale_drag_dir(now - day + Duration::from_secs(1), now),
+            "差一秒未满 24h 时不能回收"
+        );
+        assert!(is_stale_drag_dir(now - day, now), "满 24h 即视为孤儿");
+        assert!(
+            is_stale_drag_dir(now - day - Duration::from_secs(1), now),
+            "超过 24h 必须回收"
+        );
+        assert!(
+            !is_stale_drag_dir(now + Duration::from_secs(1), now),
+            "时钟回拨（modified 在未来）时宁可保留"
         );
     }
 }

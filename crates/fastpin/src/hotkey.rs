@@ -42,6 +42,26 @@ pub fn take_fallback_register_failure() -> Option<String> {
     lock_failure().take()
 }
 
+/// 截图兜底热键（区域 / 仅复制 / 全屏）本次是否有 RegisterHotKey 失败。
+/// 紧急退出键的失败单独由 EMERGENCY_QUIT_REGISTERED 表达：启动提示要区分
+/// 「截图热键不可用」与「仅紧急退出键被占用」，不能混为一谈。
+static FALLBACK_SCREENSHOT_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// （重）注册截图兜底热键前清零，只保留本次注册的结果。
+pub fn clear_fallback_screenshot_failure() {
+    FALLBACK_SCREENSHOT_FAILED.store(false, Ordering::SeqCst);
+}
+
+/// hook 在 RegisterHotKey 失败时写入。
+pub fn note_fallback_screenshot_failure() {
+    FALLBACK_SCREENSHOT_FAILED.store(true, Ordering::SeqCst);
+}
+
+/// 启动提示查询：截图兜底热键是否注册失败。
+pub fn fallback_screenshot_failed() -> bool {
+    FALLBACK_SCREENSHOT_FAILED.load(Ordering::SeqCst)
+}
+
 /// 紧急退出热键（Ctrl+Alt+Shift+Q）是否真的注册成功。托盘不可用模式里
 /// app.rs 的提示文案要据此决定是否告诉用户可以用它退出；不能用上面的失败
 /// 文案判断，因为重注册 / 新录制会话会清空那份文案。

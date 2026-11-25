@@ -2334,15 +2334,20 @@ impl SettingsView {
             HotkeyAction::CopyOnly => self.settings.hotkeys.copy_only = text.clone(),
             HotkeyAction::Fullscreen => self.settings.hotkeys.fullscreen = text.clone(),
         }
-        self.persist(cx);
-        self.reapply_hotkeys();
-        // fallback 模式（LL hook 装不上）下 RegisterHotKey 可能被别的程序占用：
-        // 旧代码丢弃 Result 仍提示绑定成功。这里把真实失败显示出来；LL 模式
-        // 没有走 RegisterHotKey，查询为 None，文案不变。
-        if let Some(detail) = hotkey::take_fallback_register_failure() {
-            self.fail(format!("热键被其它程序占用，未生效：{detail}"));
-        } else if self.status.is_empty() {
-            self.ok(format!("已设为 {text}"));
+        let saved = self.persist(cx);
+        // 保存失败时 persist 已写入「设置保存失败」，磁盘上仍是旧绑定；此时若
+        // 照旧 reapply，热键会即时变成新值，UI 报错但运行时已生效，重启又回退。
+        // 失败时也不取走 fallback 注册失败记录——本次根本没有触发重注册。
+        if saved {
+            self.reapply_hotkeys();
+            // fallback 模式（LL hook 装不上）下 RegisterHotKey 可能被别的程序占用：
+            // 旧代码丢弃 Result 仍提示绑定成功。这里把真实失败显示出来；LL 模式
+            // 没有走 RegisterHotKey，查询为 None，文案不变。
+            if let Some(detail) = hotkey::take_fallback_register_failure() {
+                self.fail(format!("热键被其它程序占用，未生效：{detail}"));
+            } else if self.status.is_empty() {
+                self.ok(format!("已设为 {text}"));
+            }
         }
         cx.notify();
     }
@@ -3447,7 +3452,8 @@ impl SettingsView {
     fn history_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::Div> {
         let h = &self.settings.history;
         let store_dir: SharedString = match h.store_dir() {
-            Ok(p) => p.display().to_string().into(),
+            // 历史目录内部用 `\\?\` 长路径读写，显示时还原成普通路径。
+            Ok(p) => crate::config::shell_path(&p).display().to_string().into(),
             Err(e) => format!("{e}").into(),
         };
         let location = widgets::stack(

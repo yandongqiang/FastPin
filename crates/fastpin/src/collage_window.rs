@@ -1015,15 +1015,18 @@ impl CollageWindowView {
             );
         }
 
-        let dir = match crate::config::screenshot_dir() {
-            Ok(dir) => dir,
-            Err(_) => {
-                self.exporting = false;
-                self.status = SharedString::from("无法获取截图目录");
-                cx.notify();
-                return;
-            }
-        };
+        // 深 save_dir 下导出会超过 MAX_PATH，按最终目录转成 `\\?\` 形式，
+        // 后续的查重/临时名/写盘都继承前缀。
+        let dir =
+            match crate::config::screenshot_dir().map(|dir| crate::config::extended_path(&dir)) {
+                Ok(dir) => dir,
+                Err(_) => {
+                    self.exporting = false;
+                    self.status = SharedString::from("无法获取截图目录");
+                    cx.notify();
+                    return;
+                }
+            };
         let time = Local::now();
         let name = format!(
             "FastPin_Collage_{:04}{:02}{:02}_{:02}{:02}{:02}",
@@ -1082,15 +1085,17 @@ impl CollageWindowView {
             return;
         }
 
-        let dir = match crate::config::screenshot_dir() {
-            Ok(dir) => dir,
-            Err(_) => {
-                self.exporting = false;
-                self.status = SharedString::from("无法获取截图目录");
-                cx.notify();
-                return;
-            }
-        };
+        // PDF 与 PNG 同样写到截图目录，深路径下必须带 `\\?\` 前缀。
+        let dir =
+            match crate::config::screenshot_dir().map(|dir| crate::config::extended_path(&dir)) {
+                Ok(dir) => dir,
+                Err(_) => {
+                    self.exporting = false;
+                    self.status = SharedString::from("无法获取截图目录");
+                    cx.notify();
+                    return;
+                }
+            };
         let now = Local::now();
         let stamp = format!(
             "{:04}{:02}{:02}_{:02}{:02}{:02}",

@@ -15,6 +15,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+use crate::config::shell_path;
 use crate::error::{Error, Result};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -152,9 +153,12 @@ pub(crate) fn migrate_legacy_run_value() -> Vec<String> {
 }
 
 pub fn open_folder(path: &Path) -> Result<()> {
+    // 建目录可以继续用 `\\?\` 长路径，但 ShellExecuteW 不解析该前缀，
+    // 传进去会静默失败；这里统一剥掉前缀（普通路径原样返回）。
     std::fs::create_dir_all(path)?;
+    let display = shell_path(path);
     let verb = wide("open");
-    let target = wide(&path.display().to_string());
+    let target = wide(&display.display().to_string());
     let result = unsafe {
         ShellExecuteW(
             None,
@@ -167,7 +171,7 @@ pub fn open_folder(path: &Path) -> Result<()> {
     };
     // ShellExecuteW returns a fake HINSTANCE; <= 32 is the error range.
     if result.0 as usize <= 32 {
-        return Err(Error::new(format!("无法打开 {}", path.display())));
+        return Err(Error::new(format!("无法打开 {}", display.display())));
     }
     Ok(())
 }
@@ -234,8 +238,9 @@ pub fn pick_folder(current: &Path) -> Result<Option<PathBuf>> {
             CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
         dialog.SetOptions(dialog.GetOptions()? | FOS_PICKFOLDERS)?;
         // Open where the user already saves. A path that no longer exists just
-        // leaves the dialog at the shell default.
-        let start = wide(&current.display().to_string());
+        // leaves the dialog at the shell default. SHCreateItemFromParsingName
+        // 同样不解析 `\\?\`，先还原成普通路径，否则初始目录会被悄悄忽略。
+        let start = wide(&shell_path(current).display().to_string());
         if let Ok(item) =
             SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(start.as_ptr()), None)
         {
@@ -263,7 +268,7 @@ pub fn pick_image(current: &Path) -> Result<Option<PathBuf>> {
     unsafe {
         let dialog: IFileOpenDialog =
             CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
-        let start = wide(&current.display().to_string());
+        let start = wide(&shell_path(current).display().to_string());
         if let Ok(item) =
             SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(start.as_ptr()), None)
         {

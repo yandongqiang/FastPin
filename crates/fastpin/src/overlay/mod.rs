@@ -262,6 +262,9 @@ pub struct OverlayView {
     display_vd_origin: Option<(i32, i32)>,
     /// DPI / 显示器变化后的几何重同步任务是否已排队（避免观察点重复触发）。
     resync_pending: bool,
+    /// SetWindowPos 正在同步派发窗口消息：此时收到的 WM_MOVE / WM_SIZE 都是
+    /// 重同步自己造成的，必须直接丢弃，否则会再排一个定时器形成自我触发循环。
+    resync_self_change: bool,
     /// 显示器观察点：随 view 一起释放时退订，避免 app 级观察点无人回收。
     display_subscription: Option<Subscription>,
     hit: SelectionHitKind,
@@ -1165,6 +1168,7 @@ impl OverlayView {
             monitor_rects: Vec::new(),
             display_vd_origin: None,
             resync_pending: false,
+            resync_self_change: false,
             display_subscription: None,
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
@@ -1241,6 +1245,7 @@ impl OverlayView {
             monitor_rects: Vec::new(),
             display_vd_origin: None,
             resync_pending: false,
+            resync_self_change: false,
             display_subscription: None,
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
@@ -1542,7 +1547,9 @@ impl OverlayView {
     }
 
     fn schedule_display_resync(&mut self, cx: &mut Context<Self>) {
-        if self.resync_pending || !self.visible {
+        // 自触发屏蔽优先于 pending：SetWindowPos 同步派发的窗口事件到达时，
+        // 既不排队也不碰 pending，避免 50ms 定时器无限自我续期。
+        if !resync_should_schedule(self.resync_pending, self.resync_self_change) || !self.visible {
             return;
         }
         self.resync_pending = true;
@@ -1563,7 +1570,14 @@ impl OverlayView {
     }
 
     fn apply_display_resync(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // try/finally 语义：不论内层是否提前 return，pending 都只在几何真正
+        // 写回之后才清。SetWindowPos 会同步派发 WM_MOVE / WM_SIZE，若在入口
+        // 就清掉标志，这些自触发事件会立刻排下一轮 50ms 定时器。
+        self.apply_display_resync_inner(window, cx);
         self.resync_pending = false;
+    }
+
+    fn apply_display_resync_inner(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some((w, h)) = self.cap.as_ref().map(|c| (c.width, c.height)) else {
             return;
         };
@@ -1609,6 +1623,13 @@ impl OverlayView {
             self.origin_y = clamped.top;
             placement_changed = true;
         }
+        // 重同步改写过 origin 后必须同步写回 cap：GPU 重置恢复路径会再走
+        // sync_from_cap，若不写回就会把原点还原到旧坐标系 / 已拔掉的屏幕。
+        let (ox, oy) = (self.origin_x, self.origin_y);
+        if let Some(cap) = self.cap.as_mut() {
+            cap.origin_x = ox;
+            cap.origin_y = oy;
+        }
         self.monitor_rects = monitor_rects_for_origin(&monitors, self.origin_x, self.origin_y);
         if placement_changed && self.long.take().is_some() {
             // 坐标已平移 / 冻结屏已拔掉：继续滚动会把滚轮投到错误的窗口。
@@ -1623,16 +1644,28 @@ impl OverlayView {
             );
         }
         let outer = window_rect_for_client_area(hwnd, clamped);
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                outer.left,
-                outer.top,
-                outer.right - outer.left,
-                outer.bottom - outer.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+        let mut current = RECT::default();
+        let geometry_changed = if unsafe { GetWindowRect(hwnd, &mut current) }.is_ok() {
+            resync_geometry_changed(current, outer)
+        } else {
+            // 读不到当前几何时保守写回，避免漏掉真正的位置 / 尺寸变化。
+            true
+        };
+        if geometry_changed {
+            // guard 只在 SetWindowPos 调用期间生效：它同步派发窗口消息，
+            // 屏蔽标志必须可靠翻转，即使回调 panic 也不能留在 true。
+            let _guard = ResyncSelfChangeGuard::new(&mut self.resync_self_change);
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    outer.left,
+                    outer.top,
+                    outer.right - outer.left,
+                    outer.bottom - outer.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
         }
         cx.notify();
     }
@@ -3519,6 +3552,13 @@ impl OverlayView {
                 // refusal; keep the reason visible instead of closing silently.
                 crate::perf::log_app(&format!("long capture export: {msg}"));
                 self.show_panel("长截图失败", long_capture_error_text(&msg), false, cx);
+                // 失败也必须结束截图会话并清掉 BUSY，否则错误面板虽然可见，
+                // 用户却必须按 Esc 才能进行下一次截图。不能直接调用 finish()：
+                // 它会隐藏窗口，连带刚显示的错误面板一起消失。
+                let source = self.capture_source();
+                let cap = self.cap.take();
+                let perf = self.perf.borrow_mut().take();
+                crate::app::complete_region_shot(empty_result(), cap, perf, source, cx);
                 return;
             }
         }
@@ -5610,9 +5650,92 @@ fn shift_origin_for_desktop(origin: i32, vd_at_capture: i32, vd_now: i32) -> i32
     origin + (vd_now - vd_at_capture)
 }
 
+/// 是否可以排一轮几何重同步：已有任务在飞、或当前正在 SetWindowPos 的自触发
+/// 窗口里，都直接合并掉。纯函数，便于单测防止 50ms 定时器自我续期回归。
+fn resync_should_schedule(pending: bool, self_change: bool) -> bool {
+    !pending && !self_change
+}
+
+/// 当前窗口矩形与目标矩形是否不同。钳制后的 desired 与窗口现状一致时跳过
+/// SetWindowPos，从源头消除 WM_MOVE / WM_SIZE 自触发。纯函数。
+fn resync_geometry_changed(current: RECT, target: RECT) -> bool {
+    current.left != target.left
+        || current.top != target.top
+        || current.right != target.right
+        || current.bottom != target.bottom
+}
+
+/// 仅在一次 SetWindowPos 调用期间屏蔽自触发消息；Drop 负责复位，即使同步
+/// 回调 panic 也不会把屏蔽标志永久留在 true。
+struct ResyncSelfChangeGuard<'a> {
+    flag: &'a mut bool,
+}
+
+impl ResyncSelfChangeGuard<'_> {
+    fn new(flag: &mut bool) -> ResyncSelfChangeGuard<'_> {
+        *flag = true;
+        ResyncSelfChangeGuard { flag }
+    }
+}
+
+impl Drop for ResyncSelfChangeGuard<'_> {
+    fn drop(&mut self) {
+        *self.flag = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 已有 pending 或 SetWindowPos 自触发期间都不能再排定时器：否则
+    /// SetWindowPos → WM_MOVE/WM_SIZE → 新 50ms 任务 → SetWindowPos 无限循环。
+    #[test]
+    fn resync_should_schedule_only_when_idle_and_not_self_change() {
+        assert!(
+            resync_should_schedule(false, false),
+            "空闲且非自触发时才排一轮重同步"
+        );
+        assert!(
+            !resync_should_schedule(true, false),
+            "已有 pending 时合并，避免重复排队"
+        );
+        assert!(
+            !resync_should_schedule(false, true),
+            "SetWindowPos 自触发消息直接丢弃"
+        );
+    }
+
+    /// 钳制后 desired 与当前窗口矩形一致时跳过 SetWindowPos，从源头消除自触发。
+    #[test]
+    fn resync_skips_set_window_pos_when_geometry_is_unchanged() {
+        let current = RECT {
+            left: 100,
+            top: 200,
+            right: 1100,
+            bottom: 920,
+        };
+        let moved = RECT {
+            left: current.left + 1,
+            ..current
+        };
+        let resized = RECT {
+            right: current.right + 1,
+            ..current
+        };
+        assert!(
+            !resync_geometry_changed(current, current),
+            "几何一致时跳过 SetWindowPos"
+        );
+        assert!(
+            resync_geometry_changed(current, moved),
+            "位置变化时必须写回几何"
+        );
+        assert!(
+            resync_geometry_changed(current, resized),
+            "尺寸变化时必须写回几何"
+        );
+    }
 
     /// 显示器移除后冻结图矩形不能留在已不存在的屏幕上：整窗搬到并集左上角，
     /// 且尺寸不变（缩放冻结图会破坏像素对齐）。

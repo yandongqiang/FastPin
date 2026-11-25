@@ -696,8 +696,10 @@ pub enum ExportMode {
 
 /// Windows 传统路径上限（UTF-16 码元）。超过这个长度的路径必须走 `\\?\`。
 const MAX_PATH_CHARS: usize = 260;
-/// 超过此长度的绝对路径才加 `\\?\` 前缀，给扩展名与序号后缀留出余量。
-const LONG_PATH_THRESHOLD: usize = 240;
+/// 触发 `\\?\` 前缀的路径长度。这里必须给追加的文件名留出余量：主干下限
+/// 24 + 扩展名 3 + 分隔符/点及序号后缀约 7，父目录在 232–240 时即使本身不到
+/// MAX_PATH，拼上文件名也会超 260。
+const LONG_PATH_THRESHOLD: usize = 190;
 /// 文件名主干的硬上限，路径预算更紧时按预算进一步缩短。
 const MAX_FILENAME_STEM_CHARS: usize = 200;
 /// 父目录极深时仍保留的主干长度，避免算出空名字。
@@ -749,6 +751,22 @@ pub(crate) fn extended_path(p: &Path) -> PathBuf {
     } else {
         PathBuf::from(format!(r"\\?\{raw}"))
     }
+}
+
+/// 把 `\\?\` 长路径还原成 Shell API 能解析的普通 Win32 形式。
+/// `ShellExecuteW` / `SHCreateItemFromParsingName` 不认识 `\\?\` 前缀，直接传
+/// 长路径会静默失败；本函数把 `\\?\C:\...` 变成 `C:\...`，把
+/// `\\?\UNC\server\share` 变成 `\\server\share`。无前缀路径原样返回，因此
+/// 可重复调用（幂等）。
+pub fn shell_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    if let Some(local) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(local);
+    }
+    path.to_path_buf()
 }
 
 /// 按父目录已占用的长度计算文件名主干预算：`MAX_PATH - parent - ext - 余量`。
@@ -870,10 +888,11 @@ impl History {
     /// Directory history lives in. A configured path wins; otherwise the
     /// per-user application data folder.
     /// 历史模块的建目录/写索引/删除都在别的模块里，这里直接返回 `\\?\` 形式的
-    /// 长路径，调用方无需改动即可绕过 MAX_PATH（短路径原样返回）。
+    /// 长路径，调用方无需改动即可绕过 MAX_PATH（短路径原样返回）。相对目录先
+    /// 按 exe 所在目录绝对化；传给 Shell API 前请用 [`shell_path`] 去掉前缀。
     pub fn store_dir(&self) -> Result<PathBuf> {
         if let Some(dir) = &self.dir {
-            return Ok(extended_path(dir));
+            return Ok(extended_path(&resolve_configured_dir(dir.clone())));
         }
         let base =
             std::env::var("LOCALAPPDATA").map_err(|_| Error::new("LOCALAPPDATA is not set"))?;
@@ -1335,14 +1354,40 @@ pub fn parse_hex_color(text: &str) -> Option<u32> {
     }
 }
 
+/// 配置里手填的相对目录按 exe 所在目录解析，而不是进程当前目录：托盘/服务
+/// 启动时 CWD 可能是 System32，相对路径会写到系统目录或根本找不到。解析后
+/// 一律返回绝对路径，便于设置页、文件夹对话框和落盘代码看到同一位置。
+fn resolve_configured_dir(dir: PathBuf) -> PathBuf {
+    if dir.is_absolute() {
+        return dir;
+    }
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok());
+    match base {
+        Some(base) => {
+            let resolved = base.join(&dir);
+            crate::perf::log_app(&format!(
+                "配置中的相对目录 {} 按 exe 所在目录解析为 {}",
+                dir.display(),
+                resolved.display()
+            ));
+            resolved
+        }
+        None => dir,
+    }
+}
+
 /// Where saved PNGs land. A configured directory wins; otherwise
 /// `Pictures\FastPin`, the folder the build has always used. Not created here
 /// — the caller writes into it and `create_dir_all` right before.
-/// 这里保留用户配置原值供设置页/文件夹对话框显示；真正落盘前调用方必须用
-/// [`extended_path`] 转换，否则深目录下的截图会卡在 MAX_PATH 上写不进去。
+/// 这里保留用户可见的原始路径（相对目录已按 exe 位置绝对化）供设置页/文件
+/// 夹对话框显示；真正落盘前调用方必须用 [`extended_path`] 转换，否则深目录下
+/// 的截图会卡在 MAX_PATH 上写不进去。
 pub fn screenshot_dir() -> Result<PathBuf> {
     if let Some(dir) = get().screenshot.save_dir {
-        return Ok(dir);
+        return Ok(resolve_configured_dir(dir));
     }
     default_screenshot_dir()
 }
@@ -2482,6 +2527,50 @@ mod tests {
         assert!(
             normalized.starts_with(r"\\?\C:\b\"),
             "规范化后应为 C:\\b\\..."
+        );
+    }
+
+    /// Shell API 只认普通 Win32 路径：`\\?\` 必须剥掉，UNC 还原成 `\\server`。
+    #[test]
+    #[cfg(windows)]
+    fn shell_path_strips_extended_prefixes() {
+        let local = Path::new(r"\\?\C:\Users\me\FastPin\history");
+        assert_eq!(
+            shell_path(local),
+            PathBuf::from(r"C:\Users\me\FastPin\history"),
+            "本地长路径应去掉 \\?\\ 前缀"
+        );
+
+        let unc = Path::new(r"\\?\UNC\server\share\FastPin");
+        assert_eq!(
+            shell_path(unc),
+            PathBuf::from(r"\\server\share\FastPin"),
+            "UNC 长路径应还原为 \\server\\share"
+        );
+
+        let plain = Path::new(r"C:\Users\me\FastPin");
+        assert_eq!(shell_path(plain), plain.to_path_buf(), "无前缀路径原样返回");
+        assert_eq!(
+            shell_path(&shell_path(local)),
+            shell_path(local),
+            "重复调用应幂等"
+        );
+    }
+
+    /// 阈值必须为追加的文件名留余量：190 及以下不加前缀，200 必须加。
+    #[test]
+    #[cfg(windows)]
+    fn extended_path_threshold_reserves_room_for_file_name() {
+        let boundary = r"C:\".len();
+        let short = Path::new(r"C:\").join("d".repeat(190 - boundary));
+        assert_eq!(path_length(&short), 190, "测试路径长度应为 190");
+        assert_eq!(extended_path(&short), short, "190 及以下不应加 \\?\\ 前缀");
+
+        let long = Path::new(r"C:\").join("d".repeat(200 - boundary));
+        let text = extended_path(&long).to_string_lossy().into_owned();
+        assert!(
+            text.starts_with(r"\\?\C:\"),
+            "200 字符的父目录必须加 \\?\\ 前缀"
         );
     }
 

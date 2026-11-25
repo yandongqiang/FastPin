@@ -310,6 +310,9 @@ pub fn action_from_wparam(wp: usize) -> Option<HotkeyAction> {
 /// 完成后取走并显示明确错误。
 fn record_register_result(name: &str, result: windows::core::Result<()>) {
     if let Err(e) = result {
+        // 单独的截图失败标志供启动提示区分「仅紧急退出键被占用」：
+        // 后者也往失败文案里写记录，但截图热键（LL 或兜底）确实可用。
+        crate::hotkey::note_fallback_screenshot_failure();
         crate::hotkey::note_fallback_register_failure(&format!("{name}（{e}）"));
     }
 }
@@ -318,6 +321,7 @@ fn record_register_result(name: &str, result: windows::core::Result<()>) {
 pub fn register_fallback_hotkeys(hwnd: HWND, bindings: &HotkeyBindings) {
     // 每次（重）注册都从干净状态开始：只有本次的失败才该显示给用户。
     crate::hotkey::clear_fallback_register_failure();
+    crate::hotkey::clear_fallback_screenshot_failure();
     unsafe {
         let _ = UnregisterHotKey(Some(hwnd), 1);
         let _ = UnregisterHotKey(Some(hwnd), 2);

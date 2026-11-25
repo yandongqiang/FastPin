@@ -1615,9 +1615,11 @@ impl PinView {
             let (mut px, w, h) = match compose(&images) {
                 Ok(v) => v,
                 Err(e) => {
-                    // Background thread: the log is this path's error channel
-                    // today, but it now names the requested size and limit.
+                    // Background thread: keep the detailed log, but also show a
+                    // visible notice. report_error uses a NULL-hwnd MessageBoxW
+                    // and an atomic reentrancy guard, so any thread may call it.
                     crate::perf::log_app(&format!("pin export: {e}"));
+                    crate::app::report_error("贴图合成失败，请重试或关闭后重新进入编辑");
                     return;
                 }
             };

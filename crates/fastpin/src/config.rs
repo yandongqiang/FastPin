@@ -1294,16 +1294,31 @@ pub fn get() -> Settings {
             return settings.clone();
         }
     }
-    let text = read_file();
+    let result = read_file();
+    // 只有读到文本或文件不存在（首次启动）能按默认值继续并写缓存；其它
+    // 读取失败（杀软占用、同步冲突、权限）若把默认值缓存下来，下一次 save
+    // 就会把默认值整份写回原文件。先把原文件改名留档，save 写的是新文件，
+    // 用户仍可从 .broken-* 备份恢复；本次也不写缓存，避免污染后续读取。
+    let recoverable = load_text_is_recoverable(&result);
+    if !recoverable {
+        if let Ok(p) = path() {
+            quarantine_broken(&p, None);
+        }
+    }
+    let text = result.unwrap_or_default();
     // 语法错误 / 非对象根节点会让 parse 直接回默认值；若放任不管，下一次
     // 保存会把默认值整份写回，原配置永久丢失。先把损坏文件改名留档，
     // 之后的 save 写的是新文件，用户仍可从 .broken-* 备份恢复。
     if is_broken_config(&text) {
         if let Ok(p) = path() {
-            quarantine_broken(&p, &text);
+            quarantine_broken(&p, Some(&text));
         }
     }
     let loaded = parse(&text);
+    if !recoverable {
+        // 读失败时原文件可能还没隔离成功，绝不缓存默认值。
+        return loaded;
+    }
     let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
     guard.get_or_insert(loaded).clone()
 }
@@ -1334,11 +1349,22 @@ fn cache() -> &'static RwLock<Option<Settings>> {
     &CACHE
 }
 
-fn read_file() -> String {
-    path()
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default()
+/// 读配置文件，区分“文件不存在”与真正的 IO 失败。过去这里把所有错误都
+/// 吞成空串，让合法配置在读取失败时被当成空配置回默认值，随后被 save 覆盖。
+/// `path()` 失败（LOCALAPPDATA 未设置）也归为 NotFound，与首次启动同样处理。
+fn read_file() -> std::io::Result<String> {
+    let p = path().map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+    std::fs::read_to_string(p)
+}
+
+/// 读配置的结果是否能按“空配置=默认值”继续。只有读到文本和文件不存在
+/// （首次启动）成立；其它 IO 错误必须走隔离分支，否则默认值会被 save
+/// 写回并覆盖原文件。抽成纯函数便于覆盖各分支，不必注入真实 IO 错误。
+fn load_text_is_recoverable(result: &std::io::Result<String>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// 文本非空但 JSON 语法错误（尾逗号、半截文件）或根节点不是对象时，`parse`
@@ -1354,7 +1380,9 @@ fn is_broken_config(text: &str) -> bool {
 /// 撞名再加序号，避免多进程 / 多次启动互相覆盖。`rename` 而非复制，
 /// 让后续 `save` 写一份全新的 settings.json。成功记一条 app 日志，
 /// 失败静默返回 false（调用方照常用默认配置继续运行）。
-fn quarantine_broken(path: &Path, text: &str) -> bool {
+/// `text` 为 None 表示文件读不到（IO 错误）：跳过内容一致性校验直接改名，
+/// 这样才能保住原文件，不让默认值覆盖它。
+fn quarantine_broken(path: &Path, text: Option<&str>) -> bool {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1367,9 +1395,11 @@ fn quarantine_broken(path: &Path, text: &str) -> bool {
     let base = path.with_file_name(name);
 
     // 读取与隔离之间文件可能被另一进程修好：内容变了就不要动它，
-    // 更不能把一份有效配置搬走。
-    if std::fs::read_to_string(path).ok().as_deref() != Some(text) {
-        return false;
+    // 更不能把一份有效配置搬走。读不到文本时无从比对，直接隔离以保住原文件。
+    if let Some(text) = text {
+        if std::fs::read_to_string(path).ok().as_deref() != Some(text) {
+            return false;
+        }
     }
     for seq in 0..1024u32 {
         let candidate = if seq == 0 {
@@ -2295,7 +2325,7 @@ mod tests {
         // 尾逗号是语法错误，parse 会直接回默认值，必须先隔离原文件。
         let first = "{\"appearance\": \"Default Light\",}";
         std::fs::write(&path, first).expect("writes broken file");
-        assert!(quarantine_broken(&path, first));
+        assert!(quarantine_broken(&path, Some(first)));
         assert!(!path.exists(), "损坏文件应已被移走");
         let first_backups = backups(&dir, &prefix);
         assert_eq!(first_backups.len(), 1, "应留下一份备份");
@@ -2306,7 +2336,7 @@ mod tests {
         // 第二次损坏要另建备份（撞名加序号），不得覆盖第一次的内容。
         let second = "{\"screenshot\":";
         std::fs::write(&path, second).expect("writes second broken file");
-        assert!(quarantine_broken(&path, second));
+        assert!(quarantine_broken(&path, Some(second)));
         assert!(!path.exists());
         let all = backups(&dir, &prefix);
         assert_eq!(all.len(), 2, "第二次隔离应另建备份");
@@ -2322,6 +2352,61 @@ mod tests {
         for backup in all {
             let _ = std::fs::remove_file(backup);
         }
+    }
+
+    /// 读取失败（杀软/同步占用/权限）不能被当成空配置：加载路径会用
+    /// `quarantine_broken(.., None)` 把原文件改名留档，本次按默认值运行但
+    /// 不写缓存，下次读盘已是 NotFound 才会缓存默认值。这里覆盖“无文本
+    /// 可读”的隔离、备份内容保留，以及判定函数的各分支。
+    #[test]
+    fn read_failure_quarantines_original_and_keeps_backup() {
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "locked");
+        assert!(load_text_is_recoverable(&Ok(
+            r#"{"appearance":"Default Light"}"#.into()
+        )));
+        assert!(load_text_is_recoverable(&Err(not_found)));
+        assert!(!load_text_is_recoverable(&Err(denied)));
+
+        let unique = format!(
+            "settings-unreadable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("{unique}.json"));
+        let prefix = format!("{unique}.json.broken-");
+        // 合法配置：读取失败时绝不能被默认值覆盖，必须先原样留档。
+        let original = r#"{"translation":{"baseUrl":"https://api.example.com/v1"}}"#;
+        std::fs::write(&path, original).expect("writes valid config");
+        assert!(quarantine_broken(&path, None));
+        assert!(!path.exists(), "读取失败时原文件应已被隔离");
+        let backups: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("reads temp dir")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "应留下一份备份");
+        let saved = std::fs::read_to_string(&backups[0]).expect("reads backup");
+        assert_eq!(saved, original, "合法配置必须原样保留在备份中");
+        // 无文本可读时加载路径返回 parse("") 的默认值，且不写缓存。
+        let defaults = parse("");
+        assert_eq!(
+            defaults.translation.model, "gpt-4o-mini",
+            "读取失败时本次仍按默认配置继续运行"
+        );
+        assert_eq!(
+            defaults.translation.base_url, "",
+            "默认值不应带用户的 baseUrl"
+        );
+        let _ = std::fs::remove_file(&backups[0]);
     }
 
     #[test]

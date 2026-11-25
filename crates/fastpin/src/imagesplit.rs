@@ -419,10 +419,17 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
+/// 空目录算可复用，只有非空目录才占用名字。
+fn is_empty_dir(path: &Path) -> std::io::Result<bool> {
+    let mut entries = std::fs::read_dir(path)?;
+    Ok(entries.next().is_none())
+}
+
 /// Resolve an available `Split Images_<name>` path under `parent`, adding
-/// ` (n)` on collisions. The directory is *not* created here: callers write
-/// into a staging folder first and only rename it here once every tile
-/// succeeded, so a failed export never leaves half-written tiles behind.
+/// ` (n)` on collisions with a *non-empty* directory. The directory is *not*
+/// created here: callers write into a staging folder first and only rename it
+/// once every tile succeeded, so a failed export never leaves half-written
+/// tiles behind.
 fn resolve_export_directory(parent: &Path, image_name: &str) -> std::io::Result<PathBuf> {
     if !parent.is_dir() {
         return Err(std::io::Error::new(
@@ -440,7 +447,47 @@ fn resolve_export_directory(parent: &Path, image_name: &str) -> std::io::Result<
         let candidate = parent.join(&name);
         match candidate.try_exists() {
             Ok(false) => return Ok(candidate),
-            Ok(true) => continue,
+            Ok(true) => {
+                // 上次失败留下的空目录可以直接用；非空的才改用带序号的新目录。
+                if candidate.is_dir() && is_empty_dir(&candidate).unwrap_or(false) {
+                    return Ok(candidate);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "无法创建输出目录",
+    ))
+}
+
+/// 发布 staging 目录。`resolve_export_directory` 与 `rename` 之间有竞态：
+/// 两次导出可能同时选中同一个名字，后完成的那次 rename 会得到 AlreadyExists。
+/// 此时先清掉空壳，再重新解析到带序号的目录重试，而不是报"导出目录落盘失败"。
+fn publish_staging_directory(
+    staging: &Path,
+    first_choice: PathBuf,
+    parent: &Path,
+    image_name: &str,
+) -> std::io::Result<PathBuf> {
+    let mut final_dir = first_choice;
+    for _ in 0..64 {
+        // Windows 上 rename 到已存在的空目录也会失败，先移除空壳。
+        if final_dir.is_dir() && is_empty_dir(&final_dir).unwrap_or(false) {
+            let _ = std::fs::remove_dir(&final_dir);
+        }
+        match std::fs::rename(staging, &final_dir) {
+            Ok(()) => return Ok(final_dir),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    || e.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
+            {
+                // 期间有别的导出占了这个名字（Windows 上 rename 到非空目录
+                // 返回 DirectoryNotEmpty 而非 AlreadyExists），顺着序号再找一个。
+                final_dir = resolve_export_directory(parent, image_name)?;
+            }
             Err(e) => return Err(e),
         }
     }
@@ -543,8 +590,9 @@ pub fn export_split_images(
     }
     // Every tile is on disk: publish the folder atomically. `directory` is
     // assigned only here, so a rename failure also reports an empty directory.
-    match std::fs::rename(&staging, &final_dir) {
-        Ok(()) => result.directory = final_dir,
+    // 冲突时由 publish_staging_directory 改用带序号的目录重试。
+    match publish_staging_directory(&staging, final_dir, parent, image_name) {
+        Ok(dir) => result.directory = dir,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&staging);
             result.saved_count = 0;
@@ -793,13 +841,49 @@ mod tests {
         let first = resolve_export_directory(&tmp.0, "Shot").expect("first path");
         assert!(first.ends_with("Split Images_Shot"));
         std::fs::create_dir(&first).expect("create first");
+        // 空目录可复用，所以这里写入一张切片让它成为真正的冲突。
+        std::fs::write(first.join("1.png"), b"first").expect("occupy first");
         let second = resolve_export_directory(&tmp.0, "Shot").expect("second path");
         assert!(second.ends_with("Split Images_Shot (2)"));
         std::fs::create_dir(&second).expect("create second");
+        std::fs::write(second.join("1.png"), b"second").expect("occupy second");
         let third = resolve_export_directory(&tmp.0, "Shot").expect("third path");
         assert!(third.ends_with("Split Images_Shot (3)"));
         // Resolving alone must not create any directory.
         assert!(!third.exists());
+    }
+
+    /// 只有非空目录才算冲突：上次失败留下的空目录应被复用，不必无意义地
+    /// 追加 `(2)` 后缀。
+    #[test]
+    fn resolve_export_directory_reuses_an_empty_directory() {
+        let tmp = TempDir::new("empty");
+        let first = resolve_export_directory(&tmp.0, "Shot").expect("first path");
+        std::fs::create_dir(&first).expect("create empty dir");
+        let reused = resolve_export_directory(&tmp.0, "Shot").expect("reused path");
+        assert_eq!(reused, first, "空目录应被复用而不是追加序号");
+    }
+
+    /// 模拟两个导出同时选中同一目录：后发布者遇到 AlreadyExists 时应改用
+    /// 带序号的目录，而不是报"导出目录落盘失败"。
+    #[test]
+    fn publish_retries_with_a_numbered_directory_on_collision() {
+        let tmp = TempDir::new("publish");
+        let base = tmp.0.join("Split Images_Shot");
+        std::fs::create_dir(&base).expect("create occupied dir");
+        std::fs::write(base.join("1.png"), b"other export").expect("occupy dir");
+        // 模拟竞态：解析时还是空的，等发布时已被另一次导出占满。
+        let first_choice = base.clone();
+        let staging = create_staging_directory(&tmp.0).expect("staging");
+        std::fs::write(staging.join("1.png"), b"tile").expect("tile");
+        let published =
+            publish_staging_directory(&staging, first_choice, &tmp.0, "Shot").expect("publish");
+        assert!(
+            published.ends_with("Split Images_Shot (2)"),
+            "冲突后应发布到带序号的目录，而不是报落盘失败"
+        );
+        assert!(published.join("1.png").is_file());
+        assert!(!staging.exists());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -11,7 +11,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::hotkey::{
-    decide, is_modifier_vk, vk_name, Hotkey, HotkeyAction, HotkeyBindings, KeyEvent, VK_SNAPSHOT,
+    decide, hotkey_from_mask, is_modifier_vk, key_event_from_mask, modifier_mask, vk_name, Hotkey,
+    HotkeyAction, HotkeyBindings, KeyEvent, VK_SNAPSHOT,
 };
 use crate::platform::{WM_FASTPIN_HOTKEY, WM_FASTPIN_HOTKEY_RECORDED};
 
@@ -25,6 +26,11 @@ static TARGET: AtomicIsize = AtomicIsize::new(0);
 static HOOK: AtomicIsize = AtomicIsize::new(0);
 static RECORD_HOOK: AtomicIsize = AtomicIsize::new(0);
 static BINDINGS: std::sync::Mutex<Option<HotkeyBindings>> = std::sync::Mutex::new(None);
+
+/// PrtSc 的修饰键锁存：keydown 写入，keyup 用 swap 读走并清零。用户常常先松
+/// 修饰键再松 PrtSc，抬键现场读不到修饰键；同一时刻只有一个 PrtSc 动作在途，
+/// 单个 AtomicU8 足够，swap 保证读与清一步完成。
+static PRTSC_MODS: AtomicU8 = AtomicU8::new(0);
 
 pub fn set_hook_target(hwnd: HWND, bindings: HotkeyBindings) {
     TARGET.store(hwnd.0 as isize, Ordering::SeqCst);
@@ -45,6 +51,8 @@ pub fn start_recording() {
     // 新的录制会话丢弃此前（例如启动时紧急退出热键）的注册失败，避免把旧的
     // 占用误报成这次录制的结果。
     crate::hotkey::clear_fallback_register_failure();
+    // 切到录制钩子前清掉上一次动作钩子可能残留的 PrtSc 锁存值。
+    PRTSC_MODS.store(0, Ordering::SeqCst);
     // Clicking a second hotkey field while one is already recording must not
     // strand the first hook: overwriting RECORD_HOOK would leak the handle and
     // leave two recorders swallowing the same keys.
@@ -132,14 +140,26 @@ unsafe extern "system" fn record_proc(code: i32, wparam: WPARAM, lparam: LPARAM)
             // Same edge the matcher uses, so PrtSc — which usually reports only
             // key-up — is recordable at all.
             let complete = if vk == VK_SNAPSHOT { key_up } else { key_down };
-            if complete {
-                let hotkey = Hotkey::new(
+            // 和动作钩子一样：PrtSc 的抬键用 keydown 锁存的修饰键，避免先松
+            // 修饰键时把组合录成裸键；swap 读完即清零。
+            let mask = if vk == VK_SNAPSHOT && key_up {
+                PRTSC_MODS.swap(0, Ordering::SeqCst)
+            } else {
+                let live = modifier_mask(
                     down(VK_CONTROL.0),
                     down(VK_MENU.0),
                     down(VK_SHIFT.0),
                     down(VK_LWIN.0) || down(VK_RWIN.0),
-                    vk,
                 );
+                if vk == VK_SNAPSHOT && key_down {
+                    PRTSC_MODS.store(live, Ordering::SeqCst);
+                }
+                live
+            };
+            let hotkey = hotkey_from_mask(vk, mask);
+            let valid = hotkey.is_bindable();
+            // 裸键不投递也不吞：无效绑定不该被保存，也不该吃掉普通输入。
+            if complete && valid {
                 unsafe {
                     let _ = PostMessageW(
                         Some(hook_target()),
@@ -149,9 +169,11 @@ unsafe extern "system" fn record_proc(code: i32, wparam: WPARAM, lparam: LPARAM)
                     );
                 }
             }
-            // Both edges: otherwise PrtSc still opens the Windows snip overlay
-            // behind the settings window.
-            return LRESULT(1);
+            // PrtSc 两个边沿都吞，否则系统截图覆盖层会在设置页后面弹出来；
+            // 有效组合照旧吞。裸键不再吞，录制卡住时也不会吃掉普通输入。
+            if vk == VK_SNAPSHOT || valid {
+                return LRESULT(1);
+            }
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -221,13 +243,27 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         let key_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
         let key_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
         if key_up || key_down {
-            let ev = KeyEvent {
-                vk: info.vkCode as u16,
-                ctrl: down(VK_CONTROL.0),
-                alt: down(VK_MENU.0),
-                shift: down(VK_SHIFT.0),
-                win: down(VK_LWIN.0) || down(VK_RWIN.0),
-                key_up,
+            let vk = info.vkCode as u16;
+            // PrtSc 的抬键可能发生在修饰键松开之后；keydown 时锁存修饰键，
+            // keyup 用锁存值判定并清零，避免组合失效、系统截图工具弹出。
+            let ev = if vk == VK_SNAPSHOT && key_up {
+                key_event_from_mask(vk, PRTSC_MODS.swap(0, Ordering::SeqCst), true)
+            } else {
+                let ctrl = down(VK_CONTROL.0);
+                let alt = down(VK_MENU.0);
+                let shift = down(VK_SHIFT.0);
+                let win = down(VK_LWIN.0) || down(VK_RWIN.0);
+                if vk == VK_SNAPSHOT && key_down {
+                    PRTSC_MODS.store(modifier_mask(ctrl, alt, shift, win), Ordering::SeqCst);
+                }
+                KeyEvent {
+                    vk,
+                    ctrl,
+                    alt,
+                    shift,
+                    win,
+                    key_up,
+                }
             };
             if let Some(bindings) = BINDINGS.lock().ok().and_then(|g| *g) {
                 let d = decide(&bindings, ev);
@@ -321,8 +357,12 @@ fn register_one(hwnd: HWND, id: i32, hotkey: Hotkey) -> windows::core::Result<()
 pub fn register_emergency_quit(hwnd: HWND) {
     const VK_Q: u32 = 0x51;
     let mods = MOD_CONTROL | MOD_ALT | HOT_KEY_MODIFIERS(0x0004) | MOD_NOREPEAT;
+    // 这里本身就是 RegisterHotKey 兜底（LL 钩子不处理退出键），无需再套一层。
     let result = unsafe { RegisterHotKey(Some(hwnd), EMERGENCY_QUIT_ID, mods, VK_Q) };
     let ok = result.is_ok();
+    // 成败写入独立的 AtomicBool：失败文案会被重注册 / 新录制会话清空，
+    // app.rs 不能靠它判断这个热键到底能不能用。
+    crate::hotkey::note_emergency_quit_registered(ok);
     if let Err(e) = result {
         crate::hotkey::note_fallback_register_failure(&format!("紧急退出热键（{e}）"));
     }
@@ -345,4 +385,5 @@ pub fn unregister_fallback_hotkeys(hwnd: HWND) {
     unsafe {
         let _ = UnregisterHotKey(Some(hwnd), EMERGENCY_QUIT_ID);
     }
+    crate::hotkey::note_emergency_quit_registered(false);
 }

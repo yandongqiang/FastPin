@@ -123,13 +123,59 @@ pub fn set_api_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// 读取 vault 条目密码的三种结果。`Retrieve` 成功只证明条目存在，密码
+/// 读取的瞬时错误必须与"确认是空密码"分开，否则会把有效 key 误判成可删除。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VaultPassword {
+    Valid(String),
+    Empty,
+    Unreadable,
+}
+
+impl VaultPassword {
+    /// 从条目读取密码并分类。任何读取失败都归入 Unreadable，绝不降级成 Empty。
+    fn read(cred: &PasswordCredential) -> Self {
+        if cred.RetrievePassword().is_err() {
+            return Self::Unreadable;
+        }
+        match cred.Password() {
+            Ok(password) if !password.is_empty() => Self::Valid(password.to_string()),
+            Ok(_) => Self::Empty,
+            Err(_) => Self::Unreadable,
+        }
+    }
+}
+
+/// 迁移决策。current 只有在确认密码为空时才可能被替换；读取失败或已有效
+/// 时一律保留。legacy 无可用值时同样保留 current，绝不留下"两边都删空"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MigrationDecision {
+    AlreadyMigrated,
+    SkipUnreadableCurrent,
+    ReplaceEmptyCurrent(String),
+    NothingToMigrate,
+}
+
+/// 纯函数：把 current/legacy 的读取结果映射成迁移动作，便于单测覆盖
+/// Credential Manager 难以在测试中模拟的瞬时失败分支。
+fn migration_decision(current: VaultPassword, legacy: VaultPassword) -> MigrationDecision {
+    match current {
+        VaultPassword::Valid(_) => MigrationDecision::AlreadyMigrated,
+        VaultPassword::Unreadable => MigrationDecision::SkipUnreadableCurrent,
+        VaultPassword::Empty => match legacy {
+            VaultPassword::Valid(key) => MigrationDecision::ReplaceEmptyCurrent(key),
+            VaultPassword::Empty | VaultPassword::Unreadable => MigrationDecision::NothingToMigrate,
+        },
+    }
+}
+
 /// Copies a key stored under the legacy credential resource to
 /// `FastPin.Translation`, then drops the old entry. A missing legacy entry is
 /// the normal case (fresh install), not an error. Best-effort: every failure is
 /// reported as a note for the caller to log and never blocks startup.
-/// A new entry with an empty/unreadable password is not a migration: it is
-/// replaced with the legacy value (or removed together with an empty legacy
-/// value) so a broken entry cannot lose the user's key.
+/// A current entry whose password reads as empty is replaced with the legacy
+/// value; an unreadable password counts as a transient failure and leaves both
+/// entries untouched so a failed read can never delete a valid key.
 pub(crate) fn migrate_legacy_vault() -> Vec<String> {
     let vault = match PasswordVault::new() {
         Ok(v) => v,
@@ -141,44 +187,56 @@ pub(crate) fn migrate_legacy_vault() -> Vec<String> {
     let Ok(old) = vault.Retrieve(&legacy, &account) else {
         return Vec::new();
     };
-    if old.RetrievePassword().is_err() {
+    let legacy_password = VaultPassword::read(&old);
+    if matches!(&legacy_password, VaultPassword::Unreadable) {
         return vec!["vault: legacy translation key unreadable".into()];
     }
-    let Ok(password) = old.Password() else {
-        return vec!["vault: legacy translation key unreadable".into()];
-    };
-    // Retrieve 成功只说明条目存在，不代表 key 可用：Credential Manager 里
-    // 可能残留一条空密码的坏条目。只有非空密码才算"已迁移"，否则必须用
-    // legacy 的值补写，避免删掉 legacy 后用户的 key 彻底丢失。
+
+    // Retrieve 成功只说明条目存在，不代表 key 可用；读不到密码就更不能删。
+    // 当前条目不存在时按 Empty 处理：没有 key 需要保护，legacy 有值就补写。
     let existing = vault.Retrieve(&current, &account).ok();
-    let already = existing.as_ref().is_some_and(|cred| {
-        cred.RetrievePassword().is_ok() && cred.Password().is_ok_and(|p| !p.is_empty())
-    });
-    if !already {
-        // Add 不接受同名条目：先删掉不可用的旧条目（若存在），保证幂等。
-        if let Some(cred) = existing {
-            if let Err(e) = vault.Remove(&cred) {
-                return vec![format!(
-                    "vault: could not remove broken FastPin entry ({e})"
-                )];
-            }
+    let current_password = existing
+        .as_ref()
+        .map(VaultPassword::read)
+        .unwrap_or(VaultPassword::Empty);
+
+    match migration_decision(current_password, legacy_password) {
+        // 幂等：current 已有有效 key，绝不动它，只清掉重复的 legacy 条目。
+        MigrationDecision::AlreadyMigrated => match vault.Remove(&old) {
+            Ok(()) => vec!["vault: duplicate legacy translation key removed".into()],
+            Err(_) => vec!["vault: FastPin key already present, legacy entry not removed".into()],
+        },
+        // Credential Manager 瞬时错误：立即返回，current 与 legacy 都保留。
+        MigrationDecision::SkipUnreadableCurrent => {
+            vec!["vault: cannot read current translation key, skip migration".into()]
         }
-        if !password.is_empty() {
-            let cred =
-                match PasswordCredential::CreatePasswordCredential(&current, &account, &password) {
-                    Ok(c) => c,
-                    Err(e) => return vec![format!("vault: could not create FastPin entry ({e})")],
-                };
+        // legacy 无可用值：不删 current（即使它是空条目），也不动 legacy。
+        MigrationDecision::NothingToMigrate => {
+            vec!["vault: no translation key to migrate".into()]
+        }
+        MigrationDecision::ReplaceEmptyCurrent(key) => {
+            // current 已确认为空，Add 不接受同名条目：先删坏条目再补写。
+            if let Some(cred) = existing {
+                if let Err(e) = vault.Remove(&cred) {
+                    return vec![format!("vault: could not remove empty FastPin entry ({e})")];
+                }
+            }
+            let cred = match PasswordCredential::CreatePasswordCredential(
+                &current,
+                &account,
+                &HSTRING::from(key.as_str()),
+            ) {
+                Ok(c) => c,
+                Err(e) => return vec![format!("vault: could not create FastPin entry ({e})")],
+            };
             if let Err(e) = vault.Add(&cred) {
                 return vec![format!("vault: could not save FastPin entry ({e})")];
             }
+            match vault.Remove(&old) {
+                Ok(()) => vec!["vault: moved translation key to FastPin.Translation".into()],
+                Err(_) => vec!["vault: FastPin key written, legacy entry not removed".into()],
+            }
         }
-    }
-    match vault.Remove(&old) {
-        Ok(()) if already => vec!["vault: duplicate legacy translation key removed".into()],
-        Ok(()) if password.is_empty() => vec!["vault: empty legacy translation key removed".into()],
-        Ok(()) => vec!["vault: moved translation key to FastPin.Translation".into()],
-        Err(_) => vec!["vault: FastPin key written, legacy entry not removed".into()],
     }
 }
 
@@ -442,6 +500,89 @@ fn cracked_scheme(url: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_keeps_a_valid_current_key_in_every_legacy_state() {
+        // current 已有效：无论 legacy 是什么，都不进入删除/补写路径。
+        let decision = migration_decision(
+            VaultPassword::Valid("sk-current".into()),
+            VaultPassword::Valid("sk-legacy".into()),
+        );
+        assert_eq!(
+            decision,
+            MigrationDecision::AlreadyMigrated,
+            "a valid current key is already migrated"
+        );
+        let decision = migration_decision(
+            VaultPassword::Valid("sk-current".into()),
+            VaultPassword::Empty,
+        );
+        assert_eq!(
+            decision,
+            MigrationDecision::AlreadyMigrated,
+            "an empty legacy entry must not remove a valid current key"
+        );
+        let decision = migration_decision(
+            VaultPassword::Valid("sk-current".into()),
+            VaultPassword::Unreadable,
+        );
+        assert_eq!(
+            decision,
+            MigrationDecision::AlreadyMigrated,
+            "an unreadable legacy entry must not remove a valid current key"
+        );
+    }
+
+    #[test]
+    fn migration_never_deletes_an_unreadable_current_key() {
+        // Credential Manager 瞬时错误必须立即停下，不能当成空密码删条目。
+        let decision = migration_decision(
+            VaultPassword::Unreadable,
+            VaultPassword::Valid("sk-legacy".into()),
+        );
+        assert_eq!(
+            decision,
+            MigrationDecision::SkipUnreadableCurrent,
+            "an unreadable current key must be preserved, not replaced"
+        );
+        let decision = migration_decision(VaultPassword::Unreadable, VaultPassword::Empty);
+        assert_eq!(
+            decision,
+            MigrationDecision::SkipUnreadableCurrent,
+            "an empty legacy must not turn a failed current read into a deletion"
+        );
+        let decision = migration_decision(VaultPassword::Unreadable, VaultPassword::Unreadable);
+        assert_eq!(
+            decision,
+            MigrationDecision::SkipUnreadableCurrent,
+            "both unreadable still preserves the current entry"
+        );
+    }
+
+    #[test]
+    fn migration_only_replaces_a_confirmed_empty_current_with_a_legacy_key() {
+        let decision = migration_decision(
+            VaultPassword::Empty,
+            VaultPassword::Valid("sk-legacy".into()),
+        );
+        assert_eq!(
+            decision,
+            MigrationDecision::ReplaceEmptyCurrent("sk-legacy".into()),
+            "a confirmed empty current is replaced with the legacy key"
+        );
+        let decision = migration_decision(VaultPassword::Empty, VaultPassword::Empty);
+        assert_eq!(
+            decision,
+            MigrationDecision::NothingToMigrate,
+            "no valid legacy key means the current entry stays untouched"
+        );
+        let decision = migration_decision(VaultPassword::Empty, VaultPassword::Unreadable);
+        assert_eq!(
+            decision,
+            MigrationDecision::NothingToMigrate,
+            "an unreadable legacy key is not proof of an empty key"
+        );
+    }
 
     #[test]
     fn api_key_cannot_inject_extra_http_headers() {

@@ -25,7 +25,7 @@ use crate::collage::{
     StitchingMethod, TemplateType,
 };
 use crate::overlay::theme;
-use printpdf::{ColorBits, ColorSpace, Image, ImageXObject, Mm, PdfDocument, Px};
+use printpdf::{ColorBits, ColorSpace, Image, ImageFilter, ImageXObject, Mm, PdfDocument, Px};
 
 actions!(
     collage_window,
@@ -209,6 +209,25 @@ fn alloc_canvas(w: u32, h: u32, bg: [u8; 4]) -> Option<Vec<u8>> {
     Some(canvas)
 }
 
+/// 解析 PNG 导出路径：同名文件已存在时依次尝试 `name (1).png`、
+/// `name (2).png`…，避免同秒重复导出覆盖上一次的结果。路径探测通过
+/// `exists` 注入，便于纯函数单测不碰磁盘。
+fn unique_png_export_path(dir: &Path, stem: &str, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    for suffix in 0..u32::MAX {
+        let name = if suffix == 0 {
+            format!("{stem}.png")
+        } else {
+            format!("{stem} ({suffix}).png")
+        };
+        let candidate = dir.join(name);
+        if !exists(&candidate) {
+            return candidate;
+        }
+    }
+    // 序号耗尽（实际上不可能）时退回原名，交给写入逻辑报错。
+    dir.join(format!("{stem}.png"))
+}
+
 /// Nearest-neighbour blit that scales `src` into `rect` and applies the
 /// rotation/flip transform. Coordinates are normalised, so the destination
 /// rect may have any size relative to the source.
@@ -285,9 +304,13 @@ impl PdfImage {
     }
 }
 
-/// Flattens an entry to the packed RGB `ImageXObject` printpdf embeds, applying
-/// the same rotation/flip as the on-screen preview.
-fn pdf_image_xobject(item: &PdfImage) -> Option<ImageXObject> {
+/// Flattens an entry to the `ImageXObject` printpdf embeds, applying
+/// the same rotation/flip as the on-screen preview. `quality` (clamped to
+/// 1..100) is the PDF 图片质量 setting: the RGB raster is JPEG-encoded at that
+/// quality and embedded with a DCTDecode filter, so lowering it actually
+/// shrinks the PDF. If the encoder refuses the buffer, the lossless RGB data
+/// is embedded instead rather than dropping the image.
+fn pdf_image_xobject(item: &PdfImage, quality: u8) -> Option<ImageXObject> {
     let (tw, th) = item.to_collage_item().transformed_size();
     if tw == 0 || th == 0 {
         return None;
@@ -327,14 +350,24 @@ fn pdf_image_xobject(item: &PdfImage) -> Option<ImageXObject> {
         }
     }
 
+    // 质量来自 config.screenshot.pdf.image_quality（已桥接到 PdfSettings），
+    // 这里再 clamp 一次，防止手改配置写出 0 或 >100。
+    let quality = quality.clamp(1, 100);
+    let mut jpeg = Vec::new();
+    let compressed = jpeg.try_reserve_exact(bytes / 2 + 1).is_ok()
+        && image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality)
+            .encode(&rgb, tw, th, image::ExtendedColorType::Rgb8)
+            .is_ok();
+
     Some(ImageXObject {
         width: Px(tw as usize),
         height: Px(th as usize),
         color_space: ColorSpace::Rgb,
         bits_per_component: ColorBits::Bit8,
         interpolate: true,
-        image_data: rgb,
-        image_filter: None,
+        image_data: if compressed { jpeg } else { rgb },
+        // printpdf 0.6 把 ImageFilter::DCT 写成 PDF 的 /DCTDecode。
+        image_filter: compressed.then_some(ImageFilter::DCT),
         clipping_bbox: None,
     })
 }
@@ -419,7 +452,7 @@ fn generate_pdfs(
                     }
                     continue;
                 };
-                let Some(xobj) = pdf_image_xobject(item) else {
+                let Some(xobj) = pdf_image_xobject(item, pdf_settings.image_quality) else {
                     // Zero-sized or over-budget: never embed a blank image.
                     if !skipped.contains(&item_index) {
                         skipped.push(item_index);
@@ -558,6 +591,8 @@ pub struct CollageWindowView {
 
     status: SharedString,
     export_result: Option<ExportResult>,
+    /// 导出中标志：PNG 同步导出、PDF 后台导出共用，防止双击/切格式并发写盘。
+    exporting: bool,
 }
 
 #[derive(Clone)]
@@ -585,6 +620,7 @@ impl CollageWindowView {
             pdf_previews: Vec::new(),
             status: "添加图片开始拼图".into(),
             export_result: None,
+            exporting: false,
         };
         if let Some((pixels, w, h, name)) = initial {
             this.add_image(pixels, w, h, &name);
@@ -862,7 +898,15 @@ impl CollageWindowView {
     }
 
     fn on_export_png(&mut self, _: &ExportCollagePng, cx: &mut Context<Self>) {
+        // 同一窗口的 PNG/PDF 导出共用一个忙标志：导出中再次点击或按快捷键
+        // 直接早退，避免重复写盘（PDF 后台任务尚未结束尤其明显）。
+        if self.exporting {
+            return;
+        }
+        self.exporting = true;
+
         if self.images.is_empty() {
+            self.exporting = false;
             self.status = SharedString::from("没有图片可导出");
             cx.notify();
             return;
@@ -870,6 +914,7 @@ impl CollageWindowView {
 
         let layout = self.collage_layout.as_ref();
         if layout.is_none() || !layout.unwrap().is_valid() {
+            self.exporting = false;
             self.status = SharedString::from("布局无效");
             cx.notify();
             return;
@@ -878,6 +923,7 @@ impl CollageWindowView {
         let layout = layout.unwrap();
         let (w, h) = layout.size;
         let Some(mut canvas) = alloc_canvas(w, h, self.collage_settings.background_rgba) else {
+            self.exporting = false;
             self.status = SharedString::from("拼图尺寸超出内存预算");
             cx.notify();
             return;
@@ -900,33 +946,36 @@ impl CollageWindowView {
             );
         }
 
-        let path = match crate::config::screenshot_dir() {
-            Ok(dir) => {
-                let time = Local::now();
-                let name = format!(
-                    "FastPin_Collage_{:04}{:02}{:02}_{:02}{:02}{:02}.png",
-                    time.year(),
-                    time.month(),
-                    time.day(),
-                    time.hour(),
-                    time.minute(),
-                    time.second()
-                );
-                dir.join(name)
-            }
+        let dir = match crate::config::screenshot_dir() {
+            Ok(dir) => dir,
             Err(_) => {
+                self.exporting = false;
                 self.status = SharedString::from("无法获取截图目录");
                 cx.notify();
                 return;
             }
         };
+        let time = Local::now();
+        let name = format!(
+            "FastPin_Collage_{:04}{:02}{:02}_{:02}{:02}{:02}",
+            time.year(),
+            time.month(),
+            time.day(),
+            time.hour(),
+            time.minute(),
+            time.second()
+        );
+        // 同秒再导出改用 `name (n).png`，不覆盖前一次结果。
+        let path = unique_png_export_path(&dir, &name, |p| p.exists());
 
         if let Err(e) = write_png_file(&path, &canvas, w, h, w * 4) {
+            self.exporting = false;
             self.status = SharedString::from(format!("导出失败: {}", e));
             cx.notify();
             return;
         }
 
+        self.exporting = false;
         self.export_result = Some(ExportResult {
             png_path: Some(path.clone()),
             pdf_path: None,
@@ -937,12 +986,22 @@ impl CollageWindowView {
     }
 
     fn on_export_pdf(&mut self, _: &ExportCollagePdf, cx: &mut Context<Self>) {
+        // 与 PNG 共用忙标志：后台任务未结束前再次触发直接早退。关窗后任务
+        // 不强杀，但完成回调用的是弱窗口句柄，窗口已关时 update 会失败，
+        // 不会往已关窗口写状态。
+        if self.exporting {
+            return;
+        }
+        self.exporting = true;
+
         if self.images.is_empty() {
+            self.exporting = false;
             self.status = SharedString::from("没有图片可导出");
             cx.notify();
             return;
         }
         if !crate::collage::validate_pdf_settings(&self.pdf_settings).is_empty() {
+            self.exporting = false;
             self.status = SharedString::from("PDF 设置无效，请检查边距/纸张大小");
             cx.notify();
             return;
@@ -951,6 +1010,7 @@ impl CollageWindowView {
         let dir = match crate::config::screenshot_dir() {
             Ok(dir) => dir,
             Err(_) => {
+                self.exporting = false;
                 self.status = SharedString::from("无法获取截图目录");
                 cx.notify();
                 return;
@@ -994,6 +1054,7 @@ impl CollageWindowView {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                this.exporting = false;
                 let PdfExportResult {
                     written,
                     error,
@@ -2645,5 +2706,35 @@ mod tests {
     fn skipped_warning_is_empty_only_when_nothing_was_skipped() {
         assert_eq!(pdf_skipped_warning(0), "");
         assert_eq!(pdf_skipped_warning(2), "（已跳过 2 张无法嵌入的图片）");
+    }
+
+    #[test]
+    fn png_export_path_adds_numbered_suffix_on_collision() {
+        use std::collections::HashSet;
+        let dir = Path::new("out");
+        let stem = "FastPin_Collage_20260101_120000";
+        let none: HashSet<PathBuf> = HashSet::new();
+        assert_eq!(
+            unique_png_export_path(dir, stem, |p| none.contains(p)),
+            dir.join(format!("{stem}.png")),
+            "首次导出应保持原名"
+        );
+        let one: HashSet<PathBuf> = [dir.join(format!("{stem}.png"))].into_iter().collect();
+        assert_eq!(
+            unique_png_export_path(dir, stem, |p| one.contains(p)),
+            dir.join(format!("{stem} (1).png")),
+            "第一次冲突应使用 (1) 后缀"
+        );
+        let two: HashSet<PathBuf> = [
+            dir.join(format!("{stem}.png")),
+            dir.join(format!("{stem} (1).png")),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            unique_png_export_path(dir, stem, |p| two.contains(p)),
+            dir.join(format!("{stem} (2).png")),
+            "连续冲突应递增后缀"
+        );
     }
 }

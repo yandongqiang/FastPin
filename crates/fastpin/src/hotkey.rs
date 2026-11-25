@@ -1,6 +1,7 @@
 //! Hotkey matching used by the low-level hook. Tests call these functions
 //! without a message loop.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 pub const VK_SNAPSHOT: u16 = 0x2C;
@@ -41,6 +42,21 @@ pub fn take_fallback_register_failure() -> Option<String> {
     lock_failure().take()
 }
 
+/// 紧急退出热键（Ctrl+Alt+Shift+Q）是否真的注册成功。托盘不可用模式里
+/// app.rs 的提示文案要据此决定是否告诉用户可以用它退出；不能用上面的失败
+/// 文案判断，因为重注册 / 新录制会话会清空那份文案。
+static EMERGENCY_QUIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// hook 在 RegisterHotKey(Ctrl+Alt+Shift+Q) 之后立即写入成败。
+pub fn note_emergency_quit_registered(ok: bool) {
+    EMERGENCY_QUIT_REGISTERED.store(ok, Ordering::SeqCst);
+}
+
+/// app.rs 查询紧急退出热键是否可用（hotkey 是 pub 模块，可直接按此路径调用）。
+pub fn emergency_quit_registered() -> bool {
+    EMERGENCY_QUIT_REGISTERED.load(Ordering::SeqCst)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyAction {
     Region,
@@ -66,6 +82,16 @@ impl Hotkey {
             win,
             vk,
         }
+    }
+
+    pub const fn has_modifier(self) -> bool {
+        self.ctrl || self.alt || self.shift || self.win
+    }
+
+    /// 除 PrtSc 单键外至少要有一个修饰键。裸键会被 LL 钩子全局吞掉，
+    /// 用户从此在系统里输入不了这个字母，所以视为无效绑定。
+    pub const fn is_bindable(self) -> bool {
+        self.vk == VK_SNAPSHOT || self.has_modifier()
     }
 
     pub fn matches(&self, ev: KeyEvent) -> bool {
@@ -239,30 +265,41 @@ pub fn parse(text: &str) -> Option<Hotkey> {
             _ => vk = vk_from_name(part),
         }
     }
-    Some(Hotkey::new(ctrl, alt, shift, win, vk?))
+    let hotkey = Hotkey::new(ctrl, alt, shift, win, vk?);
+    // 裸键（非 PrtSc）会被全局吞键，拒绝成为有效绑定；调用方据此回退默认值。
+    if !hotkey.is_bindable() {
+        return None;
+    }
+    Some(hotkey)
 }
 
 /// Finds a combo none of the already-kept actions uses. The preferred one is
 /// the action's own default; if that is taken too, spare F-keys with the same
 /// modifiers are tried so every action ends up with a distinct combo.
 fn spare_binding(used: &[Hotkey], preferred: Hotkey) -> Hotkey {
-    if !used.contains(&preferred) {
+    if !used.contains(&preferred) && preferred.is_bindable() {
         return preferred;
     }
-    for vk in 0x70u16..=0x7B {
-        let candidate = Hotkey::new(
+    // 裸键（除 PrtSc）不是有效绑定；备用键至少补一个 Ctrl，否则 decide
+    // 会把它当成无效组合，冲突让位后动作反而彻底失效。
+    let (ctrl, alt, shift, win) = if preferred.has_modifier() {
+        (
             preferred.ctrl,
             preferred.alt,
             preferred.shift,
             preferred.win,
-            vk,
-        );
+        )
+    } else {
+        (true, false, false, false)
+    };
+    for vk in 0x70u16..=0x7B {
+        let candidate = Hotkey::new(ctrl, alt, shift, win, vk);
         if !used.contains(&candidate) {
             return candidate;
         }
     }
-    // 三个动作不可能占满 12 个 F 键；保底返回原组合，冲突至少已通过日志暴露。
-    preferred
+    // 三个动作不可能占满 12 个带修饰键的 F 键；保底也返回一个有效组合。
+    Hotkey::new(ctrl, alt, shift, win, 0x70)
 }
 
 /// True for the modifier keys themselves. Recording ignores these: they refine
@@ -272,6 +309,38 @@ pub fn is_modifier_vk(vk: u16) -> bool {
         vk,
         0x10 | 0x11 | 0x12 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5 | 0x5B | 0x5C
     )
+}
+
+/// 修饰键位掩码：Ctrl=1、Alt=2、Shift=4、Win=8。PrtSc 的抬键现场修饰键
+/// 可能已经被松开，所以 keydown 时把掩码锁存到原子量，keyup 用它还原事件。
+pub const MOD_CTRL: u8 = 1;
+pub const MOD_ALT: u8 = 2;
+pub const MOD_SHIFT: u8 = 4;
+pub const MOD_WIN: u8 = 8;
+
+pub fn modifier_mask(ctrl: bool, alt: bool, shift: bool, win: bool) -> u8 {
+    (if ctrl { MOD_CTRL } else { 0 })
+        | (if alt { MOD_ALT } else { 0 })
+        | (if shift { MOD_SHIFT } else { 0 })
+        | (if win { MOD_WIN } else { 0 })
+}
+
+/// 用锁存的掩码组装 KeyEvent，判定逻辑因此保持为可单测的纯函数。
+pub fn key_event_from_mask(vk: u16, mask: u8, key_up: bool) -> KeyEvent {
+    KeyEvent {
+        vk,
+        ctrl: mask & MOD_CTRL != 0,
+        alt: mask & MOD_ALT != 0,
+        shift: mask & MOD_SHIFT != 0,
+        win: mask & MOD_WIN != 0,
+        key_up,
+    }
+}
+
+/// 录制钩子在 PrtSc 抬键时用同一份锁存掩码还原组合。
+pub fn hotkey_from_mask(vk: u16, mask: u8) -> Hotkey {
+    let ev = key_event_from_mask(vk, mask, false);
+    Hotkey::new(ev.ctrl, ev.alt, ev.shift, ev.win, vk)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,7 +366,14 @@ pub struct HotkeyDecision {
 /// when the modifiers match a binding. Unbound variants (e.g. Win+PrtSc when
 /// fullscreen is plain PrtSc) are not swallowed.
 pub fn decide(bindings: &HotkeyBindings, ev: KeyEvent) -> HotkeyDecision {
-    let bound = bindings.action_for_combo(ev);
+    // 旧配置里可能残留无修饰键的裸键绑定；这里按当前事件的组合再挡一层，
+    // 裸键（除 PrtSc 外）绝不吞系统按键。`action_for_combo` 返回的是动作枚举，
+    // 绑定合法性要看事件对应的键组合本身。
+    let combo = Hotkey::new(ev.ctrl, ev.alt, ev.shift, ev.win, ev.vk);
+    let bound = combo
+        .is_bindable()
+        .then(|| bindings.action_for_combo(ev))
+        .flatten();
     let swallow = bound.is_some();
     let action = bound.filter(|_| {
         if ev.vk == VK_SNAPSHOT {
@@ -476,5 +552,102 @@ mod tests {
         let d = decide(&b, ev(VK_W, true, true, false, false, false));
         assert_eq!(d.action, Some(HotkeyAction::CopyOnly));
         assert!(d.swallow);
+    }
+
+    /// 裸键（无修饰键）会被 LL 钩子全局吞掉，必须在解析入口就拒绝；
+    /// PrtSc 单键是唯一例外。
+    #[test]
+    fn bare_keys_are_rejected_by_parse() {
+        assert_eq!(parse("A"), None);
+        assert_eq!(parse("F5"), None);
+        assert_eq!(parse("Space"), None);
+        assert_eq!(
+            parse("Ctrl+A"),
+            Some(Hotkey::new(true, false, false, false, VK_A))
+        );
+        assert_eq!(
+            parse("PrtSc"),
+            Some(Hotkey::new(false, false, false, false, VK_SNAPSHOT))
+        );
+    }
+
+    #[test]
+    fn from_settings_replaces_bare_keys_with_defaults() {
+        let stored = crate::config::Hotkeys {
+            region: "A".into(),
+            copy_only: "F5".into(),
+            fullscreen: "PrtSc".into(),
+        };
+        let b = HotkeyBindings::from_settings(&stored);
+        let d = HotkeyBindings::poc_defaults();
+        assert_eq!(b.region, d.region);
+        assert_eq!(b.copy_only, d.copy_only);
+        assert_eq!(b.fullscreen, d.fullscreen);
+    }
+
+    /// 旧配置里残留的裸键绑定也必须被 decide 拦下，两个边沿都不吞。
+    #[test]
+    fn bare_key_binding_is_never_swallowed() {
+        let b = HotkeyBindings {
+            region: Hotkey::new(false, false, false, false, VK_A),
+            copy_only: HotkeyBindings::poc_defaults().copy_only,
+            fullscreen: HotkeyBindings::poc_defaults().fullscreen,
+        };
+        for key_up in [false, true] {
+            let d = decide(&b, ev(VK_A, false, false, false, false, key_up));
+            assert_eq!(d.action, None);
+            assert!(!d.swallow, "key_up={key_up}");
+        }
+    }
+
+    #[test]
+    fn duplicate_plain_prtsc_gets_a_bindable_spare() {
+        let stored = crate::config::Hotkeys {
+            region: "PrtSc".into(),
+            copy_only: "Ctrl+Alt+A".into(),
+            fullscreen: "PrtSc".into(),
+        };
+        let b = HotkeyBindings::from_settings(&stored);
+        assert_eq!(
+            b.region,
+            Hotkey::new(false, false, false, false, VK_SNAPSHOT)
+        );
+        assert_ne!(b.fullscreen, b.region);
+        assert!(b.fullscreen.is_bindable(), "备用组合不能是裸键");
+        assert!(b.fullscreen.has_modifier(), "备用组合应补上修饰键");
+    }
+
+    /// PrtSc 抬键时用 keydown 锁存的修饰键（而不是现场状态）判定。
+    #[test]
+    fn prtsc_keyup_uses_latched_mods() {
+        let b = HotkeyBindings {
+            region: HotkeyBindings::poc_defaults().region,
+            copy_only: HotkeyBindings::poc_defaults().copy_only,
+            fullscreen: Hotkey::new(true, false, false, false, VK_SNAPSHOT),
+        };
+        // 用户先松 Ctrl 再松 PrtSc：现场读到 0，但 keydown 锁存了 Ctrl。
+        let latched = modifier_mask(true, false, false, false);
+        let d = decide(&b, key_event_from_mask(VK_SNAPSHOT, latched, true));
+        assert_eq!(d.action, Some(HotkeyAction::Fullscreen));
+        assert!(d.swallow);
+        // 若误用现场状态则不触发也不吞键，系统截图工具会弹出来。
+        let live = 0;
+        let d_live = decide(&b, key_event_from_mask(VK_SNAPSHOT, live, true));
+        assert_eq!(d_live.action, None);
+        assert!(!d_live.swallow);
+    }
+
+    #[test]
+    fn modifier_mask_round_trip() {
+        let mask = modifier_mask(true, true, false, true);
+        let ev = key_event_from_mask(VK_A, mask, false);
+        assert_eq!(
+            (ev.ctrl, ev.alt, ev.shift, ev.win),
+            (true, true, false, true)
+        );
+        assert_eq!(
+            hotkey_from_mask(VK_A, mask),
+            Hotkey::new(true, true, false, true, VK_A)
+        );
     }
 }

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::ERROR_CANCELLED;
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
     WinHttpQueryHeaders, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
@@ -301,6 +302,67 @@ fn asset_download_url(version: &str) -> String {
     format!("https://github.com/{GITHUB_REPO}/releases/download/v{v}/FastPin-v{v}-x64-setup.exe")
 }
 
+/// 下载完成后的安装包名：`seq == 1` 用发布资产原名，撞名则追加 `-2`、`-3`…。
+/// 不覆盖旧文件：上一次下载的安装包可能正在运行，覆盖会失败或破坏它。
+fn installer_candidate_name(version: &str, seq: u32) -> String {
+    let file = asset_file_name(version);
+    if seq == 1 {
+        return file;
+    }
+    let stem = file.strip_suffix(".exe").unwrap_or(&file);
+    format!("{stem}-{seq}.exe")
+}
+
+/// 把 `.part` 原子改名为最终安装包名。Windows 上目标已存在时 `rename` 会失败，
+/// 所以逐个候选尝试；只有确认是「目标已存在」才换下一个名字。
+fn finalize_download(part: &Path, dir: &Path, version: &str) -> Result<PathBuf> {
+    for seq in 1..=999u32 {
+        let candidate = dir.join(installer_candidate_name(version, seq));
+        // 有些平台上 rename 会直接覆盖目标，所以先主动跳过已存在的名字。
+        if candidate.exists() {
+            continue;
+        }
+        match fs::rename(part, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(_) if candidate.exists() => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::new("安装包命名冲突过多，无法保存"))
+}
+
+/// 用 ShellExecuteW 拉起下载好的安装包。`runas` 请求管理员权限；若失败且不是
+/// 用户明确拒绝 UAC，再退回 `open` 试一次（例如策略不允许 runas 的环境）。
+pub fn launch_installer(path: &Path) -> Result<()> {
+    if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("exe") {
+        return Err(Error::new("安装程序不存在或已失效，请重新下载"));
+    }
+    for verb in ["runas", "open"] {
+        let wide_verb = nul_terminated(verb);
+        let target = nul_terminated(&path.to_string_lossy());
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR(wide_verb.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecuteW 把失败码伪装成 HINSTANCE；UAC 被拒时返回 1223（>32），
+        // 不能只看 <= 32，否则用户点了“否”也会被当成启动成功、毫无反馈。
+        let code = result.0 as usize;
+        if code == ERROR_CANCELLED.0 as usize {
+            return Err(Error::new("已取消安装：请在用户账户控制提示中选择“是”"));
+        }
+        if code > 32 {
+            return Ok(());
+        }
+    }
+    Err(Error::new("无法启动安装程序，请手动到下载目录运行"))
+}
+
 fn is_redirect(status: u32) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
@@ -555,9 +617,10 @@ pub fn cleanup_downloads() {
     cleanup_part_files(&download_dir(), PART_MAX_AGE);
 }
 
-/// Download the installer for `version` and return the path to a temporary
-/// file. No shell execution, extraction or installation happens here; the
-/// caller decides what to do with the returned path.
+/// Download the installer for `version` and return the path to the final
+/// installer file (streamed into a `.part` first, then renamed atomically).
+/// No shell execution, extraction or installation happens here; the caller
+/// decides what to do with the returned path.
 ///
 /// Blocking. Call it off the UI thread. `on_progress` is called once before
 /// the first read (with `received == 0` and the parsed `Content-Length`) and
@@ -621,7 +684,9 @@ pub fn download_release_asset(
     let path = unique_temp_path(&dir, version);
 
     match stream_body_to_file(session.request.0, &path, total, &mut on_progress) {
-        Ok(()) => Ok(path),
+        // 写完后立刻改名：`.part` 会被 24 小时清理任务删除，而且没有安装器
+        // 会用它。改名在同目录内完成，是原子操作，撞名时换序号而非覆盖。
+        Ok(()) => finalize_download(&path, &dir, version),
         Err(e) => {
             let _ = fs::remove_file(&path);
             Err(e)
@@ -725,6 +790,31 @@ mod tests {
         // A tag that already carries `v` produces exactly the same URL.
         assert_eq!(asset_download_url("v0.3.0"), asset_download_url("0.3.0"));
         assert!(asset_download_url("0.3.0").ends_with(asset_file_name("0.3.0").as_str()));
+    }
+
+    #[test]
+    fn installer_name_keeps_asset_name_and_adds_sequence_on_collision() {
+        assert_eq!(
+            installer_candidate_name("0.3.0", 1),
+            "FastPin-v0.3.0-x64-setup.exe",
+            "首次下载沿用发布资产的文件名"
+        );
+        assert_eq!(
+            installer_candidate_name("0.3.0", 2),
+            "FastPin-v0.3.0-x64-setup-2.exe",
+            "撞名时追加序号，不覆盖旧安装包"
+        );
+        assert_eq!(
+            installer_candidate_name("v0.3.0-beta", 3),
+            "FastPin-v0.3.0-beta-x64-setup-3.exe",
+            "版本号前缀与序号同时生效"
+        );
+    }
+
+    #[test]
+    fn launcher_refuses_missing_or_non_executable_paths() {
+        assert!(launch_installer(Path::new("C:/definitely/missing/FastPin.exe")).is_err());
+        assert!(launch_installer(Path::new("C:/definitely/missing/FastPin.part")).is_err());
     }
 
     #[test]

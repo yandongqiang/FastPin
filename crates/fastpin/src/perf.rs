@@ -3,7 +3,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::Result;
 
@@ -269,11 +269,18 @@ impl Target {
     }
 }
 
+/// 后台 writer 的消息：普通日志行，或「写完前面所有行并 flush 后回执」的同步信号。
+/// 用专用命令消息而非哨兵字符串，避免与任意日志正文冲突。
+enum LogMsg {
+    Line(String),
+    Flush(mpsc::SyncSender<()>),
+}
+
 /// 全局唯一的发送端。`OnceLock` 保证只初始化一次且线程安全；
 /// `try_send(&self)` 无需加锁即可被任意线程并发调用。
-static LOG_SENDER: OnceLock<SyncSender<String>> = OnceLock::new();
+static LOG_SENDER: OnceLock<SyncSender<LogMsg>> = OnceLock::new();
 
-fn log_sender() -> &'static SyncSender<String> {
+fn log_sender() -> &'static SyncSender<LogMsg> {
     LOG_SENDER.get_or_init(|| {
         let (tx, rx) = mpsc::sync_channel(LOG_QUEUE_CAPACITY);
         if std::thread::Builder::new()
@@ -288,6 +295,20 @@ fn log_sender() -> &'static SyncSender<String> {
     })
 }
 
+/// 退出前调用：把队列里尚未落盘的日志写完并逐句柄 flush，返回时日志已安全落盘。
+/// `LOG_SENDER` 是进程级单例、永不 drop，writer 原先只能靠 `recv` 返回 Err 才退出，
+/// 末尾的「退出前尽力冲刷」因此永远走不到；这里改为显式发一条 Flush 命令并等回执。
+/// 阻塞发送保证 Flush 排在此前所有 try_send 的行之后（FIFO），回执时它们都已落盘。
+/// 超时上限防止慢盘把退出路径挂死；writer 不存在或回执超时一律静默降级。
+pub fn flush_logs() {
+    let tx = log_sender();
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    if tx.send(LogMsg::Flush(reply_tx)).is_err() {
+        return; // writer 未启动/已退出，没有可冲刷的日志
+    }
+    let _ = reply_rx.recv_timeout(Duration::from_secs(2));
+}
+
 fn append_log(target: Target, msg: &str) {
     let line = format!("{} {msg}\n", now_stamp());
     enqueue(target, line);
@@ -296,7 +317,7 @@ fn append_log(target: Target, msg: &str) {
 /// 非阻塞入队：队列满（Full）或 writer 已退出（Disconnected）时丢弃该行。
 fn enqueue(target: Target, line: String) {
     let msg = format!("{}{TAG_SEP}{line}", target.tag());
-    let _ = log_sender().try_send(msg);
+    let _ = log_sender().try_send(LogMsg::Line(msg));
 }
 
 fn parse_msg(msg: String) -> Option<(Target, String)> {
@@ -395,7 +416,8 @@ fn flush(handle: &mut Option<BufWriter<std::fs::File>>) {
 
 /// writer 主循环：阻塞取首条，随后尽量排空队列凑成一批，再按目标批量写、
 /// 批量 flush（句柄长开复用）。`create_dir_all` 只在这里执行一次。
-fn writer_loop(rx: Receiver<String>) {
+/// 队列里出现 Flush 命令时，先把此前积攒的整批写完并 flush，再回执。
+fn writer_loop(rx: Receiver<LogMsg>) {
     // 目录只创建一次；失败则 writer 静默退出，日志降级为丢弃。
     let Some(dir) = cached_log_dir().cloned() else {
         return;
@@ -423,13 +445,34 @@ fn writer_loop(rx: Receiver<String>) {
 
     // 阻塞等待第一条；所有发送端 drop 时 recv 返回 Err -> 线程退出。
     while let Ok(first) = rx.recv() {
+        // 首条就是 Flush：没有新行可写，直接冲刷已有句柄并回执。
+        let first_line = match first {
+            LogMsg::Line(msg) => parse_msg(msg),
+            LogMsg::Flush(reply) => {
+                flush_all_handles(&mut app_f, &mut crash_f, &mut diag_f);
+                let _ = reply.send(());
+                continue;
+            }
+        };
+
         let mut batch: Vec<(Target, String)> = Vec::new();
-        if let Some(parsed) = parse_msg(first) {
+        if let Some(parsed) = first_line {
             batch.push(parsed);
         }
+        // 排空队列凑批；遇到 Flush 立即停手，保证回执发生在这批写完并 flush 之后。
+        // 排在 Flush 之后的消息留给下一轮，不影响「回执时前面的行都已落盘」。
+        let mut pending_reply = None;
         while let Ok(more) = rx.try_recv() {
-            if let Some(parsed) = parse_msg(more) {
-                batch.push(parsed);
+            match more {
+                LogMsg::Line(msg) => {
+                    if let Some(parsed) = parse_msg(msg) {
+                        batch.push(parsed);
+                    }
+                }
+                LogMsg::Flush(reply) => {
+                    pending_reply = Some(reply);
+                    break;
+                }
             }
         }
 
@@ -481,14 +524,25 @@ fn writer_loop(rx: Receiver<String>) {
         }
 
         // 每批结束统一 flush 一次（而非每次 log_* 调用都 flush）。
-        flush(&mut app_f);
-        flush(&mut crash_f);
-        flush(&mut diag_f);
+        // Flush 回执必须在这之后：调用方据此认为它之前的所有行都已落盘。
+        flush_all_handles(&mut app_f, &mut crash_f, &mut diag_f);
+        if let Some(reply) = pending_reply {
+            let _ = reply.send(());
+        }
     }
     // 退出前尽力冲刷，减少进程退出时丢失最后一批的可能。
-    flush(&mut app_f);
-    flush(&mut crash_f);
-    flush(&mut diag_f);
+    flush_all_handles(&mut app_f, &mut crash_f, &mut diag_f);
+}
+
+/// 三个长开句柄一起 flush；抽出供每批收尾与 Flush 回执共用。
+fn flush_all_handles(
+    app_f: &mut Option<BufWriter<std::fs::File>>,
+    crash_f: &mut Option<BufWriter<std::fs::File>>,
+    diag_f: &mut Option<BufWriter<std::fs::File>>,
+) {
+    flush(app_f);
+    flush(crash_f);
+    flush(diag_f);
 }
 fn missing_localappdata() -> crate::error::Error {
     crate::error::Error::new("LOCALAPPDATA is not set")

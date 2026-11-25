@@ -2262,6 +2262,16 @@ impl SettingsView {
         crate::platform::stop_recording();
         self.next_recording_seq();
 
+        // 裸键（如单独按 A）一旦保存，全局钩子会吞掉系统里每一次该按键。
+        // hook 侧解析入口也会拒绝裸键，这里在录制入口再拦一道：PrtSc
+        // 可单独使用，其余组合至少要有 Ctrl / Alt / Shift / Win。
+        // 这里直接退出录制，与 10 秒超时的收尾方式保持一致。
+        if !recording_hotkey_acceptable(pressed) {
+            self.fail("热键至少需要 Ctrl / Alt / Shift / Win 中的一个（PrtSc 除外）");
+            cx.notify();
+            return;
+        }
+
         let text = hotkey::format(pressed);
         // Two actions on one combo means one of them silently never fires.
         // Compare the effective bindings, not the raw strings: a bad string
@@ -2479,6 +2489,16 @@ impl SettingsView {
                 }
                 let _ = tx.send(Msg::Progress(progress));
             });
+            if worker_cancel.load(Ordering::Acquire) {
+                // 关窗已置位取消标记：轮询任务会立刻退出并 drop rx，Done 发到
+                // 断开的通道也没人处理。worker 自己删掉已落盘的安装包，
+                // 避免留下无人认领、要等下次启动才被清理的孤儿文件。
+                if let Ok(path) = &outcome {
+                    let _ = std::fs::remove_file(path);
+                }
+                flag.store(true, Ordering::Release);
+                return;
+            }
             let _ = tx.send(Msg::Done(outcome.map_err(|e| e.to_string())));
             flag.store(true, Ordering::Release);
         });
@@ -2552,6 +2572,19 @@ impl SettingsView {
                 cx.notify();
             }
         }
+    }
+
+    /// 以管理员权限拉起下载好的安装包；UAC 被拒时 launch_installer 会返回
+    /// 明确的错误，而不是静默无反应。
+    fn install_downloaded(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.downloaded_installer.clone() else {
+            return;
+        };
+        match crate::update::launch_installer(&path) {
+            Ok(()) => self.ok("已启动安装程序；请在用户账户控制提示中确认"),
+            Err(e) => self.fail(e.to_string()),
+        }
+        cx.notify();
     }
 
     // ---- chrome ------------------------------------------------------------
@@ -4265,7 +4298,10 @@ impl SettingsView {
         ];
         // A key on a plaintext endpoint is the one case where the vault is not
         // enough: show a two-click acknowledgement and gate the runtime on it.
+        // 空地址只是「翻译不可用」，不是「正在用明文 HTTP」；is_insecure_http
+        // 对空串/解析失败也返回 true，必须先排除空值再显示警告。
         if !self.saved_api_key.trim().is_empty()
+            && !self.settings.translation.base_url.trim().is_empty()
             && crate::translate::is_insecure_http(&self.settings.translation.base_url)
         {
             let acknowledged = self.settings.translation.allow_insecure_http;
@@ -5044,7 +5080,7 @@ impl SettingsView {
             }
         )
         .into();
-        widgets::rows(vec![
+        let mut rows = vec![
             widgets::row(crate::APP_NAME, "轻量截图与文字识别工具。")
                 .child(widgets::control(widgets::muted_text(version))),
             widgets::row("检查更新", "从发布页获取最新版本。")
@@ -5054,7 +5090,19 @@ impl SettingsView {
                 "下载官方安装包到 %LOCALAPPDATA%\\FastPin\\downloads，不经过浏览器。",
             )
             .child(widgets::control(download_button)),
-        ])
+        ];
+        // 安装包落盘后才出现安装入口；点击以管理员权限运行，失败有明确反馈。
+        if self.downloaded_installer.is_some() {
+            rows.push(
+                widgets::row("安装更新", "以管理员权限运行下载好的安装包。").child(
+                    widgets::control(widgets::button("update-install", "安装更新").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.install_downloaded(cx)),
+                    )),
+                ),
+            );
+        }
+        widgets::rows(rows)
     }
 
     /// Renders an already-computed hit list. The caller reuses the same search
@@ -5335,6 +5383,13 @@ fn settings_persist_merge(
         model::force_page_fields(&mut merged, snapshot, page);
     }
     merged
+}
+
+/// 录制时接受的热键判定：除 PrtSc 外必须带 Ctrl / Alt / Shift / Win 中至少一个。
+/// 裸键会被全局钩子一直吞掉，保存后日常输入全部失灵，必须在录制入口拦下；
+/// PrtSc 沿用系统截图键的习惯，允许单独使用。
+fn recording_hotkey_acceptable(pressed: Hotkey) -> bool {
+    pressed.vk == hotkey::VK_SNAPSHOT || pressed.ctrl || pressed.alt || pressed.shift || pressed.win
 }
 
 /// Gallery source-filter predicate. `"all"` accepts everything; other values
@@ -5780,6 +5835,67 @@ mod tests {
         assert!(
             body.find("self.force_page = None").unwrap() > body.find("Ok(()) =>").unwrap(),
             "失败分支不得清除 force_page，供下次重试"
+        );
+    }
+
+    #[test]
+    fn recording_rejects_bare_keys_except_prtsc() {
+        let bare_a = Hotkey::new(false, false, false, false, hotkey::VK_A);
+        let prtsc = Hotkey::new(false, false, false, false, hotkey::VK_SNAPSHOT);
+        let ctrl_a = Hotkey::new(true, false, false, false, hotkey::VK_A);
+        let alt_a = Hotkey::new(false, true, false, false, hotkey::VK_A);
+        let shift_a = Hotkey::new(false, false, true, false, hotkey::VK_A);
+        let win_a = Hotkey::new(false, false, false, true, hotkey::VK_A);
+
+        assert!(
+            !recording_hotkey_acceptable(bare_a),
+            "裸 A 必须拒绝，否则全局钩子会吞掉日常输入"
+        );
+        assert!(recording_hotkey_acceptable(prtsc), "PrtSc 是唯一允许的裸键");
+        assert!(recording_hotkey_acceptable(ctrl_a), "Ctrl 组合可用");
+        assert!(recording_hotkey_acceptable(alt_a), "Alt 组合可用");
+        assert!(recording_hotkey_acceptable(shift_a), "Shift 组合可用");
+        assert!(recording_hotkey_acceptable(win_a), "Win 组合可用");
+    }
+
+    #[test]
+    fn recording_validates_bare_keys_before_persisting() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("fn hotkey_recorded(")
+            .expect("hotkey_recorded is defined");
+        let end = source
+            .find("fn set_autostart(")
+            .expect("set_autostart follows hotkey_recorded");
+        let body = &source[start..end];
+        let check = body
+            .find("recording_hotkey_acceptable(pressed)")
+            .expect("录制入口必须校验裸键");
+        let save = body.find("self.persist(cx)").expect("成功路径会保存");
+        assert!(check < save, "校验必须在保存之前");
+        assert!(
+            body.contains("热键至少需要 Ctrl / Alt / Shift / Win 中的一个"),
+            "拒绝时给出中文提示"
+        );
+    }
+
+    #[test]
+    fn cancelled_download_removes_its_file() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("fn download_update(")
+            .expect("download_update is defined");
+        let end = source
+            .find("fn open_downloaded_folder(")
+            .expect("open_downloaded_folder follows download_update");
+        let body = &source[start..end];
+        assert!(
+            body.contains("worker_cancel.load(Ordering::Acquire)"),
+            "worker 必须再次检查取消标记"
+        );
+        assert!(
+            body.contains("std::fs::remove_file(path)"),
+            "取消后必须删除已落盘的安装包，避免孤儿文件"
         );
     }
 

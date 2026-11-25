@@ -259,6 +259,8 @@ impl Default for CollageSettings {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CollageLayout {
     pub size: (u32, u32),
+    /// 实际排布行数：自定义网格会按图片数扩张，不再受配置行数上限约束。
+    pub rows: u32,
     pub rects: Vec<RectPx>,
     pub error: String,
 }
@@ -658,6 +660,7 @@ pub fn calculate_collage_layout(
                 .saturating_add(border2);
 
             let mut y = settings.border;
+            layout.rows = items.len() as u32;
             for (w, item_h) in sizes {
                 let x = settings.border.saturating_add((max_w - w) / 2);
                 layout.rects.push(RectPx {
@@ -699,6 +702,7 @@ pub fn calculate_collage_layout(
                 .saturating_add(border2);
 
             let mut x = settings.border;
+            layout.rows = 1;
             for (item_w, h) in sizes {
                 let y = settings.border.saturating_add((max_h - h) / 2);
                 layout.rects.push(RectPx {
@@ -712,9 +716,14 @@ pub fn calculate_collage_layout(
             layout.size = (w, max_h.saturating_add(border2));
         }
         Direction::Custom => {
-            // Grid: rows × columns.
-            let rows = settings.rows.max(1);
+            // Grid: rows × columns. 图片数超过 rows×columns 时按实际需要的
+            // 行数扩张画布，否则多出来的图会落到画布之外，在预览和导出中
+            // 被 blit_image 静默裁掉。
             let cols = settings.columns.max(1);
+            let cols_usize = cols as usize;
+            let needed_rows = u32::try_from(items.len().div_ceil(cols_usize)).unwrap_or(u32::MAX);
+            let rows = settings.rows.max(1).max(needed_rows);
+            layout.rows = rows;
 
             // Compute max cell size.
             let max_cell_w = items
@@ -740,7 +749,6 @@ pub fn calculate_collage_layout(
                 .saturating_add(settings.spacing.saturating_mul(rows - 1))
                 .saturating_add(border2);
 
-            let cols_usize = cols as usize;
             for (idx, item) in items.iter().enumerate() {
                 let col = (idx % cols_usize) as u32;
                 let row = (idx / cols_usize) as u32;
@@ -910,6 +918,37 @@ mod tests {
                 height: 100
             }
         );
+    }
+
+    /// 图片数超过 rows×columns 时行数和画布高度必须跟着扩张，保证每张图
+    /// 都落在画布内，不会被预览/导出的 blit_image 静默裁掉。
+    #[test]
+    fn custom_grid_expands_rows_when_items_exceed_capacity() {
+        let items: Vec<CollageItem> = (0..5).map(|i| item(i, 100, 100, "x")).collect();
+        let settings = CollageSettings {
+            direction: Direction::Custom,
+            rows: 2,
+            columns: 2,
+            spacing: 10,
+            border: 5,
+            ..Default::default()
+        };
+        let layout = calculate_collage_layout(&items, &settings);
+        assert_eq!(layout.rows, 3, "5 张图、2 列应扩张为 3 行");
+        assert_eq!(layout.rects.len(), 5, "所有图片都应参与布局");
+        assert_eq!(
+            layout.size,
+            (220, 330),
+            "3 行网格高度应为 3×100 + 2×10 + 5×2"
+        );
+        for (idx, rect) in layout.rects.iter().enumerate() {
+            assert!(
+                (rect.x as u64) + (rect.width as u64) <= layout.size.0 as u64
+                    && (rect.y as u64) + (rect.height as u64) <= layout.size.1 as u64,
+                "第 {} 张图越出画布: {rect:?}",
+                idx + 1
+            );
+        }
     }
 
     /// 手工改配置时 spacing 可能被写成 u32::MAX。乘法必须饱和到上限，

@@ -171,6 +171,9 @@ pub struct SplitWindowView {
     quality: u8,
     export_result: Option<SplitExportResult>,
     status: SharedString,
+    /// 导出中标志：后台任务未结束时再次点击/按快捷键直接早退，
+    /// 避免并发导出抢同一个输出目录。
+    exporting: bool,
 }
 
 impl SplitWindowView {
@@ -192,6 +195,7 @@ impl SplitWindowView {
             quality: export.clamped_quality(),
             export_result: None,
             status: "请选择一张图片开始切图。".into(),
+            exporting: false,
         };
         if let Some((pixels, w, h, name)) = initial {
             this.set_image(pixels, w, h, name);
@@ -277,12 +281,21 @@ impl SplitWindowView {
     }
 
     fn on_export(&mut self, _: &ExportSplit, _window: &mut Window, cx: &mut Context<Self>) {
+        // 忙标志防重入：关窗后不强杀后台任务，但完成回调用的是弱窗口句柄，
+        // 窗口已关时 update 失败，不会写回已关窗口。
+        if self.exporting {
+            return;
+        }
+        self.exporting = true;
+
         if !self.has_image() {
+            self.exporting = false;
             self.status = "请先选择一张图片。".into();
             cx.notify();
             return;
         }
         if !self.layout.is_valid() {
+            self.exporting = false;
             self.status = "切图参数有误，请检查切分数量。".into();
             cx.notify();
             return;
@@ -290,6 +303,7 @@ impl SplitWindowView {
         let parent = match crate::config::screenshot_dir() {
             Ok(d) => d,
             Err(e) => {
+                self.exporting = false;
                 self.status = format!("无法取得保存目录：{e}").into();
                 cx.notify();
                 return;
@@ -311,6 +325,7 @@ impl SplitWindowView {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                this.exporting = false;
                 if result.succeeded() {
                     this.status = format!(
                         "已导出 {} 张到 {}",

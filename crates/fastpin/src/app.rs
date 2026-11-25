@@ -1,8 +1,9 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{App, Application, QuitMode};
@@ -48,9 +49,17 @@ use crate::platform::{
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 
-/// 截图文件名的进程内预留锁。去重扫描和 `create_new` 预留必须在一把锁内，
-/// 否则两个同时完成的截屏会看到同一个「不存在」的名字，再互相截断文件。
-static SAVE_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// 截图目标路径的进程内预留集合。去重扫描和「本进程已占用的目标名」必须在
+/// 一把锁内，否则两个同时完成的截屏会看到同一个「不存在」的名字，再互相覆盖。
+/// 只在内存里预留名字：不再用 `create_new` 在目标路径留下 0 字节占位文件。
+static SAVE_PATH_LOCK: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// 写盘临时文件前缀。进程退出时最多留下带此前缀的半成品，由启动时 sweep 清理。
+const IMAGE_TMP_PREFIX: &str = "fastpin-shot-tmp-";
+
+/// 临时文件名自增序号，保证同进程并发截图的临时路径互不相同。
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static GPUI_APP: RefCell<Option<gpui::AsyncApp>> = const { RefCell::new(None) };
@@ -662,6 +671,9 @@ fn run_tray() -> Result<()> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
     set_dpi_aware();
+    // 单实例，此刻不会有本程序在途写盘：清掉上次退出遗留的半截截图临时文件。
+    // 放在 CoInitializeEx 之后：默认截图目录要走 SHGetKnownFolderPath。
+    cleanup_stale_image_temps();
     let mut perf_boot = PerfSession::start();
     perf_boot.mark("T0");
     let _instance = match SingleInstance::acquire() {
@@ -670,6 +682,8 @@ fn run_tray() -> Result<()> {
             // 第二实例以前静默退出，用户以为程序没启动成功。给一个可见提示，
             // 不引入 IPC：告诉用户热键已可用、设置从已有实例的托盘打开。
             crate::perf::log_app("second instance exited: FastPin is already running");
+            // 这条日志也要赶在进程结束前落盘。
+            crate::perf::flush_logs();
             let text = wide("FastPin 已在运行，热键可直接截图；设置请从托盘打开。\0");
             let title = wide("FastPin\0");
             unsafe {
@@ -717,6 +731,11 @@ fn run_tray() -> Result<()> {
         .forget();
 
     unbind_gpui_app();
+
+    // 所有退出路径最终都汇到这里（托盘 Exit、紧急退出热键、WM_DESTROY、
+    // Explicit quit）。writer 的发送端是进程级单例、永不 drop，靠它自然退出时的
+    // 收尾 flush 永远走不到，必须显式等一次回执再返回 main。
+    crate::perf::flush_logs();
 
     if let Some(e) = boot_error.borrow_mut().take() {
         return Err(e);
@@ -833,12 +852,22 @@ fn show_tray_unavailable_hint() {
     let _ = std::thread::Builder::new()
         .name("fastpin-tray-hint".into())
         .spawn(|| {
-            let text = wide(
+            // 紧急退出热键本身也可能注册失败（被别的程序占用）。失败时不能再
+            // 让用户按一个根本不存在的组合键，改为明确指向任务管理器。
+            // hook 模块是 platform 的私有模块；同一份注册状态由公开模块 hotkey 持有，
+            // platform::hook::emergency_quit_registered() 也只是转发到它。
+            let quit_hint = if crate::hotkey::emergency_quit_registered() {
+                "退出程序: 按 Ctrl+Alt+Shift+Q, 或在任务管理器结束 FastPin.exe。"
+            } else {
+                "紧急退出热键被占用, 无法使用。\n\
+                 退出程序: 请在任务管理器结束 FastPin.exe。"
+            };
+            let text = wide(&format!(
                 "FastPin 已在后台运行，热键截图仍可用，但托盘图标未能创建 \
                  (Shell_NotifyIconW(NIM_ADD) 被系统拒绝, 0x80070005)。\n\n\
-                 退出程序: 按 Ctrl+Alt+Shift+Q, 或在任务管理器结束 FastPin.exe。\n\
-                 详情见 %LOCALAPPDATA%\\FastPin\\logs\\app.log。\0",
-            );
+                 {quit_hint}\n\
+                 详情见 %LOCALAPPDATA%\\FastPin\\logs\\app.log。\0"
+            ));
             let title = wide("FastPin 托盘图标不可用\0");
             unsafe {
                 let _ = MessageBoxW(
@@ -919,6 +948,8 @@ unsafe extern "system" fn hidden_proc(
     if msg == WM_HOTKEY {
         if wparam.0 as i32 == EMERGENCY_QUIT_ID {
             crate::perf::log_app("emergency quit hotkey pressed; exiting");
+            // 进程即将结束：显式冲刷后台日志队列，不能等 writer 自然退出。
+            crate::perf::flush_logs();
             PostQuitMessage(0);
             return LRESULT(0);
         }
@@ -966,6 +997,8 @@ unsafe extern "system" fn hidden_proc(
                 },
                 TrayCommand::Exit => {
                     remove_tray_icon(hwnd);
+                    // 与紧急退出一致：进程即将结束，显式冲刷后台日志队列。
+                    crate::perf::flush_logs();
                     PostQuitMessage(0);
                 }
             }
@@ -1226,7 +1259,7 @@ fn export_pixels_shared_with_source(
         // 设置页用同一个 effective_format 显示当前实际格式，并与这里的回退
         // 保持一致：本机缺 WebP 时不展示质量滑块、提示实际写的是 PNG。
         export.format = crate::codec::effective_format(export.format);
-        let path = default_image_path(&export)?;
+        let (path, temp) = default_image_path(&export)?;
         let px_file = px.clone();
         std::thread::spawn(move || {
             unsafe {
@@ -1235,31 +1268,37 @@ fn export_pixels_shared_with_source(
                     windows::Win32::System::Com::COINIT_MULTITHREADED,
                 );
             }
-            if let Err(e) = write_image_file(
-                &path,
-                export.format,
-                export.clamped_quality(),
-                &px_file,
-                cw,
-                ch,
-                stride,
-            ) {
-                // `default_image_path` 已经预留了空文件；写入失败要把它删掉，
-                // 免得留下一个永远不会被重命名的 0 字节截图。
-                let _ = std::fs::remove_file(&path);
-                crate::perf::log_app(&format!("image write failed: {e}"));
-                // 这是导出线程里的失败，用户看不到日志文件。弹窗明确告知，
-                // 同时回传给长截图预览（若有）更新状态。
-                report_error(&format!("截图写盘失败：{e}"));
-                if let Some(done) = &done {
-                    let _ = done.send(Err(format!("写盘失败：{e}")));
+            // 先写临时文件、成功后再原子 rename：进程在写盘中途被关闭时，目标
+            // 路径不会出现 0 字节或半截 PNG；残留的临时文件由启动时 sweep 清理。
+            let written = write_image_atomically(&temp, &path, |p| {
+                write_image_file(
+                    p,
+                    export.format,
+                    export.clamped_quality(),
+                    &px_file,
+                    cw,
+                    ch,
+                    stride,
+                )
+            });
+            let published = match written {
+                Ok(p) => p,
+                Err(e) => {
+                    release_reserved_path(&path);
+                    crate::perf::log_app(&format!("image write failed: {e}"));
+                    // 这是导出线程里的失败，用户看不到日志文件。弹窗明确告知，
+                    // 同时回传给长截图预览（若有）更新状态。
+                    report_error(&format!("截图写盘失败：{e}"));
+                    if let Some(done) = &done {
+                        let _ = done.send(Err(format!("写盘失败：{e}")));
+                    }
+                    return;
                 }
-                return;
-            }
+            };
             // Read back the exact bytes the user saved so the history copy is
             // byte-identical (and uses the same format/extension) without a
             // second encode. Failures here never affect the save itself.
-            if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(bytes) = std::fs::read(&published) {
                 crate::history::record_saved_image(
                     &bytes,
                     export.format.extension(),
@@ -1317,7 +1356,10 @@ fn export_pixels_shared_with_source(
     Ok(())
 }
 
-fn default_image_path(export: &crate::config::Export) -> Result<PathBuf> {
+/// 计算本次截图的最终路径与临时路径，并在进程内预留最终名。
+/// 不再用 `create_new` 在目标路径预留 0 字节文件：进程在写盘前退出时它会永久残留。
+/// 写盘线程只写带 `IMAGE_TMP_PREFIX` 的临时文件，写完再原子 rename 到目标。
+fn default_image_path(export: &crate::config::Export) -> Result<(PathBuf, PathBuf)> {
     let dir = crate::config::screenshot_dir()?;
     std::fs::create_dir_all(&dir)?;
     // Local time, not UTC: the name is for the user reading their own folder.
@@ -1327,24 +1369,102 @@ fn default_image_path(export: &crate::config::Export) -> Result<PathBuf> {
     let stem = export.expand_name(&date, &time);
     let extension = export.format.extension();
 
-    // 从查重到预留空文件全程持锁；`create_new` 还能挡住进程外的同名竞争。
-    // 返回的空文件由导出线程用 File::create 覆盖，编码失败时它负责删除。
-    let _guard = SAVE_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 从查重到预留目标名全程持锁：进程内两个同时完成的截屏不能拿到同一个名字。
+    // 只在内存里记账，不在磁盘上留下任何占位文件。
+    let mut reserved = SAVE_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let candidate = unique_path(&dir, &stem, extension);
-    for path in
-        std::iter::once(candidate).chain((2..).map(|n| dir.join(format!("{stem}_{n}.{extension}"))))
-    {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => return Ok(path),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+    let target = std::iter::once(candidate)
+        .chain((2..).map(|n| dir.join(format!("{stem}_{n}.{extension}"))))
+        .find(|p| !p.exists() && !reserved.contains(p))
+        .ok_or_else(|| Error::new("无法分配截图文件名"))?;
+
+    // 临时名带 pid + 自增序号：既避开同进程并发，也避开上次退出遗留的同名文件。
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!(
+        "{IMAGE_TMP_PREFIX}{}-{seq}.{extension}",
+        std::process::id()
+    ));
+    reserved.insert(target.clone());
+    Ok((target, temp))
+}
+
+/// 写盘失败时把预留的目标名还回池子，避免一次失败永久占住这个文件名。
+fn release_reserved_path(path: &Path) {
+    let mut reserved = SAVE_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reserved.remove(path);
+}
+
+/// 先写临时文件、成功后再原子 rename 到目标路径。写盘或发布失败都删除临时文件，
+/// 保证退出时最多留下带 `IMAGE_TMP_PREFIX` 的半成品（由启动时 sweep 清理），
+/// 绝不在目标路径留下 0 字节或半截 PNG。`write` 只负责把字节写进传入的临时路径。
+fn write_image_atomically(
+    temp: &Path,
+    target: &Path,
+    write: impl FnOnce(&Path) -> Result<()>,
+) -> Result<PathBuf> {
+    if let Err(e) = write(temp) {
+        let _ = std::fs::remove_file(temp);
+        return Err(e);
+    }
+    match publish_image(temp, target) {
+        Ok(published) => Ok(published),
+        Err(e) => {
+            let _ = std::fs::remove_file(temp);
+            Err(e)
+        }
+    }
+}
+
+/// 把写完的临时文件发布到目标路径：目标不存在就直接 rename；若被进程外占用
+/// 则退到 `<stem>_2.<ext>` 等带序号后缀，绝不覆盖已有文件。返回真正落盘的路径。
+fn publish_image(temp: &Path, target: &Path) -> Result<PathBuf> {
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let stem = target
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let ext = target
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let candidates = std::iter::once(target.to_path_buf())
+        .chain((2..).map(|n| dir.join(format!("{stem}_{n}.{ext}"))));
+    for candidate in candidates {
+        if candidate.exists() {
+            continue;
+        }
+        match std::fs::rename(temp, &candidate) {
+            Ok(()) => return Ok(candidate),
+            // rename 与 exists 之间被外部抢占：换下一个候选名重试。
+            Err(_) if candidate.exists() => continue,
             Err(e) => return Err(e.into()),
         }
     }
-    Err(Error::new("无法预留截图文件名"))
+    unreachable!("候选路径序列无限，总会返回一个")
+}
+
+/// 启动时清理上次退出遗留的截图临时文件。单实例保证此刻没有本程序在途写盘，
+/// 目录里带本程序前缀的文件都是崩溃/强杀残留，直接删除（比 update.rs 的按龄
+/// 清理更及时：用户很快重启也不该看到半截文件）。失败一律静默。
+fn cleanup_stale_image_temps() {
+    let Ok(dir) = crate::config::screenshot_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_temp = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(IMAGE_TMP_PREFIX));
+        if is_temp && path.is_file() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Two shots inside the same second share a stem; a screenshot silently
@@ -1391,6 +1511,54 @@ mod tests {
         // A different format does not collide with the PNGs above.
         let other = unique_path(&dir, "FastPin_20260828_143052", "jpg");
         assert_eq!(other.file_name().unwrap(), "FastPin_20260828_143052.jpg");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_image_atomically_publishes_and_cleans_temp() {
+        // Scratch under target/: the harness sandbox denies writes to %TEMP%.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("atomic-image-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let target = dir.join("shot.png");
+        let temp = dir.join(format!("{IMAGE_TMP_PREFIX}{}-0.png", std::process::id()));
+
+        // 成功路径：目标内容正确，临时文件不残留。
+        let published = write_image_atomically(&temp, &target, |p| {
+            std::fs::write(p, b"png-bytes").map_err(|e| Error::new(e.to_string()))
+        })
+        .expect("原子写应成功");
+        assert_eq!(published, target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"png-bytes".to_vec());
+        assert!(!temp.exists(), "成功后不应残留临时文件");
+
+        // 目标已存在：退到带序号后缀，不覆盖原目标，临时文件同样不残留。
+        let temp2 = dir.join(format!("{IMAGE_TMP_PREFIX}{}-1.png", std::process::id()));
+        let published2 = write_image_atomically(&temp2, &target, |p| {
+            std::fs::write(p, b"second").map_err(|e| Error::new(e.to_string()))
+        })
+        .expect("目标被占用时应换名发布");
+        assert_eq!(published2, dir.join("shot_2.png"));
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"png-bytes",
+            "不得覆盖已有文件"
+        );
+        assert_eq!(std::fs::read(&published2).unwrap(), b"second".to_vec());
+        assert!(!temp2.exists(), "冲突发布后不应残留临时文件");
+
+        // 失败路径：临时文件被删除，目标不被创建。
+        let temp3 = dir.join(format!("{IMAGE_TMP_PREFIX}{}-2.png", std::process::id()));
+        let missing = dir.join("never-created.png");
+        assert!(write_image_atomically(&temp3, &missing, |_p| {
+            Err(Error::new("encode failed"))
+        })
+        .is_err());
+        assert!(!temp3.exists(), "失败后应删除临时文件");
+        assert!(!missing.exists(), "失败后不应留下目标文件");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

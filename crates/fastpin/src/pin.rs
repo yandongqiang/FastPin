@@ -1704,7 +1704,7 @@ impl PinView {
                     zoom: t.zoom,
                 })
                 .collect();
-            let (mut px, _w, _h) = match compose(&images) {
+            let (mut px, pw, ph) = match compose(&images) {
                 Ok(v) => v,
                 Err(e) => {
                     crate::perf::log_app(&format!("drag export compose: {e}"));
@@ -1714,11 +1714,21 @@ impl PinView {
             // A dragged image pasted into a white-background target must not
             // bring its transparent gaps along, same as copy.
             flatten_gaps(&mut px, [255, 255, 255, 255]);
-            let extension = {
+            let (format, quality, extension) = {
                 let export = &crate::config::get().screenshot.export;
-                crate::codec::effective_format(export.format).extension()
+                let format = crate::codec::effective_format(export.format);
+                (format, export.clamped_quality(), format.extension())
             };
-            let staged = crate::dragexport::stage(&px, extension);
+            // 拖出的是图片文件：必须写编码后的字节，不能直接把裸 BGRA 配上
+            // .png/.jpg 扩展名交给接收方。
+            let encoded = match crate::codec::encode_bgra(format, quality, &px, pw, ph, pw * 4) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    crate::perf::log_app(&format!("drag export encode: {e}"));
+                    return;
+                }
+            };
+            let staged = crate::dragexport::stage(&encoded, extension);
             let path = match staged {
                 Ok(p) => p,
                 Err(e) => {
@@ -1726,7 +1736,7 @@ impl PinView {
                     return;
                 }
             };
-            let bytes = px.len() as u64;
+            let bytes = encoded.len() as u64;
             // 先占位再启动 OLE：账本满额时拒绝本次拖出并回收刚暂存的文件。
             // 漏掉 reserve 会让 complete() 找不到记录，expires_at 永远是 None，
             // 文件连同目录永久残留在临时目录里。

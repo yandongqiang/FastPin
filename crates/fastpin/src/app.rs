@@ -1441,15 +1441,6 @@ fn default_image_path(export: &crate::config::Export) -> Result<(PathBuf, PathBu
     Ok((target, temp))
 }
 
-/// 候选名是否已被另一次截图预留。`publish_image` 在首选名被外部占用时会
-/// 退到 `<stem>_2.ext` 等名字，这些名字可能正是别的截图的预留目标。
-fn is_reserved_path(path: &Path) -> bool {
-    SAVE_PATH_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(path)
-}
-
 /// 写盘失败时把预留的目标名还回池子，避免一次失败永久占住这个文件名。
 fn release_reserved_path(path: &Path) {
     let mut reserved = SAVE_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1499,23 +1490,30 @@ fn publish_image(temp: &Path, target: &Path) -> Result<PathBuf> {
     const MAX_CANDIDATES: u32 = 999;
     let temp = crate::config::extended_path(temp);
     for n in 0..MAX_CANDIDATES {
+        // 预留检查、exists 与 rename 必须在同一把锁内完成：先查后释放锁会
+        // 给另一张截图留下抢占同名候选的窗口，Windows rename 会覆盖文件。
+        let mut reserved = SAVE_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let candidate = if n == 0 {
             target.to_path_buf()
         } else {
-            // 首选名是本调用自己预留的；后续避让名若被别的截图预留，必须跳过。
-            let candidate = dir.join(format!("{stem}_{}.{ext}", n + 1));
-            if is_reserved_path(&candidate) {
-                continue;
-            }
-            candidate
+            dir.join(format!("{stem}_{}.{ext}", n + 1))
         };
+        // 首选名是本调用自己预留的；避让名若已被别的截图预留就跳过。
+        if n > 0 && reserved.contains(&candidate) {
+            continue;
+        }
         // 查重与 rename 都用长路径形式，但返回给用户的是原始候选路径。
         let io_candidate = crate::config::extended_path(&candidate);
         if io_candidate.exists() {
             continue;
         }
         match std::fs::rename(&temp, &io_candidate) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => {
+                if n > 0 {
+                    reserved.insert(candidate.clone());
+                }
+                return Ok(candidate);
+            }
             // rename 与 exists 之间被外部抢占：换下一个候选名重试。
             Err(_) if io_candidate.exists() => continue,
             Err(e) => return Err(e.into()),

@@ -43,6 +43,8 @@ const MAX_CHECKSUM_BYTES: u64 = 8 * 1024;
 pub struct Release {
     pub version: String,
     pub url: String,
+    /// 原始 tag（大小写保留）：资产下载路径必须用发布时的真实 tag。
+    pub tag: String,
 }
 
 pub fn current_version() -> &'static str {
@@ -138,8 +140,8 @@ pub fn check_latest() -> Result<Release> {
         serde_json::from_str(&body).map_err(|_| Error::new("发布信息不是有效的 JSON"))?;
     let tag = json["tag_name"].as_str().unwrap_or_default();
     let url = json["html_url"].as_str().unwrap_or_default();
-    if tag.is_empty() || url.is_empty() {
-        return Err(Error::new("发布信息缺少 tag_name 或 html_url"));
+    if tag.is_empty() || url.is_empty() || !valid_version(tag) {
+        return Err(Error::new("发布信息缺少有效的 tag_name 或 html_url"));
     }
     // The URL came from the network; never hand an unvalidated scheme/host to
     // ShellExecuteW (file:// and local paths would launch arbitrary programs).
@@ -147,8 +149,9 @@ pub fn check_latest() -> Result<Release> {
         return Err(Error::new("发布页地址不可信，已拒绝打开"));
     }
     Ok(Release {
-        version: tag.trim_start_matches(['v', 'V']).to_string(),
+        version: normalize_version(tag),
         url: url.to_string(),
+        tag: tag.to_string(),
     })
 }
 
@@ -313,9 +316,14 @@ fn asset_file_name(version: &str) -> String {
 
 /// Every download -- installer and checksum manifest alike -- starts from the
 /// same trusted `github.com` release path; redirects are validated separately.
+/// `tag` must be the release's real tag: `V1.2.3` and `v1.2.3` are different
+/// URLs even though both normalise to version `1.2.3`.
+fn release_asset_url_with_tag(tag: &str, file_name: &str) -> String {
+    format!("https://github.com/{GITHUB_REPO}/releases/download/{tag}/{file_name}")
+}
+
 fn release_asset_url(version: &str, file_name: &str) -> String {
-    let v = normalize_version(version);
-    format!("https://github.com/{GITHUB_REPO}/releases/download/v{v}/{file_name}")
+    release_asset_url_with_tag(&format!("v{}", normalize_version(version)), file_name)
 }
 
 /// 下载完成后的安装包名：`seq == 1` 用发布资产原名，撞名则追加 `-2`、`-3`…。
@@ -350,8 +358,15 @@ fn finalize_download(part: &Path, dir: &Path, version: &str) -> Result<PathBuf> 
 /// Resolve the GitHub asset URL through the same host-checked redirect chain as
 /// the installer download. Status is left to the caller so each asset can give
 /// its own actionable error (a missing checksum file is not a missing exe).
-fn open_release_asset(version: &str, file_name: &str) -> Result<(DownloadSession, ResponseHead)> {
-    let mut current = release_asset_url(version, file_name);
+fn open_release_asset(
+    version: &str,
+    tag: Option<&str>,
+    file_name: &str,
+) -> Result<(DownloadSession, ResponseHead)> {
+    let mut current = match tag {
+        Some(tag) if valid_version(tag) => release_asset_url_with_tag(tag, file_name),
+        _ => release_asset_url(version, file_name),
+    };
     let (mut session, mut head) = unsafe { begin_download(&current)? };
     let mut hops = 0usize;
     while is_redirect(head.status) {
@@ -409,8 +424,8 @@ fn parse_sha256sums(contents: &str, expected_file: &str) -> Result<[u8; 32]> {
 /// Download and parse the release-side checksum manifest. A 404 is a hard
 /// failure: an unsigned, unverified exe must never reach ShellExecuteW just
 /// because an older release forgot to publish its hashes.
-fn fetch_expected_hash(version: &str) -> Result<[u8; 32]> {
-    let (session, head) = open_release_asset(version, CHECKSUMS_FILE_NAME)?;
+fn fetch_expected_hash(version: &str, tag: Option<&str>) -> Result<[u8; 32]> {
+    let (session, head) = open_release_asset(version, tag, CHECKSUMS_FILE_NAME)?;
     if head.status == 404 {
         return Err(Error::new(
             "发布页缺少 SHA256SUMS.txt，出于安全考虑拒绝安装；请到发布页手动下载",
@@ -814,13 +829,14 @@ pub fn download_release_asset(
     version: &str,
     on_progress: impl FnMut(DownloadProgress),
 ) -> Result<PathBuf> {
-    download_release_asset_with_hash(version, on_progress).map(|(path, _)| path)
+    download_release_asset_with_hash(version, None, on_progress).map(|(path, _)| path)
 }
 
-/// Same as [`download_release_asset`], but also returns the verified hash so
-/// the settings view can re-check the file immediately before launching it.
+/// Same as [`download_release_asset`], but uses the release's real tag for the
+/// asset URL and returns the verified hash for a pre-launch re-check.
 pub fn download_release_asset_with_hash(
     version: &str,
+    tag: Option<&str>,
     mut on_progress: impl FnMut(DownloadProgress),
 ) -> Result<(PathBuf, [u8; 32])> {
     if !valid_version(version) {
@@ -833,7 +849,7 @@ pub fn download_release_asset_with_hash(
     let dir = download_dir();
     cleanup_download_files(&dir, DOWNLOAD_MAX_AGE);
 
-    let (session, head) = open_release_asset(version, &asset_file_name(version))?;
+    let (session, head) = open_release_asset(version, tag, &asset_file_name(version))?;
 
     if head.status == 404 {
         return Err(Error::new(format!(
@@ -859,7 +875,7 @@ pub fn download_release_asset_with_hash(
     fs::create_dir_all(&dir)?;
     let path = unique_temp_path(&dir, version);
 
-    let expected = fetch_expected_hash(version)?;
+    let expected = fetch_expected_hash(version, tag)?;
     match stream_body_to_file(session.request.0, &path, total, &mut on_progress)
         .and_then(|()| verify_hash(&path, &expected))
     {
@@ -1043,6 +1059,37 @@ mod tests {
         let other = format!("{:064}", 1);
         let conflict = format!("{sum}  {name}\n{other}  {name}\n");
         assert!(parse_sha256sums(&conflict, &name).is_err());
+    }
+
+    #[test]
+    fn prelaunch_verification_rejects_non_exe_and_tampered_files() {
+        assert!(
+            verify_installer_hash(Path::new("C:/definitely/missing/FastPin.exe"), &[0u8; 32])
+                .is_err()
+        );
+        let path = std::env::current_dir().unwrap().join(format!(
+            "fastpin-verify-test-{}-{}.exe",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, b"abc").unwrap();
+        let expected = hash_file(&path).unwrap();
+        assert!(verify_installer_hash(&path, &expected).is_ok());
+        fs::write(&path, b"abd").unwrap();
+        assert!(verify_installer_hash(&path, &expected).is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn uppercase_release_tag_is_preserved_in_asset_urls() {
+        assert_eq!(
+            release_asset_url_with_tag("V1.2.3", "a.exe"),
+            "https://github.com/yandongqiang/FastPin/releases/download/V1.2.3/a.exe"
+        );
+        assert_eq!(
+            release_asset_url("v1.2.3", "a.exe"),
+            "https://github.com/yandongqiang/FastPin/releases/download/v1.2.3/a.exe"
+        );
     }
 
     #[test]

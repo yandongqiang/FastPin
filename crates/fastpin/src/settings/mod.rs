@@ -592,8 +592,8 @@ pub struct SettingsView {
     history_poll_running: bool,
     /// In-flight update check guards against double clicks.
     update_checking: bool,
-    /// (version, url) of a newer release, when the last check found one.
-    update_available: Option<(String, String)>,
+    /// (version, url, raw tag) of a newer release, when the last check found one.
+    update_available: Option<(String, String, String)>,
     /// In-app installer download state, polled from a worker's progress channel.
     update_downloading: bool,
     /// 关窗时置位的取消标志，与下载 worker、轮询任务共享同一个 Arc：窗口
@@ -2464,7 +2464,7 @@ impl SettingsView {
                         ) =>
                     {
                         view.ok(format!("发现新版本 v{}", release.version));
-                        view.update_available = Some((release.version, release.url));
+                        view.update_available = Some((release.version, release.url, release.tag));
                     }
                     Ok(_) => {
                         view.update_available = None;
@@ -2480,7 +2480,7 @@ impl SettingsView {
     }
 
     fn open_update_page(&mut self, cx: &mut Context<Self>) {
-        let Some((_, url)) = &self.update_available else {
+        let Some((_, url, _)) = &self.update_available else {
             return;
         };
         if let Err(e) = crate::update::open_release_page(url) {
@@ -2496,7 +2496,7 @@ impl SettingsView {
         if self.update_downloading {
             return;
         }
-        let Some((version, _)) = self.update_available.clone() else {
+        let Some((version, _, tag)) = self.update_available.clone() else {
             return;
         };
         self.update_downloading = true;
@@ -2521,15 +2521,16 @@ impl SettingsView {
                 flag.store(true, Ordering::Release);
                 return;
             }
-            let outcome = crate::update::download_release_asset_with_hash(&version, |progress| {
-                // 关窗后不再有接收方：跳过进度上报，别再堆积消息。
-                // net 层的回调是 FnMut(DownloadProgress) 且无返回值，
-                // 无法从这里直接中断 WinHTTP 读取，只能等它自己收尾。
-                if worker_cancel.load(Ordering::Acquire) {
-                    return;
-                }
-                let _ = tx.send(Msg::Progress(progress));
-            });
+            let outcome =
+                crate::update::download_release_asset_with_hash(&version, Some(&tag), |progress| {
+                    // 关窗后不再有接收方：跳过进度上报，别再堆积消息。
+                    // net 层的回调是 FnMut(DownloadProgress) 且无返回值，
+                    // 无法从这里直接中断 WinHTTP 读取，只能等它自己收尾。
+                    if worker_cancel.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let _ = tx.send(Msg::Progress(progress));
+                });
             if worker_cancel.load(Ordering::Acquire) {
                 // 关窗已置位取消标记：轮询任务会立刻退出并 drop rx，Done 发到
                 // 断开的通道也没人处理。worker 自己删掉已落盘的安装包，
@@ -2642,29 +2643,44 @@ impl SettingsView {
             return;
         };
         // 下载时验过一次，这里在启动前对磁盘文件再验一次：两次点击之间
-        // 文件可能被替换。哈希在下载时缓存，不在 UI 线程发网络请求。
-        if let Some(hash) = self.downloaded_installer_hash {
-            if let Err(e) = crate::update::verify_installer_hash(&path, &hash) {
-                self.fail(format!("安装前校验失败：{e}"));
-                cx.notify();
-                return;
+        // 文件可能被替换。整文件哈希放到后台线程，避免 UI 卡住。
+        let verify_path = path.clone();
+        let verify_hash = self.downloaded_installer_hash;
+        let task = cx.background_spawn(async move {
+            match verify_hash {
+                Some(hash) => crate::update::verify_installer_hash(&verify_path, &hash),
+                None => Ok(()),
             }
-        }
-        match crate::update::launch_installer(&path, scope) {
-            Ok(()) => {
-                self.ok(match scope {
-                    crate::update::InstallScope::CurrentUser => "安装程序已启动，应用将退出",
-                    crate::update::InstallScope::AllUsers => {
-                        "安装程序已启动，应用将退出；请在 UAC 提示中确认"
+        });
+        cx.spawn(async move |this, cx| {
+            let verified = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(e) = verified {
+                    this.fail(format!("安装前校验失败：{e}"));
+                    cx.notify();
+                    return;
+                }
+                match crate::update::launch_installer(&path, scope) {
+                    Ok(()) => {
+                        this.ok(match scope {
+                            crate::update::InstallScope::CurrentUser => {
+                                "安装程序已启动，应用将退出"
+                            }
+                            crate::update::InstallScope::AllUsers => {
+                                "安装程序已启动，应用将退出；请在 UAC 提示中确认"
+                            }
+                        });
+                        cx.notify();
+                        cx.quit();
                     }
-                });
-                cx.notify();
-                cx.quit();
-                return;
-            }
-            Err(e) => self.fail(e.to_string()),
-        }
-        cx.notify();
+                    Err(e) => {
+                        this.fail(e.to_string());
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     // ---- chrome ------------------------------------------------------------
@@ -5115,7 +5131,7 @@ impl SettingsView {
     fn page_about(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // One button, two jobs: check first, then become the download link
         // once a newer release is known.
-        let update_button = if let Some((version, _)) = &self.update_available {
+        let update_button = if let Some((version, _, _)) = &self.update_available {
             widgets::button("update-open", format!("前往下载 v{version}")).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.open_update_page(cx)),

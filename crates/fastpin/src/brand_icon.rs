@@ -111,7 +111,10 @@ pub fn de_white_transparent(img: &mut RgbaImage) -> u32 {
     for y in 0..h {
         for x in 0..w {
             let p = img.get_pixel(x, y);
-            if p[3] > 0 {
+            // 只有完全不透明的像素才是可信的颜色源。Lanczos 振铃会在边缘
+            // 留下半透明的近白像素，若把它们当种子，颜色会扩散成 alpha=0
+            // 的白洞（32px 图标上的白边）。
+            if p[3] == 255 {
                 let i = (y * w + x) as usize;
                 colours[i] = 1 | (p[0] as u32) << 8 | (p[1] as u32) << 16 | (p[2] as u32) << 24;
                 queue.push_back((x, y));

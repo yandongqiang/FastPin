@@ -106,6 +106,27 @@ fn looks_like_onnx(path: &std::path::Path) -> bool {
     read > 0 && head[..read].iter().any(|&byte| byte != 0)
 }
 
+/// 字典是文本文件，不是 ONNX：只要求非空且首块内容可读、含换行，不能套用
+/// 模型的 4 KiB 门槛，否则有效的小字典会被误判成模型缺失。
+fn looks_like_dictionary(path: &std::path::Path) -> bool {
+    let Ok(meta) = path.metadata() else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 4096];
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    read > 0
+        && head[..read].iter().any(|&byte| byte != 0)
+        && (head[..read].contains(&b'\n') || meta.len() <= 4096)
+}
+
 /// True when `dir` holds all three model files that pass the integrity sniff.
 /// A zero-byte or truncated file is what an interrupted copy/download leaves
 /// behind, and ORT refuses it later, so it counts as missing. Unreadable
@@ -113,9 +134,10 @@ fn looks_like_onnx(path: &std::path::Path) -> bool {
 /// this directly, and `build` applies the same per-file sniff, so the green dot
 /// cannot disagree with what OCR actually accepts.
 pub fn models_present_in(dir: &std::path::Path) -> bool {
-    [DET_MODEL, REC_MODEL, DICT]
+    [DET_MODEL, REC_MODEL]
         .iter()
         .all(|file| looks_like_onnx(&dir.join(file)))
+        && looks_like_dictionary(&dir.join(DICT))
 }
 
 /// Whether the resolved model directory can drive OCR. There is no fallback
@@ -202,7 +224,7 @@ fn build() -> Result<OAROCR> {
     let dir = models_dir()?;
     // 与 engine_status / models_present_in 使用同一套完整性判定：截断或
     // 全零的模型不能在这里才被发现。
-    for file in [DET_MODEL, REC_MODEL, DICT] {
+    for file in [DET_MODEL, REC_MODEL] {
         let path = dir.join(file);
         if !looks_like_onnx(&path) {
             return Err(Error::new(format!(
@@ -210,6 +232,13 @@ fn build() -> Result<OAROCR> {
                 path.display()
             )));
         }
+    }
+    let dict = dir.join(DICT);
+    if !looks_like_dictionary(&dict) {
+        return Err(Error::new(format!(
+            "识别字典缺失或不完整：{}",
+            dict.display()
+        )));
     }
     OAROCRBuilder::new(
         dir.join(DET_MODEL).to_string_lossy().into_owned(),
@@ -346,9 +375,14 @@ mod tests {
     }
 
     fn write_models(dir: &std::path::Path, bytes: usize) {
-        for file in [DET_MODEL, REC_MODEL, DICT] {
+        for file in [DET_MODEL, REC_MODEL] {
             fs::write(dir.join(file), vec![7u8; bytes]).unwrap();
         }
+        let mut dict = vec![b'a'; bytes];
+        if bytes > 0 {
+            dict[0] = b'\n';
+        }
+        fs::write(dir.join(DICT), dict).unwrap();
     }
 
     #[test]
@@ -365,6 +399,20 @@ mod tests {
         write_models(&dir, 4_096);
         assert!(models_present_in(&dir), "all three pass the sniff");
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_short_dictionary_is_not_treated_as_a_missing_model() {
+        let dir = scratch("short-dict");
+        write_models(&dir, 4_096);
+        fs::write(dir.join(DICT), b"a\nb\n").unwrap();
+        assert!(models_present_in(&dir), "dictionary is a small text file");
+        fs::write(dir.join(DICT), b"").unwrap();
+        assert!(
+            !models_present_in(&dir),
+            "empty dictionary is still missing"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

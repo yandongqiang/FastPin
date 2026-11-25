@@ -1468,13 +1468,18 @@ pub fn get() -> Settings {
 /// than a truncated file that silently resets everything on next start.
 /// Cache-last: on failure the process keeps the settings the user can see.
 pub fn save(settings: &Settings) -> Result<()> {
+    let path = path()?;
     if SAVE_BLOCKED.load(Ordering::Acquire) {
-        return Err(Error::new(
-            "配置文件损坏且隔离失败，已拒绝保存；请手动修复 settings.json 后重启",
-        ));
+        // 启动时的瞬时 IO/隔离失败不该让整个会话永远不能保存。磁盘上的文件
+        // 若已恢复成合法配置，就解除封锁并继续；否则保持拒绝，绝不覆盖原文件。
+        if !save_restored_by_valid_file(&path) {
+            return Err(Error::new(
+                "配置文件暂时无法写入，本次会话已暂停保存；请检查 settings.json 后重试或重启",
+            ));
+        }
+        SAVE_BLOCKED.store(false, Ordering::Release);
     }
     let _write_guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let path = path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1545,6 +1550,13 @@ static SAVE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 fn block_save_after_failed_quarantine() {
     SAVE_BLOCKED.store(true, Ordering::Release);
     crate::perf::log_app("settings.json 隔离失败：本次进程已禁用保存，避免默认值覆盖原文件");
+}
+
+/// 隔离失败后磁盘文件是否已恢复成合法配置；是则可以解除保存封锁。
+fn save_restored_by_valid_file(path: &Path) -> bool {
+    std::fs::read_to_string(path).ok().is_some_and(|text| {
+        !is_broken_config(&text) && serde_json::from_str::<Settings>(&text).is_ok()
+    })
 }
 
 /// 读配置文件，区分“文件不存在”与真正的 IO 失败。过去这里把所有错误都
@@ -1979,6 +1991,18 @@ fn recover_split(input: Option<&serde_json::Value>) -> crate::imagesplit::SplitS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_stays_blocked_until_the_file_is_valid_again() {
+        let dir = test_dir("save-restore");
+        let path = dir.join("settings.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "not json").unwrap();
+        assert!(!save_restored_by_valid_file(&path));
+        std::fs::write(&path, serde_json::to_string(&Settings::default()).unwrap()).unwrap();
+        assert!(save_restored_by_valid_file(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// %TEMP% 在受限 CI / 沙箱里可能不可写。测试文件统一放到 crate 的
     /// target/ 下（cargo 已为该目录授予写权限），pid + 序号保证并行测试

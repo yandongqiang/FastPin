@@ -499,14 +499,38 @@ impl HistoryWindowView {
             return;
         };
         let path = self.store.image_path(record);
-        match crate::codec::decode_bgra(&path) {
-            Some((bgra, w, h)) => match crate::codec::set_clipboard_dib(&bgra, w, h, w * 4) {
-                Ok(()) => self.status = "已复制到剪贴板".into(),
-                Err(e) => self.status = format!("复制失败：{e}").into(),
-            },
-            None => self.status = "图片解码失败".into(),
-        }
+        self.status = "正在复制…".into();
         cx.notify();
+
+        // 完整解码 + DIB 组装都在后台线程：大图在 UI 线程做这两步会明显卡住
+        // 整个窗口。状态在线程回报后更新。
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_MULTITHREADED,
+                );
+            }
+            let status = match crate::codec::decode_bgra(&path) {
+                Some((bgra, w, h)) => match crate::codec::set_clipboard_dib(&bgra, w, h, w * 4) {
+                    Ok(()) => "已复制到剪贴板".to_string(),
+                    Err(e) => format!("复制失败：{e}"),
+                },
+                None => "图片解码失败".to_string(),
+            };
+            let _ = tx.send(status);
+        });
+        let task = cx.background_executor().spawn(async move { rx.recv() });
+        cx.spawn(async move |this, cx| {
+            if let Ok(status) = task.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.status = status.into();
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn on_delete(&mut self, _: &DeleteSelectedHistory, _: &mut Window, cx: &mut Context<Self>) {

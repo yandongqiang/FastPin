@@ -313,6 +313,8 @@ fn write_export_atomically<E: From<std::io::Error>>(
     }
 }
 
+type PngBlit = (std::sync::Arc<Vec<u8>>, (u32, u32), RectPx, i8, bool);
+
 /// Nearest-neighbour blit that scales `src` into `rect` and applies the
 /// rotation/flip transform. Coordinates are normalised, so the destination
 /// rect may have any size relative to the source.
@@ -991,29 +993,24 @@ impl CollageWindowView {
 
         let layout = layout.unwrap();
         let (w, h) = layout.size;
-        let Some(mut canvas) = alloc_canvas(w, h, self.collage_settings.background_rgba) else {
-            self.exporting = false;
-            self.status = SharedString::from("拼图尺寸超出内存预算");
-            cx.notify();
-            return;
-        };
-
-        for (idx, rect) in layout.rects.iter().enumerate() {
-            if idx >= self.images.len() {
-                break;
-            }
-            let item = &self.images[idx];
-            let (src_w, src_h) = item.to_collage_item().transformed_size();
-            blit_image(
-                &mut canvas,
-                (w, h),
-                &item.pixels,
-                (src_w, src_h),
-                *rect,
-                item.rotation,
-                item.flipped_h,
-            );
-        }
+        let background = self.collage_settings.background_rgba;
+        // 只克隆 blit/编码真正需要的字段；`Arc<RenderImage>` 不进后台任务。
+        let tiles: Vec<PngBlit> = layout
+            .rects
+            .iter()
+            .enumerate()
+            .take_while(|(idx, _)| *idx < self.images.len())
+            .map(|(idx, rect)| {
+                let item = &self.images[idx];
+                (
+                    item.pixels.clone(),
+                    item.to_collage_item().transformed_size(),
+                    *rect,
+                    item.rotation,
+                    item.flipped_h,
+                )
+            })
+            .collect();
 
         // 深 save_dir 下导出会超过 MAX_PATH，按最终目录转成 `\\?\` 形式，
         // 后续的查重/临时名/写盘都继承前缀。
@@ -1037,30 +1034,56 @@ impl CollageWindowView {
             time.minute(),
             time.second()
         );
-        // 同秒再导出改用 `name (n).png`，不覆盖前一次结果。
         let preferred = unique_png_export_path(&dir, &name, |p| p.exists());
-        // 先写同级唯一临时文件再发布；写入中途失败不会在目标路径留下半截 PNG。
         let temp_path = export_temp_path(&preferred, std::process::id(), next_export_temp_seq());
-        let path = match write_export_atomically(&temp_path, &preferred, |p| {
-            write_png_file(p, &canvas, w, h, w * 4)
-        }) {
-            Ok(path) => path,
-            Err(e) => {
-                self.exporting = false;
-                self.status = SharedString::from(format!("导出失败: {}", e));
-                cx.notify();
-                return;
-            }
-        };
-
-        self.exporting = false;
-        self.export_result = Some(ExportResult {
-            png_path: Some(path.clone()),
-            pdf_path: None,
-            message: format!("已导出 PNG: {}", path.display()),
-        });
-        self.status = SharedString::from(format!("已导出 PNG: {}", path.display()));
+        self.status = SharedString::from("导出中…");
+        self.export_result = None;
         cx.notify();
+
+        // 画布分配、逐像素 blit 与 WIC 编码全部在后台线程；PDF 早已如此。
+        let task = cx.background_spawn(async move {
+            let mut canvas = match alloc_canvas(w, h, background) {
+                Some(canvas) => canvas,
+                None => return Err("拼图尺寸超出内存预算".to_string()),
+            };
+            for (pixels, (src_w, src_h), rect, rotation, flipped) in tiles {
+                blit_image(
+                    &mut canvas,
+                    (w, h),
+                    &pixels,
+                    (src_w, src_h),
+                    rect,
+                    rotation,
+                    flipped,
+                );
+            }
+            write_export_atomically(&temp_path, &preferred, |p| {
+                write_png_file(p, &canvas, w, h, w * 4)
+            })
+            .map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.exporting = false;
+                match outcome {
+                    Ok(path) => {
+                        this.export_result = Some(ExportResult {
+                            png_path: Some(path.clone()),
+                            pdf_path: None,
+                            message: format!("已导出 PNG: {}", path.display()),
+                        });
+                        this.status = SharedString::from(format!("已导出 PNG: {}", path.display()));
+                    }
+                    Err(e) => {
+                        this.export_result = None;
+                        this.status = SharedString::from(format!("导出失败: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn on_export_pdf(&mut self, _: &ExportCollagePdf, cx: &mut Context<Self>) {

@@ -24,7 +24,9 @@ jobs:
       # DirectML.dll is the OCR GPU backend; ship it too.
       - name: Stage zip
         run: |
-          $dir = "dist/FastPin-${{ github.ref_name }}"
+          $ver = "${{ github.ref_name }}" -replace '^[vV]+',''
+          "APP_VERSION=$ver" >> $env:GITHUB_ENV
+          $dir = "dist/FastPin-v$ver"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target/release/FastPin.exe $dir
           Copy-Item target/release/DirectML.dll $dir
@@ -40,7 +42,7 @@ jobs:
           # Appearance themes are loaded at runtime by ThemeRegistry from themes\
           # next to the exe, so ship the directory too.
           Copy-Item themes $dir -Recurse
-          Compress-Archive -Path $dir -DestinationPath "dist/FastPin-${{ github.ref_name }}-x64.zip"
+          Compress-Archive -Path $dir -DestinationPath "dist/FastPin-v$ver-x64.zip"
       # Build the installer on the runner so every released artifact is
       # reproducible from the tagged commit (a SignPath requirement).
       - name: Install Inno Setup
@@ -56,14 +58,13 @@ jobs:
           Invoke-WebRequest "https://raw.githubusercontent.com/jrsoftware/issrc/is-6_7_3/Files/Languages/Unofficial/ChineseSimplified.isl" -OutFile $lang
       - name: Build installer
         run: |
-          $ver = "${{ github.ref_name }}" -replace '^[vV]+',''
-          & $env:ISCC /DAppVersion=$ver installer\fastpin.iss
+          & $env:ISCC /DAppVersion=$env:APP_VERSION installer\fastpin.iss
       # The in-app updater refuses to execute an installer whose SHA-256 does
       # not match this manifest. Publish it from the same build so the hash
       # always describes the exact asset uploaded below.
       - name: Publish installer checksum
         run: |
-          $ver = "${{ github.ref_name }}" -replace '^[vV]+',''
+          $ver = $env:APP_VERSION
           $asset = "FastPin-v$ver-x64-setup.exe"
           $hash = (Get-FileHash -Algorithm SHA256 "dist/$asset").Hash.ToLowerInvariant()
           "$hash  $asset" | Out-File -Encoding ascii "dist/SHA256SUMS.txt"
@@ -71,6 +72,6 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/FastPin-${{ github.ref_name }}-x64.zip
-            dist/FastPin-${{ github.ref_name }}-x64-setup.exe
+            dist/FastPin-v${{ env.APP_VERSION }}-x64.zip
+            dist/FastPin-v${{ env.APP_VERSION }}-x64-setup.exe
             dist/SHA256SUMS.txt

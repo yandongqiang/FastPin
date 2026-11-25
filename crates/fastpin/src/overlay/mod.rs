@@ -3155,6 +3155,18 @@ impl OverlayView {
             None => crate::app::capture_region_bgra(cx, ax, ay, w, h)
                 .map(|(px, pw, ph, _)| Some((px, pw, ph))),
         };
+        // 显示器断开/越界是致命错误，不该被计入「连续失败」后再换成泛化文案。
+        if let Err(e) = captured.as_ref() {
+            let text = e.to_string();
+            if text.contains("monitor that could not be captured")
+                || text.contains("readback region")
+                || text.contains("outside texture")
+            {
+                state.status = long_capture_error_text(&text);
+                crate::perf::log_app(&format!("long capture stopped: {text}"));
+                return false;
+            }
+        }
         let px = match captured {
             // No new frame since the last poll: nothing scrolled, not an error.
             Ok(None) => return true,
@@ -3465,33 +3477,47 @@ impl OverlayView {
     /// 返回像素与实际用的 GPU generation：GPU reset 后 rebaseline 必须把
     /// 会话 generation 更新到新设备，否则下一 tick 会误判整个会话失效。
     fn long_frame(
-        &self,
+        &mut self,
         cx: &mut Context<Self>,
         ax: i32,
         ay: i32,
         w: u32,
         h: u32,
     ) -> Option<(Vec<u8>, u64)> {
-        if let Some(live) = self.long.as_ref().and_then(|s| s.live.as_ref()) {
-            if let Ok(Some((px, pw, ph, _))) = crate::app::capture_region_live(
-                cx,
-                &live.session,
-                &live.gpu,
-                live.sdr_white,
-                live.mon_x,
-                live.mon_y,
-                ax,
-                ay,
-                w,
-                h,
-            ) {
-                if pw == w && ph == h {
-                    return Some((px, live.generation));
+        let current = cx.gpu_generation();
+        let live_generation = self
+            .long
+            .as_ref()
+            .and_then(|s| s.live.as_ref())
+            .map(|live| live.generation);
+        if live_generation == Some(current) {
+            if let Some(live) = self.long.as_ref().and_then(|s| s.live.as_ref()) {
+                if let Ok(Some((px, pw, ph, _))) = crate::app::capture_region_live(
+                    cx,
+                    &live.session,
+                    &live.gpu,
+                    live.sdr_white,
+                    live.mon_x,
+                    live.mon_y,
+                    ax,
+                    ay,
+                    w,
+                    h,
+                ) {
+                    if pw == w && ph == h {
+                        return Some((px, current));
+                    }
                 }
+            }
+        } else if live_generation.is_some() {
+            // 设备已换代：旧 WGC 会话属于旧 generation，必须丢掉，否则下一
+            // tick 仍会命中 live.generation stale 而中止刚 rebaseline 的会话。
+            if let Some(state) = self.long.as_mut() {
+                state.live = None;
             }
         }
         match crate::app::capture_region_bgra(cx, ax, ay, w, h) {
-            Ok((px, pw, ph, _)) if pw == w && ph == h => Some((px, cx.gpu_generation())),
+            Ok((px, pw, ph, _)) if pw == w && ph == h => Some((px, current)),
             _ => None,
         }
     }
@@ -3556,7 +3582,12 @@ impl OverlayView {
             // 抓这一帧用的设备可能已换代；同步会话 generation，下一 tick 才
             // 不会把可继续的会话当成 stale 中止。
             state.gpu_generation = frame_generation;
-            state.hover.reset();
+            // 只取消当前 hover 请求并让画布内容失效；`reset()` 会把 enabled
+            // 永久关掉，而本会话不会再重新启用它。
+            state.hover.set_hover(None);
+            state.hover.content_changed();
+            state.hover_image = None;
+            state.hover_rows = None;
             state.axis = next;
             state.maxed = false;
             state.stall_paused = false;
@@ -4604,8 +4635,8 @@ impl OverlayView {
                     spread_radius: px(0.),
                     inset: false,
                 }])
-                .occlude()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                // 纯提示，不能吞掉框选、工具栏点击或右键菜单；鼠标事件照常
+                // 冒泡到 root。
                 .child(
                     div()
                         .text_size(px(12.))
@@ -5003,6 +5034,7 @@ impl Render for OverlayView {
                 .when(show_shortcut_hints, |el| {
                     el.child(shortcut_hints_bar(phase))
                 })
+                .children(self.capture_warning_element())
                 .children(self.toolbar_element(scale, cx, &visible_items, toolbar_geom))
                 .children(self.props_element(scale, cx, toolbar_geom, active_monitor))
                 .children(self.long_bar_element(scale, cx, active_monitor))
@@ -5021,7 +5053,6 @@ impl Render for OverlayView {
                     active_monitor,
                 ))
                 .children(self.panel_element(scale, cx, toolbar_geom, active_monitor))
-                .children(self.capture_warning_element())
                 .children(self.text_layer(scale, &marks))
             })
     }

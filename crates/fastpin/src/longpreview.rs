@@ -244,14 +244,19 @@ fn fit_zoom(viewport_w: f32, image_w: f32) -> f32 {
     (available / image_w).clamp(MIN_ZOOM, 1.0)
 }
 
-pub struct LongPreviewView {
-    focus_handle: FocusHandle,
+struct PreviewImage {
     image: Arc<RenderImage>,
-    /// Ledger reservation for the RenderImage copy, held for the view's life.
-    /// The field is intentionally never read — its Drop releases the bytes.
+    pixels: Arc<Vec<u8>>,
+    /// Ledger reservation for the RenderImage copy; held for Drop only.
     #[allow(dead_code)]
     permit: crate::image_budget::MemoryPermit,
-    pixels: Arc<Vec<u8>>,
+}
+
+pub struct LongPreviewView {
+    focus_handle: FocusHandle,
+    /// One unit so replacing a result can drop the old buffers *before* the
+    /// new ones are allocated (a 16k stitch would otherwise hold two copies).
+    data: Option<PreviewImage>,
     pixel_size: (u32, u32),
     zoom: f32,
     saved: bool,
@@ -273,9 +278,11 @@ impl LongPreviewView {
     ) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            image,
-            permit,
-            pixels,
+            data: Some(PreviewImage {
+                image,
+                pixels,
+                permit,
+            }),
             pixel_size,
             zoom,
             saved: false,
@@ -296,16 +303,21 @@ impl LongPreviewView {
         cx: &mut Context<Self>,
     ) {
         let (w, h) = pixel_size;
+        // 先拿走旧缓冲再分配新缓冲：16k 长图若新旧同时在内存里会瞬时翻倍，
+        // 可能触发预算拒绝或 OOM。创建失败时把旧缓冲放回去。
+        let old = self.data.take();
         let Some((image, permit)) = render_image(&pixels, w, h) else {
-            // 尺寸对不上时退回历史路径：至少不把这次的截图静默丢掉。
+            self.data = old;
             crate::perf::log_app("long preview: pixel buffer size mismatch on replace");
             let bytes = Arc::try_unwrap(pixels).unwrap_or_else(|arc| (*arc).clone());
             crate::app::export_pin_pixels(bytes, w, h, true, true);
             return;
         };
-        self.image = image;
-        self.permit = permit; // 旧 permit 在此 drop，预算随之释放
-        self.pixels = pixels;
+        self.data = Some(PreviewImage {
+            image,
+            pixels,
+            permit,
+        });
         self.pixel_size = pixel_size;
         self.zoom = zoom;
         self.saved = false;
@@ -329,53 +341,61 @@ impl LongPreviewView {
     /// 文件写入在后台线程完成：只有收到写线程的回报才置 `saved`，其间显示
     /// "保存中…"，失败则由主线程显示原因（写线程自身也会弹可见错误框）。
     fn export(&mut self, write_file: bool, copy: bool, cx: &mut Context<Self>) {
+        // 写盘未回报时重复点击会预留两个不同文件名，得到重复的截图。
+        if write_file && self.saving {
+            return;
+        }
+        let Some(pixels) = self.data.as_ref().map(|data| data.pixels.clone()) else {
+            return;
+        };
         // 状态栏只反映最近一次操作：上一次保存失败不能留在下一次导出的状态里。
         self.save_error = None;
         let (w, h) = self.pixel_size;
         let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
-        let result = crate::app::export_pixels_shared_reported(
-            self.pixels.clone(),
-            w,
-            h,
-            w * 4,
-            write_file,
-            copy,
-            tx,
-        );
+        let result =
+            crate::app::export_pixels_shared_reported(pixels, w, h, w * 4, write_file, copy, tx);
+
+        // 只要启动了写盘线程就必须接收它的回报：即使同步阶段（剪贴板）失败，
+        // 文件仍可能落盘成功。两种结果分开处理，不能互相覆盖。
+        if write_file {
+            self.saving = true;
+            let task = cx.background_executor().spawn(async move { rx.recv() });
+            cx.spawn(async move |this, cx| {
+                let outcome = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.saving = false;
+                    match outcome {
+                        Ok(Ok(())) => {
+                            this.saved = true;
+                            this.save_error = None;
+                        }
+                        Ok(Err(e)) if !this.saved => this.save_error = Some(e),
+                        Err(_) if !this.saved => {
+                            this.save_error = Some("保存线程意外退出".into());
+                        }
+                        _ => {}
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
         match result {
             Ok(()) => {
                 // 剪贴板复制是同步完成的；文件是否落盘必须等写线程回报。
                 self.copied |= copy;
-                if write_file {
-                    self.saving = true;
-                    self.save_error = None;
-                    cx.notify();
-                    let task = cx.background_executor().spawn(async move { rx.recv() });
-                    cx.spawn(async move |this, cx| {
-                        let outcome = task.await;
-                        let _ = this.update(cx, |this, cx| {
-                            this.saving = false;
-                            match outcome {
-                                Ok(Ok(())) => this.saved = true,
-                                Ok(Err(e)) => this.save_error = Some(e),
-                                Err(_) => {
-                                    this.save_error = Some("保存线程意外退出".into());
-                                }
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .detach();
-                } else {
-                    cx.notify();
-                }
+                cx.notify();
             }
             Err(e) => {
-                // 同步失败（路径预留 / 编码 / 剪贴板）：这里也要弹框，否则
-                // 用户只看到状态栏一句话，仍以为是程序没反应。
                 crate::perf::log_app(&format!("long preview export: {e}"));
-                self.save_error = Some(e.to_string());
-                crate::app::report_error(&format!("截图导出失败：{e}"));
+                if copy {
+                    // 剪贴板失败只影响复制，不能把已经成功的文件保存报成失败。
+                    crate::app::report_error(&format!("复制到剪贴板失败：{e}"));
+                } else {
+                    self.save_error = Some(e.to_string());
+                    crate::app::report_error(&format!("截图导出失败：{e}"));
+                }
                 cx.notify();
             }
         }
@@ -408,8 +428,11 @@ impl LongPreviewView {
     /// Hands the shared stitch buffer straight to the splitter — no re-encode,
     /// so a tall screenshot can be cut into printable tiles immediately.
     fn on_split(&mut self, _: &SplitLongPreview, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pixels) = self.data.as_ref().map(|data| data.pixels.clone()) else {
+            return;
+        };
         crate::imagesplit_window::show_split_pixels(
-            self.pixels.clone(),
+            pixels,
             self.pixel_size.0,
             self.pixel_size.1,
             cx,
@@ -419,8 +442,11 @@ impl LongPreviewView {
     /// Opens the collage window with the stitched image, ready for multi-image
     /// layout and PDF export.
     fn on_collage(&mut self, _: &CollageLongPreview, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pixels) = self.data.as_ref().map(|data| data.pixels.clone()) else {
+            return;
+        };
         crate::collage_window::show_collage_pixels(
-            self.pixels.clone(),
+            pixels,
             self.pixel_size.0,
             self.pixel_size.1,
             cx,
@@ -631,10 +657,11 @@ impl LongPreviewView {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .child(
-                        img(ImageSource::Render(self.image.clone()))
-                            .w(px(dw))
-                            .h(px(dh)),
+                    .children(
+                        self.data
+                            .as_ref()
+                            .map(|data| img(ImageSource::Render(data.image.clone())))
+                            .map(|image| image.w(px(dw)).h(px(dh))),
                     ),
             )
     }

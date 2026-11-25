@@ -11,7 +11,8 @@ use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
     WinHttpQueryHeaders, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
     URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
-    WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_INTERNET_SCHEME_HTTP, WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_STATUS_CODE,
 };
 
 use crate::config;
@@ -61,8 +62,27 @@ pub fn translate(text: &str) -> Result<String> {
 
 /// Whether the configured Base URL uses plaintext HTTP. Used by both the
 /// runtime guard and the settings warning banner so the two cannot disagree.
+///
+/// 判定来源必须与 `post_json` 一致：后者用 `WinHttpCrackUrl` 解出的 `nScheme`
+/// 决定是否加 `WINHTTP_FLAG_SECURE`。纯字符串前缀判断会被 `http:\host\v1`
+/// 绕过——WinHTTP 把 `\` 当分隔符，仍按明文 HTTP 把 Authorization 发出去。
 pub fn is_insecure_http(base_url: &str) -> bool {
-    base_url.trim().to_ascii_lowercase().starts_with("http://")
+    let wide: Vec<u16> = base_url.trim().encode_utf16().chain([0]).collect();
+    let mut parts = URL_COMPONENTS {
+        dwStructSize: std::mem::size_of::<URL_COMPONENTS>() as u32,
+        // u32::MAX asks WinHttp for pointers into `wide` instead of copies.
+        dwSchemeLength: u32::MAX,
+        dwHostNameLength: u32::MAX,
+        dwUrlPathLength: u32::MAX,
+        dwExtraInfoLength: u32::MAX,
+        ..Default::default()
+    };
+    if unsafe { WinHttpCrackUrl(&wide, 0, &mut parts) }.is_ok() {
+        return parts.nScheme == WINHTTP_INTERNET_SCHEME_HTTP;
+    }
+    // 解析失败时 post_json 同样会失败，不会真的发出请求；这里按前缀保守
+    // 兜底，宁可多提示一次也不能把可疑地址当成安全的 HTTPS 放行。
+    base_url.trim().to_ascii_lowercase().starts_with("http")
 }
 
 /// The vault entry is optional: local gateways commonly take no key.
@@ -179,8 +199,9 @@ fn message_content(json: &str) -> Option<String> {
 
 /// `{"error":{"message":"..."}}` —— 网关失败时真正的原因在这里（401 只显示
 /// 状态码会把"API Key 无效"这类信息丢掉）。与 `message_content` 一样容错：
-/// 非 JSON / HTML 错误页一律忽略，文本经去敏、截断后才给用户看。
-fn error_message(json: &str) -> Option<String> {
+/// 非 JSON / HTML 错误页一律忽略，文本经去敏（含本次请求实际使用的 Key）、
+/// 截断后才给用户看。
+fn error_message(json: &str, key: &str) -> Option<String> {
     if json.trim_start().starts_with('<') {
         return None;
     }
@@ -190,7 +211,7 @@ fn error_message(json: &str) -> Option<String> {
         .and_then(|e| e.get("message"))
         .or_else(|| root.get("error"))
         .and_then(|v| v.as_str())?;
-    let msg = crate::net::redact_api_message(msg.trim());
+    let msg = crate::net::redact_api_message_with_secret(msg.trim(), key);
     (!msg.is_empty()).then_some(msg)
 }
 
@@ -346,7 +367,7 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
             // error.message（已去敏、截断），HTML 错误页等无法解析的情况则
             // 退回原来的简短状态码提示。
             let detail = String::from_utf8_lossy(&payload);
-            let detail = error_message(&detail)
+            let detail = error_message(&detail, api_key)
                 .map(|m| format!("：{m}"))
                 .unwrap_or_default();
             return Err(Error::new(format!("翻译失败（HTTP {status}）{detail}")));
@@ -405,6 +426,8 @@ mod tests {
         assert!(is_insecure_http("  HTTP://gateway.local/v1 "));
         assert!(!is_insecure_http("https://api.openai.com/v1"));
         assert!(!is_insecure_http(""));
+        // WinHTTP 把反斜杠当分隔符：前缀检查漏掉，但请求实际走明文 HTTP。
+        assert!(is_insecure_http("http:\\gateway.local\\v1"));
     }
 
     #[test]
@@ -453,18 +476,28 @@ mod tests {
     #[test]
     fn error_message_extracts_and_redacts_the_providers_reason() {
         let json = r#"{"error":{"message":"Incorrect API key provided: sk-abcdefghijklmnop"}}"#;
-        let msg = error_message(json).expect("error.message is present");
+        let msg = error_message(json, "").expect("error.message is present");
         assert!(msg.contains("Incorrect API key"));
         assert!(!msg.contains("sk-abcdefghijklmnop"));
         assert!(msg.contains("***"));
         // 直接是字符串、HTML 错误页、缺字段都要容错。
         assert_eq!(
-            error_message(r#"{"error":"model not found"}"#).as_deref(),
+            error_message(r#"{"error":"model not found"}"#, "").as_deref(),
             Some("model not found")
         );
-        assert!(error_message("<html>502 Bad Gateway</html>").is_none());
-        assert!(error_message(r#"{"error":{}}"#).is_none());
-        assert!(error_message("{").is_none());
+        assert!(error_message("<html>502 Bad Gateway</html>", "").is_none());
+        assert!(error_message(r#"{"error":{}}"#, "").is_none());
+        assert!(error_message("{", "").is_none());
+    }
+
+    #[test]
+    fn error_message_redacts_the_key_echoed_by_the_gateway() {
+        // gsk_/AIza/key= 这类真实 Key 没有 Bearer/sk- 外观，只有拿本次请求
+        // 实际带上的 Key 做精确替换才能去掉。
+        let json = r#"{"error":{"message":"invalid api key gsk_secret123"}}"#;
+        let msg = error_message(json, "gsk_secret123").expect("error.message is present");
+        assert!(!msg.contains("gsk_secret123"));
+        assert!(msg.contains("***"));
     }
 
     #[test]

@@ -191,23 +191,39 @@ pub fn clear_logs() -> Result<usize> {
     Ok(removed)
 }
 
-/// Total bytes under `path`, one level of subdirectories deep — enough for the
-/// data folder and the log folder without walking an entire drive.
+/// Total bytes under `path`, a bounded number of subdirectory levels deep —
+/// enough for the data folder and the log folder without walking an entire
+/// drive (and without recursing forever through a self-pointing junction).
 pub fn dir_size(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .filter_map(|e| e.ok())
-        .map(|e| {
-            let path = e.path();
-            match e.metadata() {
-                Ok(md) if md.is_file() => md.len(),
-                Ok(md) if md.is_dir() => dir_size(&path),
-                _ => 0,
-            }
-        })
-        .sum()
+    /// `metadata()` 会跟随 junction/符号链接；`symlink_metadata()` 不会，
+    /// 因此 reparse point 一律跳过。再加上深度上限，目录成环时递归必然收敛，
+    /// 不会在 `panic = "abort"` 下把整个进程爆栈带走。
+    fn walk(path: &Path, depth: u32) -> u64 {
+        const MAX_DEPTH: u32 = 8;
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let path = e.path();
+                let Ok(md) = std::fs::symlink_metadata(&path) else {
+                    return 0;
+                };
+                if md.file_type().is_symlink() {
+                    return 0;
+                }
+                if md.is_file() {
+                    md.len()
+                } else if md.is_dir() && depth < MAX_DEPTH {
+                    walk(&path, depth + 1)
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+    walk(path, 0)
 }
 
 /// Folder picker for the save-location card. `Ok(None)` is the user pressing
@@ -265,5 +281,50 @@ pub fn pick_image(current: &Path) -> Result<Option<PathBuf>> {
         Ok(Some(PathBuf::from(
             text.map_err(|e| Error::new(e.to_string()))?,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "fastpin-dir-size-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("scratch dir");
+        path
+    }
+
+    #[test]
+    fn dir_size_counts_files_in_nested_subdirectories() {
+        let root = scratch_dir("sum");
+        std::fs::write(root.join("a.bin"), vec![0u8; 10]).expect("write root file");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).expect("child dir");
+        std::fs::write(child.join("b.bin"), vec![0u8; 25]).expect("write child file");
+        assert_eq!(dir_size(&root), 35, "files at both levels are counted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dir_size_is_bounded_by_the_depth_limit() {
+        let root = scratch_dir("depth");
+        let mut dir = root.clone();
+        for level in 0..12 {
+            dir = dir.join(format!("level{level}"));
+            std::fs::create_dir_all(&dir).expect("nested dir");
+            std::fs::write(dir.join("payload.bin"), vec![0u8; 4]).expect("payload");
+        }
+        // 超过上限的层级不再计入；关键是递归有界、不会爆栈。
+        let size = dir_size(&root);
+        assert!(size <= 12 * 4, "depth-limited sum stays bounded: {size}");
+        assert!(size >= 8 * 4, "levels within the limit are counted: {size}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

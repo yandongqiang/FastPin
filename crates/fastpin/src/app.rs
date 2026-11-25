@@ -711,7 +711,10 @@ fn run_tray() -> Result<()> {
 
     // 应用退出：拖出文件的账本只清记录、不删文件（接收方可能还在读，
     // 留下来的临时文件由 OS 清理）。不清会让残留记录一直占着预算。
-    crate::pin::drag_retention().lock().unwrap().forget();
+    crate::pin::drag_retention()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forget();
 
     unbind_gpui_app();
 
@@ -775,9 +778,15 @@ fn boot_resident(
         // 三步走：锁内只摘快照、只按结果回填；阻塞的 remove_file / 删目录
         // 放在锁外，避免慢盘或杀软扫描时卡住其它拖出的 reserve() / complete()。
         let retention = crate::pin::drag_retention();
-        let targets = retention.lock().unwrap().expired_targets(Instant::now());
+        let targets = retention
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expired_targets(Instant::now());
         let results = crate::dragexport::Retention::finish_deletes(targets);
-        retention.lock().unwrap().apply_deletes(results);
+        retention
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply_deletes(results);
     })
     .detach();
     Ok(())
@@ -785,12 +794,20 @@ fn boot_resident(
 
 /// 统一的可见错误提示。release 构建下 `log_app` 只写一个本地日志文件，
 /// 用户根本看不到；裁剪 / 合成 / 写盘这类"点了按钮却什么都没发生"的失败
-/// 必须用 Win32 消息框直接告知。用一把互斥量串行化，避免多个导出线程同时
-/// 弹出一堆模态框把界面卡死；消息框本身是 `hwnd = NULL` 的顶层框，不会
+/// 必须用 Win32 消息框直接告知。消息框本身是 `hwnd = NULL` 的顶层框，不会
 /// 依赖任何 GPUI 窗口（失败时截图窗口可能正在关闭）。
+///
+/// 这里刻意用原子布尔标志而不是互斥量串行化：MessageBoxW 是模态调用，
+/// 它自己的消息循环里本进程的 LL 热键 hook 仍然工作，用户在弹框期间再按
+/// PrtSc 会在同一线程重入本函数；若此时持有非重入的 std Mutex，重入加锁
+/// 会永久阻塞，连第一个框都无法关闭，整个 UI 挂死。跨线程持锁弹框同样
+/// 会冻结 UI 线程。标志用 `swap` 抢占：已有框在显示时直接丢弃新的错误，
+/// 避免弹框堆积；并发错误被合并/丢弃是有意的取舍，保证绝不在锁内做模态调用。
 pub fn report_error(msg: &str) {
-    static ERROR_DIALOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = ERROR_DIALOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    static DIALOG_ACTIVE: AtomicBool = AtomicBool::new(false);
+    if DIALOG_ACTIVE.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let text = wide(&format!("{msg}\0"));
     let title = wide("FastPin\0");
     unsafe {
@@ -801,6 +818,8 @@ pub fn report_error(msg: &str) {
             MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
         );
     }
+    // MessageBoxW 即使返回 Err 也必须复位标志，否则以后所有错误提示都被吞掉。
+    DIALOG_ACTIVE.store(false, Ordering::SeqCst);
 }
 
 /// One-time, best-effort visible notice for tray-less mode. Shown on a helper

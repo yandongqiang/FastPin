@@ -172,6 +172,19 @@ pub fn redact_api_message(text: &str) -> String {
     }
 }
 
+/// 与 [`redact_api_message`] 相同，但先把本次请求实际使用的 Key 作为精确子串
+/// 替换掉。网关可能在 error.message 里原样回显 `gsk_xxx` / `AIza...` /
+/// `key=abcd` 之类的真实 Key——它们没有 Bearer/sk- 的外观，光靠词法规则
+/// 挡不住，必须拿真 Key 比对。`secret` 为空时退化为纯词法去敏。
+pub fn redact_api_message_with_secret(text: &str, secret: &str) -> String {
+    let text = if secret.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(secret, "***")
+    };
+    redact_api_message(&text)
+}
+
 /// `None` on u64 overflow or when adding `chunk` would pass `limit`.
 pub(crate) fn checked_accumulate(received: u64, chunk: u64, limit: u64) -> Option<u64> {
     let next = received.checked_add(chunk)?;
@@ -302,6 +315,20 @@ mod tests {
         let short = redact_api_message(&long);
         assert!(short.chars().count() <= 301);
         assert!(short.ends_with('…'));
+    }
+
+    #[test]
+    fn echoed_secret_is_redacted_exactly() {
+        let msg = "Invalid API key: gsk_secret123 (key=gsk_secret123)";
+        let redacted = redact_api_message_with_secret(msg, "gsk_secret123");
+        assert!(!redacted.contains("gsk_secret123"));
+        assert!(redacted.contains("***"));
+        // 空 secret 保持原来的词法去敏行为。
+        assert_eq!(
+            redact_api_message_with_secret("sk-abcdefghijklmnop", ""),
+            "***",
+            "existing sk- rule still applies"
+        );
     }
 
     #[test]

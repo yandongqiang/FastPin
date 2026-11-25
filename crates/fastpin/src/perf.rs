@@ -164,8 +164,9 @@ fn write_log_line_sync(path: &Path, msg: &str) -> bool {
         if let Some(parent) = path.parent() {
             create_dir_all(parent)?;
         }
-        // 这条路径每次 open/close，顺便按大小轮转，避免长挂机时无限增长。
-        rotate_if_needed(path, LOG_ROTATE_BYTES);
+        // 同步路径每次按 path 新开句柄、只追加不轮转：轮转由后台 writer 独占。
+        // 若同步也轮转，后台长开句柄会指向已改名的备份文件，后续日志全部写错位置；
+        // 每次 open by path 则永远写当前文件，不会持有失效句柄。
         let mut f = OpenOptions::new().create(true).append(true).open(path)?;
         // msg 与换行合成一次写入：同一进程内 O_APPEND 的单次 write 是原子的，
         // 因此不会与后台 writer 交错把两行粘成一行。
@@ -317,15 +318,31 @@ fn log_exceeds(path: &Path, max_bytes: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// 把 `path` 改名为 `*.log.1`。Windows 上 rename 目标已存在会失败，先删旧备份。
+/// 把 `path` 改名为 `*.log.1`。Windows 上 rename 目标已存在会失败，但绝不先删
+/// 旧备份：先把 `path` 挪到临时名，再删旧 `.1`，最后把临时名改成 `.1`；
+/// 任一步失败都把临时名改回 `path` 并返回 false，保住当前日志与旧备份。
 fn rotate_file(path: &Path) -> bool {
     let rotated = path.with_extension("log.1");
-    let _ = std::fs::remove_file(&rotated);
-    std::fs::rename(path, &rotated).is_ok()
+    let temp = path.with_extension("log.rotating");
+    if std::fs::rename(path, &temp).is_err() {
+        return false;
+    }
+    // 旧备份只在确实存在时删除；删不掉就回滚，绝不带着半成品继续。
+    if rotated.exists() && std::fs::remove_file(&rotated).is_err() {
+        let _ = std::fs::rename(&temp, path);
+        return false;
+    }
+    if std::fs::rename(&temp, &rotated).is_err() {
+        let _ = std::fs::rename(&temp, path);
+        return false;
+    }
+    true
 }
 
 /// 若 `path` 达到 `max_bytes` 就轮转成 `*.log.1`，返回是否发生轮转。
 /// 阈值由参数传入而非写死，便于单测用极小文件覆盖轮转分支。
+/// 生产路径已禁止同步轮转，此函数仅保留给单测验证轮转细节。
+#[cfg(test)]
 fn rotate_if_needed(path: &Path, max_bytes: u64) -> bool {
     log_exceeds(path, max_bytes) && rotate_file(path)
 }
@@ -335,6 +352,13 @@ fn rotate_if_needed(path: &Path, max_bytes: u64) -> bool {
 /// 由 `open_rotated` 打开全新的文件。
 fn rotate_target(handle: &mut Option<BufWriter<std::fs::File>>, path: &Path) {
     if log_exceeds(path, LOG_ROTATE_BYTES) {
+        // take() 会 drop BufWriter，未 flush 的缓冲会被静默丢弃。先显式 flush，
+        // 失败则放弃本轮轮转，避免丢掉最多一批日志。
+        if let Some(f) = handle.as_mut() {
+            if f.flush().is_err() {
+                return;
+            }
+        }
         let _ = handle.take();
         rotate_file(path);
     }
@@ -586,6 +610,69 @@ mod tests {
                 "每行只能有一个行首标记: {line}"
             );
             assert!(line.ends_with("xxxxxxxx"), "行尾必须完整: {line}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_and_buffered_writer_lines_never_join_lines() {
+        // 模仿后台 writer：一个线程持长开 BufWriter，分批 write_all + flush；
+        // 同时多个线程走同步路径（每次按 path 新开句柄）。两种写入交错时，
+        // 每行仍应自带完整标记与行尾，不得粘成一行。
+        let dir = test_dir("sync-vs-buffered");
+        let _ = create_dir_all(&dir);
+        let path = dir.join("app.log");
+
+        const SYNC_THREADS: usize = 4;
+        const SYNC_LINES: usize = 40;
+        const BUFFERED_LINES: usize = 40;
+
+        let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        for t in 0..SYNC_THREADS {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..SYNC_LINES {
+                    let msg = format!("sync-{t:02}-{i:03} {}", "y".repeat(32));
+                    assert!(write_log_line_sync(&path, &msg));
+                }
+            }));
+        }
+        let bg_path = path.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut f = BufWriter::new(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&bg_path)
+                    .expect("后台 writer 应能打开日志"),
+            );
+            for i in 0..BUFFERED_LINES {
+                let line = format!("bg-{i:03} {}\n", "z".repeat(32));
+                f.write_all(line.as_bytes()).expect("批量写应成功");
+                if i % 8 == 7 {
+                    f.flush().expect("批量 flush 应成功");
+                }
+            }
+            f.flush().expect("收尾 flush 应成功");
+        }));
+        for h in handles {
+            h.join().expect("写线程不应 panic");
+        }
+
+        let content = std::fs::read_to_string(&path).expect("并发写后应能读回");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            SYNC_THREADS * SYNC_LINES + BUFFERED_LINES,
+            "同步与后台写入的行数应完整，不得粘连"
+        );
+        for line in lines {
+            let marks = line.matches("sync-").count() + line.matches("bg-").count();
+            assert_eq!(marks, 1, "每行只能有一个标记: {line}");
+            let tail_ok =
+                line.ends_with("y".repeat(32).as_str()) || line.ends_with("z".repeat(32).as_str());
+            assert!(tail_ok, "行尾必须完整: {line}");
         }
 
         let _ = std::fs::remove_dir_all(&dir);

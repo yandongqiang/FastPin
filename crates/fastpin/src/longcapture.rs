@@ -1740,6 +1740,14 @@ impl Stitcher {
         // in both directions.
         BUDGET.checked_bytes(self.width as u64, new_total as u64, 4)?;
         let bytes = new_rows * row_bytes;
+        // 先把 heights 的容量备好：此后再无「占着预算却没有数据行」的提前返回。
+        // 若放在像素/permits/head_rows 改动之后，heights.try_reserve 失败时
+        // 缓冲已含新行、head_rows 已扣减，却不会 push segment，账目全程虚高。
+        self.heights.try_reserve(1).map_err(|_| {
+            StitchError::Budget(BudgetError::AllocFailed {
+                bytes: std::mem::size_of::<usize>() as u64,
+            })
+        })?;
 
         if self.head_rows >= new_rows {
             // Fast path: the rows land in space that is already allocated, so
@@ -1783,11 +1791,6 @@ impl Stitcher {
             self.head_grant = head;
         }
 
-        self.heights.try_reserve(1).map_err(|_| {
-            StitchError::Budget(BudgetError::AllocFailed {
-                bytes: std::mem::size_of::<usize>() as u64,
-            })
-        })?;
         self.heights.insert(0, new_rows);
         Ok(())
     }

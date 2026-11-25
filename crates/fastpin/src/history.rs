@@ -407,6 +407,10 @@ impl HistoryStore {
     /// Two-phase removal: commit the record's disappearance to the index,
     /// then unlink the directory. A crash between the two leaves an orphan
     /// directory that `cleanup_pending` reclaims on next start.
+    ///
+    /// 落盘按 dragexport 的「锁内快照 -> 锁外删除 -> 锁内回填」三段完成：
+    /// `remove_dir_all` 是阻塞 I/O，Windows 上缩略图解码持有文件句柄时还会失败，
+    /// 绝不能在 `STORE_LOCK` 里做，否则会卡住其它导出线程的 `add` 和 UI 操作。
     pub fn remove(&self, id: &str) -> Result<()> {
         self.remove_many(&[id.to_string()])
     }
@@ -415,50 +419,52 @@ impl HistoryStore {
         if ids.is_empty() {
             return Ok(());
         }
-        let _guard = lock();
-        self.remove_many_locked(ids)
-    }
 
-    /// Removal with `STORE_LOCK` already held. `prune` reads the index and then
-    /// deletes victims under the same guard; calling `remove_many` there would
-    /// try to take the (non-reentrant) mutex twice and deadlock.
-    fn remove_many_locked(&self, ids: &[String]) -> Result<()> {
-        let mut index = self.read_index()?;
-        let mut removed = Vec::new();
-        index.records.retain(|r| {
-            if ids.contains(&r.id) {
-                removed.push(PendingDeletion {
-                    id: r.id.clone(),
-                    bytes: r.bytes,
-                });
-                false
-            } else {
-                true
+        // 第一阶段（持锁、只动索引）：把记录从 index 摘下并追加到 pending，
+        // 目录路径只做成快照交给锁外。这里不广播 revision——磁盘文件还没删完，
+        // UI 提前移除卡片会让人误以为已经删干净了。
+        let (to_remove, removed_any) = {
+            let _guard = lock();
+            let mut index = self.read_index()?;
+            let mut removed = Vec::new();
+            index.records.retain(|r| {
+                if ids.contains(&r.id) {
+                    removed.push(PendingDeletion {
+                        id: r.id.clone(),
+                        bytes: r.bytes,
+                    });
+                    false
+                } else {
+                    true
+                }
+            });
+            let removed_any = !removed.is_empty();
+            if !removed_any {
+                return Ok(());
             }
-        });
-        if removed.is_empty() {
-            return Ok(());
-        }
-        let to_remove: Vec<String> = removed.iter().map(|p| p.id.clone()).collect();
-        index.pending_deletions.extend(removed);
-        self.write_index(&index)?;
-        // 删除已提交到索引：广播给所有打开的历史视图，它们才能立刻移除卡片。
-        HISTORY_REVISION.fetch_add(1, Ordering::Release);
+            // 非法 id 已在 record_dir 记日志；绝不把拼接出的路径交给 remove_dir_all。
+            let dirs: Vec<PathBuf> = removed
+                .iter()
+                .filter_map(|p| self.record_dir(&p.id).ok())
+                .collect();
+            index.pending_deletions.extend(removed);
+            self.write_index(&index)?;
+            (dirs, removed_any)
+        };
+        // guard 已离开作用域：下面阻塞的删除不再持有全局锁。
 
-        for id in &to_remove {
-            let dir = match self.record_dir(id) {
-                Ok(dir) => dir,
-                // 非法 id 已在 record_dir 记日志；绝不传给 remove_dir_all。
-                Err(_) => continue,
-            };
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                // 删除失败（目录被占用等）时 pending 条目会保留，下次启动重试。
+        // 第二阶段（锁外）：真正删目录。失败只记日志，pending 条目保留，
+        // 下次 cleanup_pending 或删除时重试。
+        for dir in &to_remove {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
                 eprintln!("history: 删除记录目录 {} 失败：{e}", dir.display());
             }
         }
 
-        // Finalize: drop the pending entries whose directories are gone (or
-        // were never created). A locked directory stays pending for retry.
+        // 第三阶段（重新持锁）：重读索引再 finalize，避免覆盖锁外期间并发 add
+        // 写入的新记录；目录仍在（被占用）的 pending 保留重试。只有在 finalize
+        // 写盘成功后才广播，UI 看到的"已删除"才与磁盘状态一致。
+        let _guard = lock();
         let mut index = self.read_index()?;
         index
             .pending_deletions
@@ -468,6 +474,9 @@ impl HistoryStore {
                 Err(_) => false,
             });
         self.write_index(&index)?;
+        if removed_any {
+            HISTORY_REVISION.fetch_add(1, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -486,31 +495,58 @@ impl HistoryStore {
     /// Retries directories left behind by an interrupted delete. Safe to call
     /// on every startup; it never touches live records.
     pub fn cleanup_pending(&self) -> Result<()> {
+        // 第一阶段（持锁、只动索引）：挑出仍存在的待删目录做成快照。非法 id
+        // 只记日志、不进快照，既不删目录也不检查存在性；目录已不存在的项直接
+        // 从 pending 摘掉（两步删除的第二步其实已完成）。
+        let dirs: Vec<PathBuf> = {
+            let _guard = lock();
+            let mut index = self.read_index()?;
+            let before = index.pending_deletions.len();
+            let mut dirs = Vec::new();
+            index.pending_deletions.retain(|p| {
+                let dir = match self.record_dir(&p.id) {
+                    Ok(dir) => dir,
+                    // 非法 id 已记日志：安全跳过，不删任何目录也不检查存在性。
+                    Err(_) => return false,
+                };
+                if !dir.exists() {
+                    return false;
+                }
+                // 删除结果要等锁外确认，先把 pending 留在索引里。
+                dirs.push(dir);
+                true
+            });
+            if index.pending_deletions.len() != before {
+                self.write_index(&index)?;
+            }
+            dirs
+        };
+        if dirs.is_empty() {
+            return Ok(());
+        }
+        // guard 已离开作用域：阻塞删除不再持锁。
+
+        // 第二阶段（锁外）：真正重试删除。慢盘、杀软扫描、缩略图占用句柄
+        // 只影响本次重试，不会卡住 add / 删除 / 清空。
+        for dir in &dirs {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                // 仍被占用（例如历史窗口正在读缩略图），保留待下次重试。
+                eprintln!("history: 重试删除目录 {} 失败：{e}", dir.display());
+            }
+        }
+
+        // 第三阶段（重新持锁）：重读索引并按目录是否还存在回填 pending，
+        // 避免覆盖锁外期间其它线程写入的记录；删除成功的 pending 才清除。
         let _guard = lock();
         let mut index = self.read_index()?;
-        let before = index.pending_deletions.len();
-        index.pending_deletions.retain(|p| {
-            let dir = match self.record_dir(&p.id) {
-                Ok(dir) => dir,
-                // 非法 id 已记日志：安全跳过，不删任何目录也不检查存在性。
-                Err(_) => return false,
-            };
-            if !dir.exists() {
-                // 目录已不存在：两步删除的第二步其实已完成。
-                return false;
-            }
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => false,
-                Err(e) => {
-                    // 仍被占用（例如历史窗口正在读缩略图），保留待下次重试。
-                    eprintln!("history: 重试删除目录 {} 失败：{e}", dir.display());
-                    true
-                }
-            }
-        });
-        if index.pending_deletions.len() != before {
-            self.write_index(&index)?;
-        }
+        index
+            .pending_deletions
+            .retain(|p| match self.record_dir(&p.id) {
+                Ok(dir) => dir.exists(),
+                // 非法 id 不再保留；它的目录也绝不会被触碰。
+                Err(_) => false,
+            });
+        self.write_index(&index)?;
         Ok(())
     }
 
@@ -520,45 +556,49 @@ impl HistoryStore {
     /// than "now" in this simplified model, so there is no pin concept here.
     /// Returns how many records were removed.
     pub fn prune(&self, retention: &Retention) -> Result<usize> {
-        // 读索引到删 victim 必须是同一把锁保护区；否则另一个截屏线程的 add
-        // 可能读到这里尚未反映的旧索引，后续写回会把新记录丢掉。
-        let _guard = lock();
-        let index = self.read_index()?;
-        let mut ordered: Vec<HistoryRecord> = index.records.clone();
-        ordered.sort_by(|a, b| {
-            a.created_ms
-                .cmp(&b.created_ms)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        // 读索引到选出 victim 必须在同一把锁保护区；否则另一个截屏线程的 add
+        // 可能读到这里尚未反映的旧索引，后续写回会把新记录丢掉。真正的删除
+        // 不在这里做：guard 选完 victim 就释放，由 remove_many 的三段式重新
+        // 持锁读 index 再写回，因此并发 add 的新记录同样不会丢。
+        let victims = {
+            let _guard = lock();
+            let index = self.read_index()?;
+            let mut ordered: Vec<HistoryRecord> = index.records.clone();
+            ordered.sort_by(|a, b| {
+                a.created_ms
+                    .cmp(&b.created_ms)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
 
-        let now = now_ms();
-        let cutoff = now.saturating_sub(retention.retention_days.saturating_mul(86_400_000));
-        // 损坏/被篡改的索引可能把 bytes 写成接近 u64::MAX 的值；普通求和在
-        // debug 下溢出 panic、release 下回绕成很小的值，导致错误的清理决策。
-        let total: u64 = ordered
-            .iter()
-            .fold(0u64, |acc, r| acc.saturating_add(r.bytes));
-        let mut count = ordered.len();
-        let mut bytes = total;
-        let mut victims = Vec::new();
+            let now = now_ms();
+            let cutoff = now.saturating_sub(retention.retention_days.saturating_mul(86_400_000));
+            // 损坏/被篡改的索引可能把 bytes 写成接近 u64::MAX 的值；普通求和在
+            // debug 下溢出 panic、release 下回绕成很小的值，导致错误的清理决策。
+            let total: u64 = ordered
+                .iter()
+                .fold(0u64, |acc, r| acc.saturating_add(r.bytes));
+            let mut count = ordered.len();
+            let mut bytes = total;
+            let mut victims = Vec::new();
 
-        for r in &ordered {
-            let expired = !retention.keep_permanently
-                && retention.retention_days > 0
-                && r.created_ms < cutoff;
-            let over_count = count > retention.limit;
-            let over_bytes = bytes > retention.max_disk_bytes;
-            if expired || over_count || over_bytes {
-                victims.push(r.id.clone());
-                count = count.saturating_sub(1);
-                bytes = bytes.saturating_sub(r.bytes);
-            } else {
-                break;
+            for r in &ordered {
+                let expired = !retention.keep_permanently
+                    && retention.retention_days > 0
+                    && r.created_ms < cutoff;
+                let over_count = count > retention.limit;
+                let over_bytes = bytes > retention.max_disk_bytes;
+                if expired || over_count || over_bytes {
+                    victims.push(r.id.clone());
+                    count = count.saturating_sub(1);
+                    bytes = bytes.saturating_sub(r.bytes);
+                } else {
+                    break;
+                }
             }
-        }
-
-        // 已经持有锁：走 locked 变体，避免重复加锁死锁。
-        self.remove_many_locked(&victims)?;
+            victims
+        };
+        // guard 已释放：remove_many 会自己重新持锁摘快照、锁外删、再持锁回填。
+        self.remove_many(&victims)?;
         Ok(victims.len())
     }
 

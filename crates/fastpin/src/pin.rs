@@ -881,19 +881,19 @@ impl PinView {
             return;
         };
         let held = (pixels.len() as u64).saturating_mul(2);
-        // 先把旧许可归还账本再预留新额度，避免两份预留同时生效时的瞬时双倍计费。
-        // 旧额度按旧像素缓冲的大小记下：新额度若失败，尽力把它补回来，失败的
-        // 编辑仍保持原有像素与渲染图不变。
-        let old_bytes = (self.pixels.len() as u64).saturating_mul(2);
-        drop(self.permit.take());
+        // 先预留新额度、成功后才归还旧许可：新额度失败时旧 permit 原封不动，
+        // self.pixels/self.image 也没被换掉，状态完全不变。
+        // 若反过来先归还再补回，两次预留都失败就会丢掉 permit，而两份缓冲
+        // 仍占着内存，LIVE_BYTES 少记会让后续 pin/长截图突破全局上限。
+        // 短暂的双倍计费偏保守，正是安全方向。
         let permit = match crate::image_budget::try_reserve(held) {
             Ok(permit) => permit,
             Err(e) => {
                 crate::perf::log_app(&format!("pin edit refused: {e}"));
-                self.permit = crate::image_budget::try_reserve(old_bytes).ok();
                 return;
             }
         };
+        drop(self.permit.take());
         self.permit = Some(permit);
         self.pixels = pixels;
         self.image = image;
@@ -1708,7 +1708,7 @@ impl PinView {
             // 文件连同目录永久残留在临时目录里。
             let reserved = drag_retention()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .reserve(path.clone(), bytes);
             let lease = match reserved {
                 Some(lease) => lease,
@@ -1739,7 +1739,7 @@ impl PinView {
                     crate::drag::DragOutcome::Failed
                 }
             };
-            let retention = &mut drag_retention().lock().unwrap();
+            let retention = &mut drag_retention().lock().unwrap_or_else(|e| e.into_inner());
             retention.complete(&lease, outcome.accepted());
             // A refused drop keeps its grace window too: the receiver may have
             // read the file mid-drop even though it refused the final effect.

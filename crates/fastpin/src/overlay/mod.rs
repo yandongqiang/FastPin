@@ -274,7 +274,9 @@ pub struct OverlayView {
     mag: Option<(Vec<u8>, u32, u32, u32)>,
     /// Clamped (x, y) the last magnifier readback was taken at, so a mouse
     /// move that lands on the same source pixel skips the GPU round trip.
-    mag_origin: Option<(u32, u32)>,
+    /// (x, y, w, h) of the last magnifier readback; size is part of the key so
+    /// a shrinking capture cannot be skipped by a stale hit.
+    mag_origin: Option<(u32, u32, u32, u32)>,
     editor: Session,
     text_edit: Option<TextDraft>,
     /// Last mosaic readback, keyed by the elements that produced it. The overlay
@@ -290,6 +292,9 @@ pub struct OverlayView {
     /// selection rect so the full-canvas mask is not rebuilt every frame.
     spotlight_cache: SpotlightDimCache,
     panel: Option<Panel>,
+    /// 多显示器采集中缺失区域的可见告警。独立于 panel：panel 依赖 toolbar
+    /// 几何，在选区完成前根本不会渲染，而采集失败发生在选区之前。
+    capture_warning: Option<String>,
     /// Read when the overlay is shown, not per frame: the settings window can
     /// rewrite it while this view is alive, and the bar must not change shape
     /// underneath a capture the user is already working in.
@@ -805,6 +810,30 @@ fn next_result_seq(seq: u64) -> u64 {
     seq.wrapping_add(1)
 }
 
+/// 多屏采集中失败的显示器区域 → 用户可见文案。返回 None 表示整张桌面完整。
+fn missing_regions_warning(regions: &[crate::capture::MissingRegion]) -> Option<String> {
+    if regions.is_empty() {
+        return None;
+    }
+    let detail = regions
+        .iter()
+        .map(|m| {
+            format!(
+                "显示器 {}（{}, {}，{}×{}）",
+                m.monitor + 1,
+                m.x,
+                m.y,
+                m.w,
+                m.h
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    Some(format!(
+        "{detail} 未能采集，截图对应区域为空白。请检查显示器连接后重试。"
+    ))
+}
+
 /// 长截图失败面板只呈现面向用户的中文：已知底层英文文案映射成原因 + 下一步
 /// 动作；已是中文的回执原样透传；未知英文保留原文但加中文前缀，既不暴露裸
 /// 英文，也不丢掉可用于反馈的诊断信息。
@@ -824,6 +853,12 @@ fn long_capture_error_text(raw: &str) -> String {
     }
     if text.contains("region outside the fresh capture") {
         return "选区超出当前屏幕范围，请重新框选后重试".to_string();
+    }
+    if text.contains("monitor that could not be captured") {
+        return "选区包含未能采集的显示器，请检查显示器连接后重新截图".to_string();
+    }
+    if text.contains("readback region") || text.contains("outside texture") {
+        return "选区超出当前画面范围，请重新截图后重试".to_string();
     }
     if text.contains("long-capture frame") || text.contains("frame buffer holds") {
         return "画面数据无效或不完整，请重新框选后重试".to_string();
@@ -1182,6 +1217,7 @@ impl OverlayView {
             mask_cache: RefCell::new(None),
             spotlight_cache: RefCell::new(None),
             panel: None,
+            capture_warning: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
             toolbar_position: screenshot.toolbar_position,
             panel_position: screenshot.panel_position,
@@ -1212,6 +1248,7 @@ impl OverlayView {
         window: &mut Window,
     ) -> Self {
         let freeze_generation = Some(cap.generation);
+        let capture_warning = missing_regions_warning(&cap.missing_regions);
         let screenshot = crate::config::get().screenshot;
         let mut view = Self {
             selection: Rect::new(0.0, 0.0, 0.0, 0.0),
@@ -1259,6 +1296,7 @@ impl OverlayView {
             mask_cache: RefCell::new(None),
             spotlight_cache: RefCell::new(None),
             panel: None,
+            capture_warning,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
             toolbar_position: screenshot.toolbar_position,
             panel_position: screenshot.panel_position,
@@ -1346,29 +1384,9 @@ impl OverlayView {
         set_long_passthrough(crate::platform::hwnd_of(window), None);
         self.sync_from_cap(window);
         // 多显示器时某一路 WGC/DXGI 都失败会留下空白区域。采集层已写日志，
-        // 这里必须让用户看见：静默缺一块比明确报错更糟。
-        if !missing_regions.is_empty() {
-            let detail = missing_regions
-                .iter()
-                .map(|m| {
-                    format!(
-                        "显示器 {}（{}, {}，{}×{}）",
-                        m.monitor + 1,
-                        m.x,
-                        m.y,
-                        m.w,
-                        m.h
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("；");
-            self.show_panel(
-                "截图不完整",
-                format!("{detail} 未能采集，截图对应区域为空白。请检查显示器连接后重试。"),
-                false,
-                cx,
-            );
-        }
+        // 这里用独立于 panel 的常驻横幅提示：panel 在选区完成前不会渲染。
+        self.capture_warning = missing_regions_warning(&missing_regions);
+        cx.notify();
     }
 
     /// 记一次 UIA 失败；连续 UIA_TIMEOUT_TRIP 次后熔断该窗口，之后不再投递。
@@ -1846,7 +1864,9 @@ impl OverlayView {
 
         match rebuilt {
             Ok((cap, swap)) => {
-                let missing_count = cap.missing_regions.len();
+                let missing_regions = cap.missing_regions.clone();
+                let missing_count = missing_regions.len();
+                self.capture_warning = missing_regions_warning(&missing_regions);
                 self.freeze_size = (cap.width, cap.height);
                 self.cap = Some(cap);
                 self.freeze_swap = Some(swap);
@@ -3442,6 +3462,8 @@ impl OverlayView {
 
     /// Captures one fresh frame of the long-capture region, preferring the
     /// persistent session and falling back to a full capture.
+    /// 返回像素与实际用的 GPU generation：GPU reset 后 rebaseline 必须把
+    /// 会话 generation 更新到新设备，否则下一 tick 会误判整个会话失效。
     fn long_frame(
         &self,
         cx: &mut Context<Self>,
@@ -3449,7 +3471,7 @@ impl OverlayView {
         ay: i32,
         w: u32,
         h: u32,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(Vec<u8>, u64)> {
         if let Some(live) = self.long.as_ref().and_then(|s| s.live.as_ref()) {
             if let Ok(Some((px, pw, ph, _))) = crate::app::capture_region_live(
                 cx,
@@ -3464,12 +3486,12 @@ impl OverlayView {
                 h,
             ) {
                 if pw == w && ph == h {
-                    return Some(px);
+                    return Some((px, live.generation));
                 }
             }
         }
         match crate::app::capture_region_bgra(cx, ax, ay, w, h) {
-            Ok((px, pw, ph, _)) if pw == w && ph == h => Some(px),
+            Ok((px, pw, ph, _)) if pw == w && ph == h => Some((px, cx.gpu_generation())),
             _ => None,
         }
     }
@@ -3491,7 +3513,7 @@ impl OverlayView {
         }) else {
             return;
         };
-        let Some(px) = self.long_frame(cx, ax, ay, w, h) else {
+        let Some((px, frame_generation)) = self.long_frame(cx, ax, ay, w, h) else {
             return;
         };
         let (wu, hu) = (w as usize, h as usize);
@@ -3531,6 +3553,10 @@ impl OverlayView {
                 stitcher,
             });
             state.gate.rebaseline(epoch);
+            // 抓这一帧用的设备可能已换代；同步会话 generation，下一 tick 才
+            // 不会把可继续的会话当成 stale 中止。
+            state.gpu_generation = frame_generation;
+            state.hover.reset();
             state.axis = next;
             state.maxed = false;
             state.stall_paused = false;
@@ -3787,31 +3813,37 @@ impl OverlayView {
             return;
         };
         let half = (MAG_COUNT / 2) as i32;
-        let max_x = cap.width.saturating_sub(MAG_COUNT) as i32;
-        let max_y = cap.height.saturating_sub(MAG_COUNT) as i32;
-        let x = (self.mouse.x.floor() as i32 - half).clamp(0, max_x) as u32;
-        let y = (self.mouse.y.floor() as i32 - half).clamp(0, max_y) as u32;
+        let x = (self.mouse.x.floor() as i32 - half).clamp(0, i32::MAX) as u32;
+        let y = (self.mouse.y.floor() as i32 - half).clamp(0, i32::MAX) as u32;
+        // 严格越界检查要求请求区域完整落在纹理内：原点钳制之后还要钳制宽高，
+        // 否则极小画面（< MAG_COUNT）会让放大镜和取色一起静默失效。
+        let w = MAG_COUNT.min(cap.width.saturating_sub(x));
+        let h = MAG_COUNT.min(cap.height.saturating_sub(y));
+        if w == 0 || h == 0 {
+            self.mag = None;
+            self.mag_origin = None;
+            self.picked_color = None;
+            return;
+        }
         // A staging texture + CopySubresourceRegion + Map is a GPU sync; skip it
         // when the cursor has not moved to a new source pixel since the last
         // readback (high-polling mice fire hundreds of moves per painted frame).
-        if self.mag_origin == Some((x, y)) && self.mag.is_some() {
+        if self.mag_origin == Some((x, y, w, h)) && self.mag.is_some() {
             return;
         }
         self.mag = cx
-            .with_gpu_context(|_device, ctx| {
-                crate::capture::crop_sdr_bgra(cap, ctx, x, y, MAG_COUNT, MAG_COUNT)
-            })
+            .with_gpu_context(|_device, ctx| crate::capture::crop_sdr_bgra(cap, ctx, x, y, w, h))
             .and_then(|r| r.ok());
         self.mag_origin = if self.mag.is_some() {
-            Some((x, y))
+            Some((x, y, w, h))
         } else {
             None
         };
-        // The magnifier is a MAG_COUNT×MAG_COUNT crop centred on the cursor, so
-        // its middle pixel is exactly the colour under the crosshair.
-        self.picked_color = self.mag.as_ref().and_then(|(buf, w, h, stride)| {
-            let half = MAG_COUNT / 2;
-            crate::colorpicker::Color::from_bgra(buf, half, half, *w, *h, *stride)
+        // 放大镜以光标为中心；不足 MAG_COUNT 时以实际缓冲中心取色。
+        self.picked_color = self.mag.as_ref().and_then(|(buf, bw, bh, stride)| {
+            let cx = *bw / 2;
+            let cy = *bh / 2;
+            crate::colorpicker::Color::from_bgra(buf, cx, cy, *bw, *bh, *stride)
         });
     }
 
@@ -4546,6 +4578,49 @@ impl OverlayView {
         )
     }
 
+    /// 采集告警横幅：不依赖 toolbar/selection 几何，截图一落下就能看见，且
+    /// 不会被首次鼠标按下时的 `invalidate_pending_result()` 清掉。
+    fn capture_warning_element(&self) -> Option<impl IntoElement> {
+        let text = self.capture_warning.as_ref()?;
+        Some(
+            div()
+                .id("overlay-capture-warning")
+                .absolute()
+                .top(px(12.))
+                .left(px(12.))
+                .max_w(px(460.))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .p(px(10.))
+                .rounded_lg()
+                .bg(theme::surface())
+                .border_1()
+                .border_color(theme::border())
+                .shadow(vec![BoxShadow {
+                    color: theme::base().opacity(0.12),
+                    offset: point(px(0.), px(4.)),
+                    blur_radius: px(16.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }])
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::secondary_fg())
+                        .child("截图不完整"),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(theme::primary_fg())
+                        .child(text.clone()),
+                ),
+        )
+    }
+
     fn panel_element(
         &self,
         scale: f32,
@@ -4946,6 +5021,7 @@ impl Render for OverlayView {
                     active_monitor,
                 ))
                 .children(self.panel_element(scale, cx, toolbar_geom, active_monitor))
+                .children(self.capture_warning_element())
                 .children(self.text_layer(scale, &marks))
             })
     }
@@ -5961,6 +6037,22 @@ mod tests {
         assert!(!should_accept_result(u64::MAX, 0));
     }
 
+    #[test]
+    fn missing_regions_warning_lists_the_holes() {
+        assert!(missing_regions_warning(&[]).is_none());
+        let text = missing_regions_warning(&[crate::capture::MissingRegion {
+            monitor: 1,
+            x: -1920,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        }])
+        .expect("有一块缺失就必须有告警");
+        assert!(text.contains("显示器 2"), "{text}");
+        assert!(text.contains("1920×1080"), "{text}");
+        assert!(text.contains("重试"), "{text}");
+    }
+
     /// 失败面板只说中文：WGC 超时映射为原因 + 重试动作，中文回执原样透传，
     /// 未知英文保留原文并加中文前缀。
     #[test]
@@ -5974,6 +6066,17 @@ mod tests {
         assert_eq!(
             long_capture_error_text("长截图后台任务已停止"),
             "长截图后台任务已停止"
+        );
+        let missing =
+            long_capture_error_text("capture region includes a monitor that could not be captured");
+        assert!(
+            missing.contains("显示器") && missing.contains("重新截图"),
+            "{missing}"
+        );
+        let oob = long_capture_error_text("readback region (0, 0, 15, 15) is outside texture 4x4");
+        assert!(
+            oob.contains("重新截图") && !oob.contains("outside texture"),
+            "{oob}"
         );
         let unknown = long_capture_error_text("strange failure 0x1");
         assert!(unknown.starts_with("未知错误："), "{unknown}");

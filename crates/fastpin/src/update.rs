@@ -446,17 +446,22 @@ fn hash_file(path: &Path) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-/// Called on the `.part` before it is renamed into its final installer name,
-/// so an unverified file is never presented as a downloadable installer.
-fn verify_installer(part: &Path, version: &str) -> Result<()> {
-    let expected = fetch_expected_hash(version)?;
-    let actual = hash_file(part)?;
-    if actual != expected {
+fn verify_hash(path: &Path, expected: &[u8; 32]) -> Result<()> {
+    let actual = hash_file(path)?;
+    if actual != *expected {
         return Err(Error::new(
-            "安装包 SHA-256 校验失败：下载内容与发布文件不一致，已删除该文件",
+            "安装包 SHA-256 校验失败：磁盘内容与发布文件不一致",
         ));
     }
     Ok(())
+}
+
+/// 安装前用下载时缓存的哈希复核磁盘文件，防止落盘到点击安装之间被替换。
+pub fn verify_installer_hash(path: &Path, expected: &[u8; 32]) -> Result<()> {
+    if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("exe") {
+        return Err(Error::new("安装程序不存在或已失效，请重新下载"));
+    }
+    verify_hash(path, expected)
 }
 
 /// 安装范围由用户选择，而不是由启动器擅自提权。安装器用
@@ -807,8 +812,17 @@ pub fn cleanup_downloads() {
 /// once after every chunk.
 pub fn download_release_asset(
     version: &str,
-    mut on_progress: impl FnMut(DownloadProgress),
+    on_progress: impl FnMut(DownloadProgress),
 ) -> Result<PathBuf> {
+    download_release_asset_with_hash(version, on_progress).map(|(path, _)| path)
+}
+
+/// Same as [`download_release_asset`], but also returns the verified hash so
+/// the settings view can re-check the file immediately before launching it.
+pub fn download_release_asset_with_hash(
+    version: &str,
+    mut on_progress: impl FnMut(DownloadProgress),
+) -> Result<(PathBuf, [u8; 32])> {
     if !valid_version(version) {
         return Err(Error::new("版本号无效"));
     }
@@ -845,12 +859,13 @@ pub fn download_release_asset(
     fs::create_dir_all(&dir)?;
     let path = unique_temp_path(&dir, version);
 
+    let expected = fetch_expected_hash(version)?;
     match stream_body_to_file(session.request.0, &path, total, &mut on_progress)
-        .and_then(|()| verify_installer(&path, version))
+        .and_then(|()| verify_hash(&path, &expected))
     {
         // 哈希校验通过后立刻改名：`.part` 会被 24 小时清理任务删除，而且没有
         // 安装器会用它。改名在同目录内完成，是原子操作，撞名时换序号而非覆盖。
-        Ok(()) => finalize_download(&path, &dir, version),
+        Ok(()) => finalize_download(&path, &dir, version).map(|final_path| (final_path, expected)),
         Err(e) => {
             // 截断、超限或哈希不符的文件一律不留：下次启动的清理任务不该是
             // 唯一拦住未验证安装包的防线。

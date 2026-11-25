@@ -182,6 +182,19 @@ pub(crate) fn capture_region_bgra(
 ) -> Result<(Vec<u8>, u32, u32, u32)> {
     let mut perf = PerfSession::start();
     let cap = capture_from_app(cx, true, Some((abs_x, abs_y, w, h)), &mut perf)?;
+    // 跨屏选区会走 capture_all；某屏失败时合成图留有空洞，直接裁剪会把空白
+    // 拼进长截图。必须显式失败，而不是把缺口当成正常画面。
+    let (right, bottom) = (abs_x as i64 + w as i64, abs_y as i64 + h as i64);
+    if cap.missing_regions.iter().any(|m| {
+        (m.x as i64) < right
+            && (m.x as i64 + m.w as i64) > abs_x as i64
+            && (m.y as i64) < bottom
+            && (m.y as i64 + m.h as i64) > abs_y as i64
+    }) {
+        return Err(Error::new(
+            "capture region includes a monitor that could not be captured",
+        ));
+    }
     let x = abs_x - cap.origin_x;
     let y = abs_y - cap.origin_y;
     if x < 0 || y < 0 {
@@ -285,13 +298,8 @@ fn install_panic_hook() {
 
 pub fn run() -> Result<()> {
     install_panic_hook();
-    // Before anything reads settings: move the pre-rebrand profile over. It is
-    // a no-op on second start and never aborts startup.
-    crate::migrate::migrate_legacy_paths();
-    // History 维护已移到 run_tray() 的单实例 acquire 之后：prune 会整份重写
-    // index.json，STORE_LOCK 只是进程内锁，挡不住第二实例并发读改写索引。
-    // Drop installer .part files left behind by a killed or failed download.
-    crate::update::cleanup_downloads();
+    // 迁移与下载清理会跨进程改目录/删文件，必须在参数解析之后、GUI 路径的
+    // 单实例 acquire 之后执行（见 run_tray）；CLI 子命令不应碰真实用户目录。
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         attach_parent_console();
@@ -692,6 +700,11 @@ fn run_tray() -> Result<()> {
             return Ok(());
         }
     };
+    // 与历史维护同理：迁移和下载清理会整份改目录/删文件，STORE_LOCK 挡不住
+    // 第二实例，必须在 acquire 之后、且只在 GUI 路径执行。放在任何设置读取
+    // （cleanup_stale_image_temps 会用截图目录）之前完成迁移。
+    crate::migrate::migrate_legacy_paths();
+    crate::update::cleanup_downloads();
     // 清掉上次退出遗留的半截截图临时文件。必须在单实例 acquire 成功之后：
     // 若第二实例在早退前清理，会按前缀删掉第一实例正在写/等待 rename 的临时文件
     // （Windows 下 FILE_SHARE_DELETE 允许跨进程删除未关闭句柄的文件），令截图丢失。
@@ -792,15 +805,9 @@ fn boot_resident(
     // The TaskbarCreated handler re-adds the icon after the next Explorer
     // restart, so a transient failure here is recoverable.
     if let Err(e) = add_tray_icon(hwnd) {
-        crate::perf::log_app(&format!("tray icon unavailable: {e}"));
-        eprintln!("tray icon unavailable ({e}); continuing without it");
-        // Degraded mode: the LL hook and RegisterHotKey fallback are already
-        // installed above and are independent of the tray, so hotkeys still
-        // work. But the tray Exit menu is normally the only quit path, so add
-        // a dedicated quit hotkey and a one-time visible hint telling the user
-        // the app is alive and how to stop it.
-        register_emergency_quit(hwnd);
-        show_tray_unavailable_hint();
+        // Degraded mode: 热键通路与托盘独立，但托盘 Exit 是主要的退出入口，
+        // 所以补注册紧急退出热键并提示用户。
+        degrade_without_tray(hwnd, &e.to_string());
     }
     // 拖出文件的宽限期时钟由 complete() 启动，真正删除靠这里的周期 sweep。
     // 复用 GPUI 后台执行器的定时器，不新增线程；任务随 app 退出而终止。
@@ -854,6 +861,16 @@ pub fn report_error(msg: &str) {
     }
     // MessageBoxW 即使返回 Err 也必须复位标志，否则以后所有错误提示都被吞掉。
     DIALOG_ACTIVE.store(false, Ordering::SeqCst);
+}
+
+/// 托盘不可用时统一降级：补注册紧急退出热键并给出一次性可见提示。启动和
+/// Explorer 重启（TaskbarCreated）后的重新添加失败都要走这里，否则进程会
+/// 既没有托盘图标也没有退出入口。
+fn degrade_without_tray(hwnd: HWND, reason: &str) {
+    crate::perf::log_app(&format!("tray icon unavailable: {reason}"));
+    eprintln!("tray icon unavailable ({reason}); continuing without it");
+    register_emergency_quit(hwnd);
+    show_tray_unavailable_hint();
 }
 
 /// One-time, best-effort visible notice for tray-less mode. Shown on a helper
@@ -1010,7 +1027,10 @@ unsafe extern "system" fn hidden_proc(
     // Tray menu: the popup runs its own modal loop inside `handle_tray`, so
     // there is no owner-draw traffic on the hidden window any more.
     if msg == taskbar_created_message() {
-        let _ = add_tray_icon(hwnd);
+        if let Err(e) = add_tray_icon(hwnd) {
+            // 不能静默吞掉：没有托盘图标时同样需要紧急退出通路和可见提示。
+            degrade_without_tray(hwnd, &e.to_string());
+        }
         return LRESULT(0);
     }
     if msg == WM_TRAYICON {
@@ -1421,6 +1441,15 @@ fn default_image_path(export: &crate::config::Export) -> Result<(PathBuf, PathBu
     Ok((target, temp))
 }
 
+/// 候选名是否已被另一次截图预留。`publish_image` 在首选名被外部占用时会
+/// 退到 `<stem>_2.ext` 等名字，这些名字可能正是别的截图的预留目标。
+fn is_reserved_path(path: &Path) -> bool {
+    SAVE_PATH_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(path)
+}
+
 /// 写盘失败时把预留的目标名还回池子，避免一次失败永久占住这个文件名。
 fn release_reserved_path(path: &Path) {
     let mut reserved = SAVE_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1473,7 +1502,12 @@ fn publish_image(temp: &Path, target: &Path) -> Result<PathBuf> {
         let candidate = if n == 0 {
             target.to_path_buf()
         } else {
-            dir.join(format!("{stem}_{}.{ext}", n + 1))
+            // 首选名是本调用自己预留的；后续避让名若被别的截图预留，必须跳过。
+            let candidate = dir.join(format!("{stem}_{}.{ext}", n + 1));
+            if is_reserved_path(&candidate) {
+                continue;
+            }
+            candidate
         };
         // 查重与 rename 都用长路径形式，但返回给用户的是原始候选路径。
         let io_candidate = crate::config::extended_path(&candidate);

@@ -110,17 +110,36 @@ pub fn set_api_key(key: &str) -> Result<()> {
     let vault = PasswordVault::new()?;
     let resource = HSTRING::from(VAULT_RESOURCE);
     let account = HSTRING::from(VAULT_ACCOUNT);
-    if let Ok(existing) = vault.Retrieve(&resource, &account) {
-        vault.Remove(&existing)?;
-    }
     let key = key.trim();
+
+    // 先备份旧凭据再删除：Add/CreatePasswordCredential 任一失败都要把旧
+    // Key 放回去，否则设置页只显示“保存失败”，原 Key 却已经没了。
+    // RetrievePassword 把密码读进对象，之后可以直接把同一个对象 Add 回去。
+    let old = match vault.Retrieve(&resource, &account) {
+        Ok(cred) => {
+            cred.RetrievePassword()?;
+            vault.Remove(&cred)?;
+            Some(cred)
+        }
+        Err(_) => None,
+    };
+
     if key.is_empty() {
         return Ok(());
     }
-    let cred =
-        PasswordCredential::CreatePasswordCredential(&resource, &account, &HSTRING::from(key))?;
-    vault.Add(&cred)?;
-    Ok(())
+
+    let result = (|| -> Result<()> {
+        let cred =
+            PasswordCredential::CreatePasswordCredential(&resource, &account, &HSTRING::from(key))?;
+        vault.Add(&cred)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        if let Some(cred) = old.as_ref() {
+            let _ = vault.Add(cred);
+        }
+    }
+    result
 }
 
 /// 读取 vault 条目密码的三种结果。`Retrieve` 成功只证明条目存在，密码

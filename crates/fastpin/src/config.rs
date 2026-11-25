@@ -5,7 +5,8 @@
 //! vault, shared with the C# build. See `translate::api_key`.
 
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -1430,23 +1431,31 @@ pub fn get() -> Settings {
     // 就会把默认值整份写回原文件。先把原文件改名留档，save 写的是新文件，
     // 用户仍可从 .broken-* 备份恢复；本次也不写缓存，避免污染后续读取。
     let recoverable = load_text_is_recoverable(&result);
+    // 只有在原文成功隔离（或本来就没有可损坏的文件）时才允许缓存默认值。
+    // 隔离失败时缓存 + 后续 save 会把用户刚修好的原配置整份覆盖。
+    let mut cache_defaults = recoverable;
     if !recoverable {
-        if let Ok(p) = path() {
-            quarantine_broken(&p, None);
+        let quarantined = path().map(|p| quarantine_broken(&p, None)).unwrap_or(false);
+        if !quarantined {
+            block_save_after_failed_quarantine();
         }
+        cache_defaults = false;
     }
     let text = result.unwrap_or_default();
     // 语法错误 / 非对象根节点会让 parse 直接回默认值；若放任不管，下一次
     // 保存会把默认值整份写回，原配置永久丢失。先把损坏文件改名留档，
     // 之后的 save 写的是新文件，用户仍可从 .broken-* 备份恢复。
     if is_broken_config(&text) {
-        if let Ok(p) = path() {
-            quarantine_broken(&p, Some(&text));
+        let quarantined = path()
+            .map(|p| quarantine_broken(&p, Some(&text)))
+            .unwrap_or(false);
+        if !quarantined {
+            block_save_after_failed_quarantine();
+            cache_defaults = false;
         }
     }
     let loaded = parse(&text);
-    if !recoverable {
-        // 读失败时原文件可能还没隔离成功，绝不缓存默认值。
+    if !cache_defaults {
         return loaded;
     }
     let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
@@ -1459,12 +1468,20 @@ pub fn get() -> Settings {
 /// than a truncated file that silently resets everything on next start.
 /// Cache-last: on failure the process keeps the settings the user can see.
 pub fn save(settings: &Settings) -> Result<()> {
+    if SAVE_BLOCKED.load(Ordering::Acquire) {
+        return Err(Error::new(
+            "配置文件损坏且隔离失败，已拒绝保存；请手动修复 settings.json 后重启",
+        ));
+    }
+    let _write_guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(settings).map_err(|e| Error::new(format!("{e}")))?;
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    // 临时名带自增序号：即便将来有后台任务加入 save，也不会共用同一个文件。
+    let seq = SAVE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), seq));
     write_temp_file(&tmp, |p| std::fs::write(p, &text))?;
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
@@ -1515,6 +1532,19 @@ pub fn cleanup_stale_temp_files() {
 fn cache() -> &'static RwLock<Option<Settings>> {
     static CACHE: RwLock<Option<Settings>> = RwLock::new(None);
     &CACHE
+}
+
+/// 损坏配置隔离失败时，本次进程一律拒绝保存：否则默认值会把用户刚修好的
+/// settings.json 整份覆盖。只在进程内生效，重启后可重新尝试。
+static SAVE_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// 序列化 → 写临时文件 → rename 全程持锁，避免后台任务加入后两个 save
+/// 共用同一个临时文件、互相发布半写内容。
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+static SAVE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn block_save_after_failed_quarantine() {
+    SAVE_BLOCKED.store(true, Ordering::Release);
+    crate::perf::log_app("settings.json 隔离失败：本次进程已禁用保存，避免默认值覆盖原文件");
 }
 
 /// 读配置文件，区分“文件不存在”与真正的 IO 失败。过去这里把所有错误都

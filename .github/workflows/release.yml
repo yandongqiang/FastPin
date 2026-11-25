@@ -56,14 +56,14 @@ jobs:
           Invoke-WebRequest "https://raw.githubusercontent.com/jrsoftware/issrc/is-6_7_3/Files/Languages/Unofficial/ChineseSimplified.isl" -OutFile $lang
       - name: Build installer
         run: |
-          $ver = "${{ github.ref_name }}".TrimStart('v')
+          $ver = "${{ github.ref_name }}" -replace '^[vV]+',''
           & $env:ISCC /DAppVersion=$ver installer\fastpin.iss
       # The in-app updater refuses to execute an installer whose SHA-256 does
       # not match this manifest. Publish it from the same build so the hash
       # always describes the exact asset uploaded below.
       - name: Publish installer checksum
         run: |
-          $ver = "${{ github.ref_name }}".TrimStart('v')
+          $ver = "${{ github.ref_name }}" -replace '^[vV]+',''
           $asset = "FastPin-v$ver-x64-setup.exe"
           $hash = (Get-FileHash -Algorithm SHA256 "dist/$asset").Hash.ToLowerInvariant()
           "$hash  $asset" | Out-File -Encoding ascii "dist/SHA256SUMS.txt"

@@ -60,8 +60,8 @@ pub(crate) fn read_response(request: *mut c_void, cap: usize) -> Result<Vec<u8>>
         let extra = available as usize;
         if extra > cap.saturating_sub(at) {
             return Err(Error::new(format!(
-                "响应过大（超过 {} MiB）",
-                cap / (1024 * 1024)
+                "响应过大（超过 {}）",
+                response_limit_label(cap)
             )));
         }
         payload.resize(at + extra, 0u8);
@@ -81,6 +81,15 @@ pub(crate) fn read_response(request: *mut c_void, cap: usize) -> Result<Vec<u8>>
         }
     }
     Ok(payload)
+}
+
+/// 8 KiB 的校验文件上限不能显示成“超过 0 MiB”。
+fn response_limit_label(cap: usize) -> String {
+    if cap >= 1024 * 1024 {
+        format!("{} MiB", cap / 1024 / 1024)
+    } else {
+        format!("{} KiB", cap / 1024)
+    }
 }
 
 /// Removes `user:password@` from a URL before it is echoed in an error message.
@@ -268,6 +277,12 @@ pub(crate) fn stream_body_to_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_limit_label_uses_kib_for_small_caps() {
+        assert_eq!(response_limit_label(8 * 1024), "8 KiB");
+        assert_eq!(response_limit_label(8 * 1024 * 1024), "8 MiB");
+    }
 
     #[test]
     fn redacts_userinfo_but_keeps_the_host() {

@@ -601,6 +601,8 @@ pub struct SettingsView {
     update_download_cancel: Arc<AtomicBool>,
     update_progress: Option<crate::update::DownloadProgress>,
     downloaded_installer: Option<PathBuf>,
+    /// 下载时已验证的 SHA-256；安装前用它在磁盘上复核一次文件未被替换。
+    downloaded_installer_hash: Option<[u8; 32]>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1049,6 +1051,7 @@ impl SettingsView {
             update_download_cancel: Arc::new(AtomicBool::new(false)),
             update_progress: None,
             downloaded_installer: None,
+            downloaded_installer_hash: None,
             _subscriptions: subscriptions,
         }
     }
@@ -2499,6 +2502,7 @@ impl SettingsView {
         self.update_downloading = true;
         self.update_progress = None;
         self.downloaded_installer = None;
+        self.downloaded_installer_hash = None;
         // 新一次下载重置上次的取消标记；关窗回调持有的是同一个 Arc。
         self.update_download_cancel.store(false, Ordering::Release);
         let cancel = self.update_download_cancel.clone();
@@ -2506,7 +2510,7 @@ impl SettingsView {
 
         enum Msg {
             Progress(crate::update::DownloadProgress),
-            Done(std::result::Result<PathBuf, String>),
+            Done(std::result::Result<(PathBuf, [u8; 32]), String>),
         }
         let (tx, rx) = mpsc::channel::<Msg>();
         let finished = Arc::new(AtomicBool::new(false));
@@ -2517,7 +2521,7 @@ impl SettingsView {
                 flag.store(true, Ordering::Release);
                 return;
             }
-            let outcome = crate::update::download_release_asset(&version, |progress| {
+            let outcome = crate::update::download_release_asset_with_hash(&version, |progress| {
                 // 关窗后不再有接收方：跳过进度上报，别再堆积消息。
                 // net 层的回调是 FnMut(DownloadProgress) 且无返回值，
                 // 无法从这里直接中断 WinHTTP 读取，只能等它自己收尾。
@@ -2530,13 +2534,22 @@ impl SettingsView {
                 // 关窗已置位取消标记：轮询任务会立刻退出并 drop rx，Done 发到
                 // 断开的通道也没人处理。worker 自己删掉已落盘的安装包，
                 // 避免留下无人认领、要等下次启动才被清理的孤儿文件。
-                if let Ok(path) = &outcome {
+                if let Ok((path, _)) = &outcome {
                     let _ = std::fs::remove_file(path);
                 }
                 flag.store(true, Ordering::Release);
                 return;
             }
+            // 取消标记可能在上面检查之后、send 之前/之后才置位：轮询任务
+            // 此时可能已经丢弃 rx。send 完再确认一次，确保已落盘的安装包
+            // 不会变成无人认领的孤儿文件。
+            let downloaded = outcome.as_ref().ok().map(|(path, _)| path.clone());
             let _ = tx.send(Msg::Done(outcome.map_err(|e| e.to_string())));
+            if worker_cancel.load(Ordering::Acquire) {
+                if let Some(path) = downloaded {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
             flag.store(true, Ordering::Release);
         });
 
@@ -2547,10 +2560,11 @@ impl SettingsView {
                         .update(cx, |this, cx| {
                             match msg {
                                 Msg::Progress(p) => this.update_progress = Some(p),
-                                Msg::Done(Ok(path)) => {
+                                Msg::Done(Ok((path, hash))) => {
                                     this.update_downloading = false;
                                     this.update_progress = None;
                                     this.downloaded_installer = Some(path);
+                                    this.downloaded_installer_hash = Some(hash);
                                     this.ok("安装包已下载");
                                 }
                                 Msg::Done(Err(e)) => {
@@ -2572,16 +2586,24 @@ impl SettingsView {
                     .await;
             }
             if cancel.load(Ordering::Acquire) {
+                // 关窗竞态：Done 可能刚进通道，轮询就看到 cancel。能取到就删，
+                // 取不到则由 worker 在 send 后复查取消标记负责删除。
+                while let Ok(msg) = rx.try_recv() {
+                    if let Msg::Done(Ok((path, _))) = msg {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
                 return;
             }
             // Drain the final Done message after the worker set its flag.
             while let Ok(msg) = rx.try_recv() {
                 if this
                     .update(cx, |this, cx| {
-                        if let Msg::Done(Ok(path)) = msg {
+                        if let Msg::Done(Ok((path, hash))) = msg {
                             this.update_downloading = false;
                             this.update_progress = None;
                             this.downloaded_installer = Some(path);
+                            this.downloaded_installer_hash = Some(hash);
                             this.ok("安装包已下载");
                         } else if let Msg::Done(Err(e)) = msg {
                             this.update_downloading = false;
@@ -2619,6 +2641,15 @@ impl SettingsView {
         let Some(path) = self.downloaded_installer.clone() else {
             return;
         };
+        // 下载时验过一次，这里在启动前对磁盘文件再验一次：两次点击之间
+        // 文件可能被替换。哈希在下载时缓存，不在 UI 线程发网络请求。
+        if let Some(hash) = self.downloaded_installer_hash {
+            if let Err(e) = crate::update::verify_installer_hash(&path, &hash) {
+                self.fail(format!("安装前校验失败：{e}"));
+                cx.notify();
+                return;
+            }
+        }
         match crate::update::launch_installer(&path, scope) {
             Ok(()) => {
                 self.ok(match scope {

@@ -22,10 +22,12 @@ AppPublisherURL=https://github.com/yandongqiang/FastPin
 AppSupportURL=https://github.com/yandongqiang/FastPin/issues
 AppUpdatesURL=https://github.com/yandongqiang/FastPin/releases/latest
 ; Default to a per-user install (no UAC prompt). The updater asks which scope
-; the user wants and passes /CURRENTUSER or /ALLUSERS; a manually launched
-; setup shows Inno Setup's own scope dialog instead. Both paths are supported.
+; the user wants and passes /CURRENTUSER or /ALLUSERS. UsePreviousPrivileges=no
+; makes a manually launched setup ask as well instead of silently reusing the
+; old per-user mode. Both install scopes are supported.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+UsePreviousPrivileges=no
 DefaultDirName={autopf}\FastPin
 DefaultGroupName=FastPin
 OutputDir=..\dist
@@ -45,8 +47,9 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
+; 开机启动由应用自身在设置页管理（HKCU，当前用户）。安装器在 /ALLUSERS
+; 提权上下文里写 HKCU 会落到管理员账户，因此不再提供这个选项。
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "autostart"; Description: "开机自动启动"; GroupDescription: "其他选项:"; Flags: unchecked
 
 [Files]
 Source: "..\target\release\FastPin.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -64,10 +67,8 @@ Name: "{group}\FastPin"; Filename: "{app}\FastPin.exe"
 Name: "{group}\卸载 FastPin"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\FastPin"; Filename: "{app}\FastPin.exe"; Tasks: desktopicon
 
-[Registry]
-; ValueName matches settings::system::RUN_VALUE. An in-place upgrade also gets
-; the app's own first-start migration, which moves a legacy autostart value.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "FastPin"; ValueData: """{app}\FastPin.exe"""; Flags: uninsdeletevalue; Tasks: autostart
+; 没有 [Registry] 段：开机启动由应用自身写当前用户 HKCU，旧值由
+; migrate_legacy_run_value() 迁移。提权的 /ALLUSERS 安装不能在这里写 HKCU。
 
 [Run]
 Filename: "{app}\FastPin.exe"; Description: "{cm:LaunchProgram,FastPin}"; Flags: nowait postinstall skipifsilent

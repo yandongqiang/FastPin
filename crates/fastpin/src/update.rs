@@ -219,10 +219,11 @@ fn get(url: &str) -> Result<String> {
             0,
         ));
         if session.0.is_null() {
-            return Err(Error::new("WinHttpOpen failed"));
+            // 本地网络栈初始化失败，不是服务端问题：给出可操作的方向。
+            return Err(Error::new("网络初始化失败，请检查网络或代理设置后重试"));
         }
         let ms = (TIMEOUT_SECONDS * 1000) as i32;
-        WinHttpSetTimeouts(session.0, ms, ms, ms, ms)?;
+        WinHttpSetTimeouts(session.0, ms, ms, ms, ms).map_err(|e| crate::net::winhttp_error(&e))?;
 
         let connect = Handle(WinHttpConnect(
             session.0,
@@ -231,7 +232,8 @@ fn get(url: &str) -> Result<String> {
             0,
         ));
         if connect.0.is_null() {
-            return Err(Error::new("WinHttpConnect failed"));
+            // 连不上更新服务器，多为代理或 DNS 问题，提示稍后重试。
+            return Err(Error::new("无法连接到更新服务器，请稍后重试"));
         }
 
         let request = Handle(WinHttpOpenRequest(
@@ -248,11 +250,14 @@ fn get(url: &str) -> Result<String> {
             },
         ));
         if request.0.is_null() {
-            return Err(Error::new("WinHttpOpenRequest failed"));
+            // 会话与连接都有效却建不出请求，按瞬时故障提示重试。
+            return Err(Error::new("无法创建更新请求，请稍后重试"));
         }
 
-        WinHttpSendRequest(request.0, None, None, 0, 0, 0)?;
-        WinHttpReceiveResponse(request.0, std::ptr::null_mut())?;
+        WinHttpSendRequest(request.0, None, None, 0, 0, 0)
+            .map_err(|e| crate::net::winhttp_error(&e))?;
+        WinHttpReceiveResponse(request.0, std::ptr::null_mut())
+            .map_err(|e| crate::net::winhttp_error(&e))?;
 
         let mut status = 0u32;
         let mut size = std::mem::size_of::<u32>() as u32;
@@ -263,7 +268,8 @@ fn get(url: &str) -> Result<String> {
             Some(&mut status as *mut u32 as *mut c_void),
             &mut size,
             std::ptr::null_mut(),
-        )?;
+        )
+        .map_err(|e| crate::net::winhttp_error(&e))?;
 
         let payload = crate::net::read_response(request.0, crate::net::MAX_RESPONSE_BYTES)?;
 
@@ -500,10 +506,11 @@ unsafe fn begin_download(url: &str) -> Result<(DownloadSession, ResponseHead)> {
             0,
         ));
         if session.0.is_null() {
-            return Err(Error::new("WinHttpOpen failed"));
+            // 与检查更新同一条网络初始化路径，文案保持一致。
+            return Err(Error::new("网络初始化失败，请检查网络或代理设置后重试"));
         }
         let ms = (TIMEOUT_SECONDS * 1000) as i32;
-        WinHttpSetTimeouts(session.0, ms, ms, ms, ms)?;
+        WinHttpSetTimeouts(session.0, ms, ms, ms, ms).map_err(|e| crate::net::winhttp_error(&e))?;
 
         let connect = Handle(WinHttpConnect(
             session.0,
@@ -512,7 +519,8 @@ unsafe fn begin_download(url: &str) -> Result<(DownloadSession, ResponseHead)> {
             0,
         ));
         if connect.0.is_null() {
-            return Err(Error::new("WinHttpConnect failed"));
+            // 下载同样连不上更新服务器，提示稍后重试。
+            return Err(Error::new("无法连接到更新服务器，请稍后重试"));
         }
 
         let request = Handle(WinHttpOpenRequest(
@@ -529,11 +537,14 @@ unsafe fn begin_download(url: &str) -> Result<(DownloadSession, ResponseHead)> {
             },
         ));
         if request.0.is_null() {
-            return Err(Error::new("WinHttpOpenRequest failed"));
+            // 会话与连接都有效却建不出请求，按瞬时故障提示重试。
+            return Err(Error::new("无法创建更新请求，请稍后重试"));
         }
 
-        WinHttpSendRequest(request.0, None, None, 0, 0, 0)?;
-        WinHttpReceiveResponse(request.0, std::ptr::null_mut())?;
+        WinHttpSendRequest(request.0, None, None, 0, 0, 0)
+            .map_err(|e| crate::net::winhttp_error(&e))?;
+        WinHttpReceiveResponse(request.0, std::ptr::null_mut())
+            .map_err(|e| crate::net::winhttp_error(&e))?;
 
         let status = query_u32_header(request.0, WINHTTP_QUERY_STATUS_CODE).unwrap_or(0);
         let total = query_u32_header(request.0, WINHTTP_QUERY_CONTENT_LENGTH).map(u64::from);

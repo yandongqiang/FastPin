@@ -187,7 +187,11 @@ pub(crate) fn start(cx: &mut App, group: u64, tiles: &[TileSnapshot]) {
                     edit.extent = (bw, bh);
                     edit.backdrop = backdrop;
                 }
-                None => crate::perf::log_app("pin edit: backdrop compose failed"),
+                None => {
+                    crate::perf::log_app("pin edit: backdrop compose failed");
+                    // 底图没合成出来时依赖它的效果会静默失效，必须让用户看见原因。
+                    crate::app::report_error("底图合成失败，马赛克暂不可用，请关闭后重新进入编辑");
+                }
             }
             edit.preparing = false;
             drop(edit);

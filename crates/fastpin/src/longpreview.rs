@@ -329,6 +329,8 @@ impl LongPreviewView {
     /// 文件写入在后台线程完成：只有收到写线程的回报才置 `saved`，其间显示
     /// "保存中…"，失败则由主线程显示原因（写线程自身也会弹可见错误框）。
     fn export(&mut self, write_file: bool, copy: bool, cx: &mut Context<Self>) {
+        // 状态栏只反映最近一次操作：上一次保存失败不能留在下一次导出的状态里。
+        self.save_error = None;
         let (w, h) = self.pixel_size;
         let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
         let result = crate::app::export_pixels_shared_reported(

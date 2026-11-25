@@ -257,6 +257,15 @@ pub fn encode_bgra(
     }
 }
 
+/// WIC expects `ImageQuality` as a float in 0.0..=1.0, but the UI exposes
+/// 1..=100. Writing the raw byte made every setting above 1 clamp to 1.0 in
+/// WIC, so changing 90 -> 10 still exported at maximum quality. Clamp the UI
+/// value first, then normalize it into WIC's range. Pure so it can be tested
+/// without COM.
+fn wic_quality(quality: u32) -> f32 {
+    quality.clamp(1, 100) as f32 / 100.0
+}
+
 /// Writes `ImageQuality` into the frame's encoder options. Only the lossy
 /// formats declare it: asking a PNG encoder for a quality property is an error
 /// on some WIC builds, and passing a property the encoder does not know is how
@@ -281,7 +290,7 @@ unsafe fn set_encoder_quality(bag: &IPropertyBag2, format: ImageFormat, quality:
     {
         let inner = &mut *value.Anonymous.Anonymous;
         inner.vt = VT_R4;
-        inner.Anonymous.fltVal = quality as f32;
+        inner.Anonymous.fltVal = wic_quality(quality as u32);
     }
     bag.Write(1, &prop, &value)
         .map_err(|e| Error::new(format!("WIC ImageQuality {quality}: {e}")))
@@ -552,6 +561,32 @@ mod tests {
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
     const SIG: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10];
+
+    #[test]
+    fn wic_quality_normalizes_the_ui_range() {
+        assert_eq!(
+            wic_quality(1),
+            0.01_f32,
+            "1 maps to the lowest non-zero WIC quality"
+        );
+        assert_eq!(
+            wic_quality(50),
+            0.5_f32,
+            "50 maps to the middle of WIC's range"
+        );
+        assert_eq!(
+            wic_quality(100),
+            1.0_f32,
+            "100 maps to the top of WIC's range"
+        );
+        assert_eq!(wic_quality(0), 0.01_f32, "values below 1 clamp up");
+        assert_eq!(wic_quality(101), 1.0_f32, "values above 100 clamp down");
+        assert_eq!(
+            wic_quality(u32::MAX),
+            1.0_f32,
+            "a far out-of-range value still clamps down"
+        );
+    }
 
     #[test]
     fn encode_png_has_signature_and_iend() {

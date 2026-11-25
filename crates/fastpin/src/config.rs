@@ -1335,13 +1335,51 @@ pub fn save(settings: &Settings) -> Result<()> {
     }
     let text = serde_json::to_string_pretty(settings).map_err(|e| Error::new(format!("{e}")))?;
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, &text)?;
+    write_temp_file(&tmp, |p| std::fs::write(p, &text))?;
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
     *cache().write().unwrap_or_else(|e| e.into_inner()) = Some(settings.clone());
     Ok(())
+}
+
+/// 写临时文件；写入失败（磁盘满 / 目录只读 / 句柄被占用）时删除可能残留的
+/// 半成品，避免 `settings.tmp-<pid>` 散落在配置目录里。
+/// `write` 以参数注入，便于单测模拟“建了文件但返回错误”的半写入场景。
+fn write_temp_file(
+    tmp: &Path,
+    write: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if let Err(e) = write(tmp) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 删除目录下所有 `settings.tmp-*` 残留（上次进程被强杀时 save 来不及清理的）。
+fn cleanup_temp_files_in(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("settings.tmp-") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// 启动时 best-effort 清理陈旧的 `settings.tmp-<pid>` 临时文件。
+/// 正常路径下 save 失败会自己删除，这里只兜底进程被强杀的情况；
+/// 任何失败都静默忽略，绝不影响启动。需要主会话在 app.rs 的启动 sweep 里接线调用。
+pub fn cleanup_stale_temp_files() {
+    if let Ok(p) = path() {
+        if let Some(parent) = p.parent() {
+            cleanup_temp_files_in(parent);
+        }
+    }
 }
 
 fn cache() -> &'static RwLock<Option<Settings>> {
@@ -2475,5 +2513,50 @@ mod tests {
         assert_eq!(recovered.screenshot.hidden_toolbar_items[0], "tool-0");
         assert_eq!(recovered.screenshot.record_history_sources.len(), 256);
         assert_eq!(recovered.screenshot.record_history_sources[0], "src-0");
+    }
+
+    /// 写临时文件失败时不能留下半成品：这里模拟“文件已创建但写入返回错误”
+    /// 的场景（磁盘满 / 只读目录的真实失败无法可靠注入）。
+    #[test]
+    fn failed_temp_write_removes_partial_file() {
+        let dir = test_dir("temp-write-fail");
+        let tmp = dir.join("settings.tmp-4242");
+        let result = write_temp_file(&tmp, |p| {
+            std::fs::write(p, b"partial")?;
+            Err(std::io::Error::other("simulated disk full"))
+        });
+        assert!(result.is_err(), "写失败应向外传播错误");
+        assert!(!tmp.exists(), "写失败后残留的临时文件必须被删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 成功路径不能误删临时文件（rename 还需要它）。
+    #[test]
+    fn successful_temp_write_keeps_file() {
+        let dir = test_dir("temp-write-ok");
+        let tmp = dir.join("settings.tmp-4243");
+        let result = write_temp_file(&tmp, |p| std::fs::write(p, b"complete"));
+        assert!(result.is_ok(), "写成功应返回 Ok");
+        assert!(tmp.exists(), "写成功时临时文件应保留供 rename 使用");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动 sweep 只清 `settings.tmp-*`，不能碰正常配置和其它文件。
+    #[test]
+    fn cleanup_removes_only_stale_temp_files() {
+        let dir = test_dir("cleanup-temp");
+        let stale = dir.join("settings.tmp-9999");
+        let config = dir.join("settings.json");
+        let unrelated = dir.join("notes.txt");
+        std::fs::write(&stale, b"partial").expect("writes stale temp");
+        std::fs::write(&config, b"{}").expect("writes config");
+        std::fs::write(&unrelated, b"keep").expect("writes unrelated file");
+
+        cleanup_temp_files_in(&dir);
+
+        assert!(!stale.exists(), "陈旧的 settings.tmp-* 应被清理");
+        assert!(config.exists(), "正常配置文件不能删除");
+        assert!(unrelated.exists(), "非临时文件不能删除");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

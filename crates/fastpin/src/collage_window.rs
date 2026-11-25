@@ -209,15 +209,20 @@ fn alloc_canvas(w: u32, h: u32, bg: [u8; 4]) -> Option<Vec<u8>> {
     Some(canvas)
 }
 
-/// 解析 PNG 导出路径：同名文件已存在时依次尝试 `name (1).png`、
-/// `name (2).png`…，避免同秒重复导出覆盖上一次的结果。路径探测通过
-/// `exists` 注入，便于纯函数单测不碰磁盘。
-fn unique_png_export_path(dir: &Path, stem: &str, exists: impl Fn(&Path) -> bool) -> PathBuf {
+/// 统一的导出命名逻辑：同名文件已存在时依次尝试 `name (1).ext`、
+/// `name (2).ext`…，避免同秒重复导出覆盖上一次的结果。PNG/PDF 共用，
+/// 路径探测通过 `exists` 注入，便于纯函数单测不碰磁盘。
+fn unique_export_path(
+    dir: &Path,
+    stem: &str,
+    ext: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
     for suffix in 0..u32::MAX {
         let name = if suffix == 0 {
-            format!("{stem}.png")
+            format!("{stem}.{ext}")
         } else {
-            format!("{stem} ({suffix}).png")
+            format!("{stem} ({suffix}).{ext}")
         };
         let candidate = dir.join(name);
         if !exists(&candidate) {
@@ -225,7 +230,87 @@ fn unique_png_export_path(dir: &Path, stem: &str, exists: impl Fn(&Path) -> bool
         }
     }
     // 序号耗尽（实际上不可能）时退回原名，交给写入逻辑报错。
-    dir.join(format!("{stem}.png"))
+    dir.join(format!("{stem}.{ext}"))
+}
+
+/// PNG 导出路径，见 `unique_export_path`。
+fn unique_png_export_path(dir: &Path, stem: &str, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    unique_export_path(dir, stem, "png", exists)
+}
+
+/// PDF 导出路径：与 PNG 同样的 `(n)` 后缀策略，绝不覆盖已有成品。
+fn unique_pdf_export_path(dir: &Path, stem: &str, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    unique_export_path(dir, stem, "pdf", exists)
+}
+
+/// 导出临时文件的进程内序号，与 pid 拼在一起保证多窗口/多进程并发写盘
+/// 不会共用同一个临时文件而被 `File::create` 互相截断。
+static EXPORT_TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_export_temp_seq() -> u64 {
+    EXPORT_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 同级唯一临时路径：`name.<pid>.<seq>.tmp`。pid/seq 显式传入以便纯函数单测。
+fn export_temp_path(path: &Path, pid: u32, seq: u64) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.{pid}.{seq}.tmp"))
+}
+
+/// 把写完的临时文件发布到 `preferred`：目标已存在则依次退到 `<stem> (n).<ext>`，
+/// 绝不覆盖或删除已有成品。`exists` 预检 + rename 失败重试应对并发抢占。
+fn publish_file(temp: &Path, preferred: &Path) -> std::io::Result<PathBuf> {
+    let dir = preferred.parent().unwrap_or_else(|| Path::new("."));
+    let stem = preferred
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let ext = preferred
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    for suffix in 0..u32::MAX {
+        let candidate = if suffix == 0 {
+            preferred.to_path_buf()
+        } else {
+            dir.join(format!("{stem} ({suffix}).{ext}"))
+        };
+        if candidate.exists() {
+            continue;
+        }
+        match std::fs::rename(temp, &candidate) {
+            Ok(()) => return Ok(candidate),
+            // rename 与 exists 之间被外部抢占：换下一个候选名重试。
+            Err(_) if candidate.exists() => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("导出候选路径序号耗尽"))
+}
+
+/// 先写临时文件、成功后再原子发布。写入或发布失败都删除临时文件，目标路径上
+/// 永远不留下半截文件。PNG 与 PDF 共用这一流程。
+fn write_export_atomically<E: From<std::io::Error>>(
+    temp: &Path,
+    preferred: &Path,
+    write: impl FnOnce(&Path) -> Result<(), E>,
+) -> Result<PathBuf, E> {
+    if let Err(e) = write(temp) {
+        let _ = std::fs::remove_file(temp);
+        return Err(e);
+    }
+    match publish_file(temp, preferred) {
+        Ok(path) => Ok(path),
+        Err(e) => {
+            let _ = std::fs::remove_file(temp);
+            Err(E::from(e))
+        }
+    }
 }
 
 /// Nearest-neighbour blit that scales `src` into `rect` and applies the
@@ -372,17 +457,6 @@ fn pdf_image_xobject(item: &PdfImage, quality: u8) -> Option<ImageXObject> {
     })
 }
 
-/// Sibling staging path used to write a PDF before publishing it atomically.
-/// Writing straight to the destination would leave a truncated file behind
-/// when `save` or `flush` fails.
-fn pdf_temp_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    path.with_file_name(format!("{name}.tmp"))
-}
-
 /// User-facing note for images that could not be embedded in the PDF.
 fn pdf_skipped_warning(count: usize) -> String {
     if count == 0 {
@@ -483,32 +557,27 @@ fn generate_pdfs(
             continue;
         }
 
-        let name = if per_page {
-            format!("FastPin_Collage_{stamp}_p{}.pdf", group_idx + 1)
+        let stem = if per_page {
+            format!("FastPin_Collage_{stamp}_p{}", group_idx + 1)
         } else {
-            format!("FastPin_Collage_{stamp}.pdf")
+            format!("FastPin_Collage_{stamp}")
         };
-        let path = dir.join(name);
-        let temp_path = pdf_temp_path(&path);
-        // Write to a sibling temp file, then publish with an atomic rename.
-        // A save/flush failure leaves no truncated PDF at `path`.
-        let result = (|| -> std::io::Result<()> {
-            let file = std::fs::File::create(&temp_path)?;
-            let mut writer = std::io::BufWriter::new(file);
-            doc.save(&mut writer).map_err(std::io::Error::other)?;
-            std::io::Write::flush(&mut writer)?;
-            drop(writer);
-            // The timestamped name is normally free, but replace a stale
-            // file from an earlier same-second export before publishing.
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-            }
-            std::fs::rename(&temp_path, &path)
-        })();
+        // 与 PNG 一样遇到同名就加 `(n)` 后缀，绝不删除上一次已发布的 PDF。
+        let preferred = unique_pdf_export_path(&dir, &stem, |p| p.exists());
+        let temp_path = export_temp_path(&preferred, std::process::id(), next_export_temp_seq());
+        // 写同级唯一临时文件，成功后再原子发布；save/flush 失败不会留下半截 PDF。
+        let result =
+            write_export_atomically(&temp_path, &preferred, |path| -> std::io::Result<()> {
+                let file = std::fs::File::create(path)?;
+                let mut writer = std::io::BufWriter::new(file);
+                doc.save(&mut writer).map_err(std::io::Error::other)?;
+                std::io::Write::flush(&mut writer)?;
+                drop(writer);
+                Ok(())
+            });
         match result {
-            Ok(()) => written.push(path),
+            Ok(path) => written.push(path),
             Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
                 error = Some(e);
                 break;
             }
@@ -966,14 +1035,20 @@ impl CollageWindowView {
             time.second()
         );
         // 同秒再导出改用 `name (n).png`，不覆盖前一次结果。
-        let path = unique_png_export_path(&dir, &name, |p| p.exists());
-
-        if let Err(e) = write_png_file(&path, &canvas, w, h, w * 4) {
-            self.exporting = false;
-            self.status = SharedString::from(format!("导出失败: {}", e));
-            cx.notify();
-            return;
-        }
+        let preferred = unique_png_export_path(&dir, &name, |p| p.exists());
+        // 先写同级唯一临时文件再发布；写入中途失败不会在目标路径留下半截 PNG。
+        let temp_path = export_temp_path(&preferred, std::process::id(), next_export_temp_seq());
+        let path = match write_export_atomically(&temp_path, &preferred, |p| {
+            write_png_file(p, &canvas, w, h, w * 4)
+        }) {
+            Ok(path) => path,
+            Err(e) => {
+                self.exporting = false;
+                self.status = SharedString::from(format!("导出失败: {}", e));
+                cx.notify();
+                return;
+            }
+        };
 
         self.exporting = false;
         self.export_result = Some(ExportResult {
@@ -2695,11 +2770,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pdf_temp_path_is_a_sibling_that_keeps_the_original() {
+    fn export_temp_path_is_a_sibling_that_keeps_the_original() {
         let target = Path::new("out").join("FastPin_Collage_1.pdf");
-        let temp = pdf_temp_path(&target);
-        assert_eq!(temp, Path::new("out").join("FastPin_Collage_1.pdf.tmp"));
-        assert_eq!(target, Path::new("out").join("FastPin_Collage_1.pdf"));
+        let temp = export_temp_path(&target, 42, 7);
+        assert_eq!(
+            temp,
+            Path::new("out").join("FastPin_Collage_1.pdf.42.7.tmp"),
+            "临时文件应是同级、带 pid/序号的名字"
+        );
+        assert_eq!(
+            target,
+            Path::new("out").join("FastPin_Collage_1.pdf"),
+            "生成临时路径不得改动目标路径"
+        );
+    }
+
+    #[test]
+    fn export_temp_path_is_unique_per_pid_and_seq() {
+        let target = Path::new("out").join("FastPin_Collage_20260101_120000.pdf");
+        let base = export_temp_path(&target, 100, 1);
+        let next_seq = export_temp_path(&target, 100, 2);
+        let other_pid = export_temp_path(&target, 101, 1);
+        assert_eq!(
+            base,
+            Path::new("out").join("FastPin_Collage_20260101_120000.pdf.100.1.tmp"),
+            "pid/序号都体现在临时名里"
+        );
+        assert_eq!(
+            next_seq,
+            Path::new("out").join("FastPin_Collage_20260101_120000.pdf.100.2.tmp"),
+            "同进程不同序号应产生不同临时名"
+        );
+        assert_eq!(
+            other_pid,
+            Path::new("out").join("FastPin_Collage_20260101_120000.pdf.101.1.tmp"),
+            "不同进程号相同序号也应产生不同临时名"
+        );
+    }
+
+    #[test]
+    fn pdf_export_path_adds_numbered_suffix_on_collision() {
+        use std::collections::HashSet;
+        let dir = Path::new("out");
+        let stem = "FastPin_Collage_20260101_120000";
+        let none: HashSet<PathBuf> = HashSet::new();
+        let base = unique_pdf_export_path(dir, stem, |p| none.contains(p));
+        assert_eq!(base, dir.join(format!("{stem}.pdf")), "首次导出应保持原名");
+        let one: HashSet<PathBuf> = [dir.join(format!("{stem}.pdf"))].into_iter().collect();
+        let first = unique_pdf_export_path(dir, stem, |p| one.contains(p));
+        assert_eq!(
+            first,
+            dir.join(format!("{stem} (1).pdf")),
+            "第一次冲突应使用 (1) 后缀"
+        );
+        let two: HashSet<PathBuf> = [
+            dir.join(format!("{stem}.pdf")),
+            dir.join(format!("{stem} (1).pdf")),
+        ]
+        .into_iter()
+        .collect();
+        let second = unique_pdf_export_path(dir, stem, |p| two.contains(p));
+        assert_eq!(
+            second,
+            dir.join(format!("{stem} (2).pdf")),
+            "连续冲突应递增后缀"
+        );
     }
 
     #[test]

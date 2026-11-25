@@ -310,6 +310,9 @@ pub struct OverlayView {
     /// sees its generation is gone, and exits instead of appending into a
     /// new session.
     long_seq: u64,
+    /// OCR / 翻译序号：选区重画或新截图都会推进它，后台任务回执带旧序号时
+    /// 直接丢弃，避免上一次截图的识别 / 翻译内容显示在新选区的面板里。
+    result_seq: u64,
 }
 
 /// OCR / translation output: read-only text plus copy, same as the C# panel.
@@ -775,6 +778,51 @@ fn should_keep_polling(generation_matches: bool, maxed: bool, capturing: bool) -
     generation_matches && !maxed && capturing
 }
 
+/// OCR / 翻译回执是否还属于当前选区。选区重画或新一轮截图会推进 `result_seq`；
+/// 序号不一致的后台结果必须直接丢弃，不能覆盖新选区的面板。
+fn should_accept_result(captured_seq: u64, current_seq: u64) -> bool {
+    captured_seq == current_seq
+}
+
+/// 长截图失败面板只呈现面向用户的中文：已知底层英文文案映射成原因 + 下一步
+/// 动作；已是中文的回执原样透传；未知英文保留原文但加中文前缀，既不暴露裸
+/// 英文，也不丢掉可用于反馈的诊断信息。
+fn long_capture_error_text(raw: &str) -> String {
+    let text = raw.trim();
+    if text.contains("WGC produced no frame")
+        || text.contains("no capture frames")
+        || text.contains("capture unsupported: no WGC frame")
+    {
+        return "截图超时，未取得画面，请确认窗口未被最小化或被遮挡后重试".to_string();
+    }
+    if text.contains("GPU device is resetting") {
+        return "显卡设备正在重置，请稍候重试".to_string();
+    }
+    if text.contains("GPU context unavailable") {
+        return "显卡上下文不可用，请重新截图".to_string();
+    }
+    if text.contains("region outside the fresh capture") {
+        return "选区超出当前屏幕范围，请重新框选后重试".to_string();
+    }
+    if text.contains("long-capture frame") || text.contains("frame buffer holds") {
+        return "画面数据无效或不完整，请重新框选后重试".to_string();
+    }
+    if text.contains("does not match the stitcher width") {
+        return "画面宽度发生变化，请重新截图后重试".to_string();
+    }
+    if text.contains("long-capture limit") || text.contains("exceeds the") {
+        return "画面超出尺寸或长度限制，请缩小选区后重试".to_string();
+    }
+    if text.contains("failed to spawn thread") {
+        return "无法启动后台处理线程，请稍候重试".to_string();
+    }
+    // 已是中文（例如长截图后台任务已停止）的回执不需要再套一层前缀。
+    if text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        return text.to_string();
+    }
+    format!("未知错误：{text}")
+}
+
 /// A running WGC session plus what `capture_region_live` needs to crop it:
 /// the GPU handle it was started on and the monitor's origin, so an absolute
 /// screen rect can be converted to monitor-local coordinates.
@@ -1127,6 +1175,7 @@ impl OverlayView {
             color_open: false,
             long: None,
             long_seq: 0,
+            result_seq: 0,
         }
     }
 
@@ -1201,6 +1250,7 @@ impl OverlayView {
             color_open: false,
             long: None,
             long_seq: 0,
+            result_seq: 0,
         };
         view.sync_from_cap(window);
         view.register_display_resync(cx, window);
@@ -1263,6 +1313,8 @@ impl OverlayView {
         self.color_open = false;
         self.long = None;
         self.long_seq = self.long_seq.wrapping_add(1);
+        // 新一轮截图：上一张图的 OCR / 翻译回执不能再落到这张图上。
+        self.invalidate_pending_result();
         set_long_passthrough(crate::platform::hwnd_of(window), None);
         self.sync_from_cap(window);
     }
@@ -1799,6 +1851,9 @@ impl OverlayView {
                 return;
             }
         }
+        // 画布上的左键按下意味着选区可能被重画、移动或继续标注：先让在途的
+        // OCR / 翻译结果过期，避免旧结果在新选区的面板里显示或被复制。
+        self.invalidate_pending_result();
         crate::perf::log_diag(&format!(
             "root mouse_down: canvas phase={:?} tool={:?} mouse=({:.0},{:.0})",
             self.phase, self.editor.tool, self.mouse.x, self.mouse.y
@@ -2494,6 +2549,14 @@ impl OverlayView {
         Ok((px, w, h, stride))
     }
 
+    /// 选区即将被重画 / 移动：推进识别序号并撤掉旧面板。
+    /// 后台 OCR / 翻译回执带着旧序号返回时会被丢弃；清掉面板（包括 busy 的
+    /// 「识别中…」）则保证新选区能立刻重新发起识别，也避免旧结果被复制。
+    fn invalidate_pending_result(&mut self) {
+        self.result_seq = self.result_seq.wrapping_add(1);
+        self.panel = None;
+    }
+
     fn busy(&self) -> bool {
         self.panel.as_ref().is_some_and(|p| p.busy)
     }
@@ -2559,7 +2622,12 @@ impl OverlayView {
                 match crate::app::capture_region_bgra(cx, abs_x, abs_y, result.w, result.h) {
                     Ok(frame) => (None, frame),
                     Err(e) => {
-                        self.show_panel("长截图失败", e.to_string(), false, cx);
+                        self.show_panel(
+                            "长截图失败",
+                            long_capture_error_text(&e.to_string()),
+                            false,
+                            cx,
+                        );
                         return;
                     }
                 }
@@ -2574,7 +2642,12 @@ impl OverlayView {
         let mut stitcher = match OrbStitcher::new(axis, w, h, LONG_MAX_H) {
             Ok(s) => s,
             Err(e) => {
-                self.show_panel("长截图失败", e.to_string(), false, cx);
+                self.show_panel(
+                    "长截图失败",
+                    long_capture_error_text(&e.to_string()),
+                    false,
+                    cx,
+                );
                 return;
             }
         };
@@ -2582,7 +2655,12 @@ impl OverlayView {
         // canvas / ORB reference (no matching), and the neutral decision is
         // discarded here — the worker owns every later frame.
         if let Err(e) = stitcher.push(&px, w, h) {
-            self.show_panel("长截图失败", e.to_string(), false, cx);
+            self.show_panel(
+                "长截图失败",
+                long_capture_error_text(&e.to_string()),
+                false,
+                cx,
+            );
             return;
         }
         // 首帧已建立画布：沿 stitch 轴的增长长度就是 total_height / trim 的
@@ -2603,7 +2681,15 @@ impl OverlayView {
         let worker = match LongWorker::new(gen, axis, stitcher) {
             Ok(w) => w,
             Err(e) => {
-                self.show_panel("长截图失败", format!("后台任务启动失败：{e}"), false, cx);
+                self.show_panel(
+                    "长截图失败",
+                    format!(
+                        "后台任务启动失败：{}",
+                        long_capture_error_text(&e.to_string())
+                    ),
+                    false,
+                    cx,
+                );
                 return;
             }
         };
@@ -3368,7 +3454,7 @@ impl OverlayView {
                 // failed allocation or a stopped worker rather than a size
                 // refusal; keep the reason visible instead of closing silently.
                 crate::perf::log_app(&format!("long capture export: {msg}"));
-                self.show_panel("长截图失败", msg, false, cx);
+                self.show_panel("长截图失败", long_capture_error_text(&msg), false, cx);
                 return;
             }
         }
@@ -3435,15 +3521,22 @@ impl OverlayView {
             }
         };
         self.show_panel(OCR_TITLE, "识别中…".into(), true, cx);
+        // 选区重画会推进 result_seq；回执序号不一致时直接丢弃。
+        let gen = self.result_seq;
         let task = cx.background_spawn(async move { crate::ocr::recognize(&px, w, h, stride) });
         cx.spawn(async move |this, cx| {
             let recognized = task.await;
-            let _ = this.update(cx, |this, cx| match recognized {
-                Ok(text) if text.trim().is_empty() => {
-                    this.show_panel(OCR_TITLE, "未识别到文字".into(), false, cx)
+            let _ = this.update(cx, |this, cx| {
+                if !should_accept_result(gen, this.result_seq) {
+                    return;
                 }
-                Ok(text) => this.show_panel(OCR_TITLE, text, false, cx),
-                Err(e) => this.show_panel("识别失败", e.to_string(), false, cx),
+                match recognized {
+                    Ok(text) if text.trim().is_empty() => {
+                        this.show_panel(OCR_TITLE, "未识别到文字".into(), false, cx)
+                    }
+                    Ok(text) => this.show_panel(OCR_TITLE, text, false, cx),
+                    Err(e) => this.show_panel("识别失败", e.to_string(), false, cx),
+                }
             });
         })
         .detach();
@@ -3464,6 +3557,8 @@ impl OverlayView {
             }
         };
         self.show_panel(TRANSLATE_TITLE, "翻译中…".into(), true, cx);
+        // 同 OCR：先记下序号，回执过期就不写面板。
+        let gen = self.result_seq;
         let task = cx.background_spawn(async move {
             let source = crate::ocr::recognize(&px, w, h, stride)?;
             if source.trim().is_empty() {
@@ -3473,9 +3568,14 @@ impl OverlayView {
         });
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
-            let _ = this.update(cx, |this, cx| match outcome {
-                Ok(translated) => this.show_panel(TRANSLATE_TITLE, translated, false, cx),
-                Err(e) => this.show_panel("翻译失败", e.to_string(), false, cx),
+            let _ = this.update(cx, |this, cx| {
+                if !should_accept_result(gen, this.result_seq) {
+                    return;
+                }
+                match outcome {
+                    Ok(translated) => this.show_panel(TRANSLATE_TITLE, translated, false, cx),
+                    Err(e) => this.show_panel("翻译失败", e.to_string(), false, cx),
+                }
             });
         })
         .detach();
@@ -5430,6 +5530,33 @@ mod tests {
         assert!(!should_clear_long_passthrough(7, 8, false));
         assert!(!should_clear_long_passthrough(7, 7, true));
         assert!(!should_clear_long_passthrough(7, 8, true));
+    }
+
+    /// 选区重画推进序号后，在途的 OCR / 翻译结果必须被丢弃。
+    #[test]
+    fn stale_recognition_result_is_discarded() {
+        assert!(should_accept_result(3, 3));
+        assert!(!should_accept_result(3, 4));
+        assert!(!should_accept_result(u64::MAX, 0));
+    }
+
+    /// 失败面板只说中文：WGC 超时映射为原因 + 重试动作，中文回执原样透传，
+    /// 未知英文保留原文并加中文前缀。
+    #[test]
+    fn long_capture_error_text_is_chinese_and_actionable() {
+        let timeout = long_capture_error_text("WGC produced no frame before the deadline");
+        assert!(
+            timeout.contains("超时") && timeout.contains("重试"),
+            "{timeout}"
+        );
+        assert!(!timeout.contains("WGC"), "{timeout}");
+        assert_eq!(
+            long_capture_error_text("长截图后台任务已停止"),
+            "长截图后台任务已停止"
+        );
+        let unknown = long_capture_error_text("strange failure 0x1");
+        assert!(unknown.starts_with("未知错误："), "{unknown}");
+        assert!(unknown.contains("strange failure 0x1"), "{unknown}");
     }
 
     /// A stall, a pause or a static edge is a state the bar reflects; the poll

@@ -60,6 +60,10 @@ pub struct Retention {
     /// time to retry. A receiver can still hold a Windows handle, and dropping
     /// the record would leak the file with no owner left to clean it up.
     retry: Vec<Retry>,
+    /// retry 放弃时最后一次删除仍失败的文件（墓碑）。不占 64 个名额/字节预算，
+    /// 但每次 sweep 都会经 `expired_targets` 重试，直到文件与 FastPin-drag-* 目录
+    /// 真正被清掉；这样接收方晚放句柄也不会留下无人认领的磁盘残留。
+    abandoned: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -89,6 +93,8 @@ pub struct DeleteTarget {
     bytes: u64,
     /// 来自 retry 队列：删除失败时留在 retry，不需要再次入队。
     retrying: bool,
+    /// 来自 abandoned 墓碑：删除失败也要继续留着，下次 sweep 再试。
+    abandoned: bool,
     since: Instant,
     /// retry 条目已经失败的删除次数，live 条目为 0。
     attempts: usize,
@@ -107,7 +113,8 @@ impl Retention {
     }
 
     /// Files currently held (dragging, inside their grace window, or waiting
-    /// in retry after a failed delete). Retry entries still occupy a slot.
+    /// in retry after a failed delete). Retry entries still occupy a slot;
+    /// abandoned tombstones do not, but the sweep keeps retrying them.
     pub fn retained_files(&self) -> usize {
         self.live.len() + self.retry.len()
     }
@@ -160,13 +167,14 @@ impl Retention {
     /// 只 clone 路径与预算，账本原样保留：删除完成前名额与字节仍然占用，
     /// 既不会超发，也不会出现"正在删却被别的拖出抢走名额"的窗口。
     pub fn expired_targets(&self, now: Instant) -> Vec<DeleteTarget> {
-        let mut out = Vec::with_capacity(self.live.len() + self.retry.len());
+        let mut out = Vec::with_capacity(self.live.len() + self.retry.len() + self.abandoned.len());
         for live in &self.live {
             if live.expires_at.is_some_and(|deadline| deadline <= now) {
                 out.push(DeleteTarget {
                     path: live.lease.path.clone(),
                     bytes: live.lease.bytes,
                     retrying: false,
+                    abandoned: false,
                     since: now,
                     attempts: 0,
                 });
@@ -177,8 +185,21 @@ impl Retention {
                 path: retry.path.clone(),
                 bytes: retry.bytes,
                 retrying: true,
+                abandoned: false,
                 since: retry.since,
                 attempts: retry.attempts,
+            });
+        }
+        // 墓碑没有宽限期也没有次数上限：只要还在磁盘上就每次 sweep 都重试，
+        // 否则放弃后接收方再放句柄，这条残留就再也没人清了。
+        for path in &self.abandoned {
+            out.push(DeleteTarget {
+                path: path.clone(),
+                bytes: 0,
+                retrying: false,
+                abandoned: true,
+                since: now,
+                attempts: 0,
             });
         }
         out
@@ -212,16 +233,24 @@ impl Retention {
     ///
     /// 成功才归还预算并移除记录；首次删除失败（接收方仍持句柄）转入 retry，
     /// 继续占用预算与名额，等下一次 sweep 重试。retry 达到次数上限或保留期限
-    /// 后放弃，避免一条永远删不掉的文件把名额永久占死。
+    /// 后放弃并归还名额，避免一条永远删不掉的文件把名额永久占死；若最后一次
+    /// 删除也失败，则转入不占名额的 abandoned 墓碑，由后续 sweep 继续清理。
     pub fn apply_deletes(&mut self, results: Vec<DeleteResult>) {
         for DeleteResult { target, deleted } in results {
             if deleted {
-                if target.retrying {
-                    self.retry.retain(|r| r.path != target.path);
+                if target.abandoned {
+                    // 墓碑终于删掉了：移除即可，它从来不占预算。
+                    self.abandoned.retain(|p| p != &target.path);
                 } else {
-                    self.live.retain(|l| l.lease.path != target.path);
+                    if target.retrying {
+                        self.retry.retain(|r| r.path != target.path);
+                    } else {
+                        self.live.retain(|l| l.lease.path != target.path);
+                    }
+                    self.bytes = self.bytes.saturating_sub(target.bytes);
                 }
-                self.bytes = self.bytes.saturating_sub(target.bytes);
+            } else if target.abandoned {
+                // 墓碑仍在磁盘上，保留等待下次 sweep，不重复打日志刷屏。
             } else if !target.retrying {
                 // 首次失败：从 live 移到 retry，名额与字节继续占用。
                 self.live.retain(|l| l.lease.path != target.path);
@@ -241,15 +270,22 @@ impl Retention {
                 if give_up {
                     self.retry.retain(|r| r.path != target.path);
                     self.bytes = self.bytes.saturating_sub(target.bytes);
-                    // 最后一次尽力删除；仍删不掉也只记日志，名额必须归还。
-                    // 这里的 I/O 只发生在放弃路径（极少数），不会让每次 sweep
-                    // 都在持锁状态下做磁盘操作。
-                    discard(&target.path);
-                    eprintln!(
-                        "[FastPin] 拖出文件重试 {} 次后放弃: {}",
-                        attempts,
-                        target.path.display()
-                    );
+                    // 最后一次尽力删除；这里的 I/O 只发生在放弃路径（极少数），
+                    // 不会让每次 sweep 都在持锁状态下做磁盘操作。
+                    // 删不掉就留下墓碑：下次 sweep 的 expired_targets 仍会带上它，
+                    // 接收方放开 Windows 句柄后文件与目录就能被真正清掉，不再残留。
+                    if discard(&target.path) {
+                        crate::perf::log_app(&format!(
+                            "[FastPin] 拖出文件重试 {attempts} 次后放弃并清理: {}",
+                            target.path.display()
+                        ));
+                    } else {
+                        self.abandoned.push(target.path.clone());
+                        crate::perf::log_app(&format!(
+                            "[FastPin] 拖出文件重试 {attempts} 次后放弃，删除失败已登记待清理: {}",
+                            target.path.display()
+                        ));
+                    }
                 } else if let Some(retry) = self.retry.iter_mut().find(|r| r.path == target.path) {
                     retry.attempts = attempts;
                 }
@@ -273,6 +309,13 @@ impl Retention {
     pub fn forget(&mut self) {
         self.live.clear();
         self.retry.clear();
+        if !self.abandoned.is_empty() {
+            crate::perf::log_app(&format!(
+                "[FastPin] 退出时仍有 {} 个拖出残留交由系统临时目录清理",
+                self.abandoned.len()
+            ));
+        }
+        self.abandoned.clear();
         self.bytes = 0;
     }
 }
@@ -307,19 +350,23 @@ pub fn stage(bytes: &[u8], extension: &str) -> std::io::Result<PathBuf> {
 }
 
 /// Deletes the directory `stage` created, if the file inside it is the only
-/// thing there. Best effort: a failure leaves the file for `Retention` or the
-/// OS temp sweep.
-pub fn discard(path: &Path) {
+/// thing there. Returns `true` only when both the file and its per-drag
+/// directory are gone; `false` means a receiver still holds a handle and the
+/// path must be retried (see `Retention`'s abandoned tombstones).
+pub fn discard(path: &Path) -> bool {
     let Some(dir) = path.parent() else {
-        return;
+        return false;
     };
-    let _ = std::fs::remove_file(path);
-    if dir
+    let file_gone = !path.exists() || std::fs::remove_file(path).is_ok();
+    let dir_gone = if dir
         .file_name()
         .is_some_and(|n| n.to_string_lossy().starts_with("FastPin-drag-"))
     {
-        let _ = std::fs::remove_dir(dir);
-    }
+        std::fs::remove_dir(dir).is_ok() || !dir.exists()
+    } else {
+        true
+    };
+    file_gone && dir_gone
 }
 
 fn unique_counter() -> u64 {
@@ -646,6 +693,45 @@ mod tests {
         assert_eq!(retention.retained_bytes(), 0, "回填后才归还预算");
         assert_eq!(retention.retained_files(), 0, "回填后才移除记录");
         assert!(!path.exists(), "文件应已被删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abandoned_targets_are_retried_until_they_can_be_deleted() {
+        // 目录无法被 remove_file 删除：重试耗尽后文件仍在磁盘上，必须留下墓碑。
+        let dir = scratch();
+        let blocked = dir.join("abandoned.png");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut retention = Retention::new();
+        let lease = retention.reserve(blocked.clone(), 5).unwrap();
+        retention.complete(&lease, true);
+        for live in retention.live.iter_mut() {
+            live.expires_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+        for _ in 0..MAX_RETRY_ATTEMPTS {
+            retention.expire();
+        }
+
+        assert_eq!(retention.retry.len(), 0, "重试耗尽应放弃 retry 条目");
+        assert_eq!(retention.retained_bytes(), 0, "放弃后应归还字节预算");
+        assert_eq!(retention.retained_files(), 0, "墓碑不应占用拖出名额");
+        assert_eq!(
+            retention.abandoned.len(),
+            1,
+            "删除失败应留下墓碑供后续 sweep 清理"
+        );
+        assert!(blocked.exists(), "接收方仍持有句柄时残留应保留");
+        assert!(
+            retention.reserve(dir.join("fresh.png"), 1).is_some(),
+            "墓碑不得挡住新的拖出"
+        );
+
+        // 接收方释放句柄后，下一次 sweep 就应清掉残留并移除墓碑，无需 app.rs 接线。
+        std::fs::remove_dir(&blocked).unwrap();
+        std::fs::write(&blocked, vec![0u8; 5]).unwrap();
+        retention.expire();
+        assert_eq!(retention.abandoned.len(), 0, "删除成功后应移除墓碑");
+        assert!(!blocked.exists(), "残留文件最终应被清掉");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

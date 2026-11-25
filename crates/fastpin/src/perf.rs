@@ -299,21 +299,23 @@ fn log_sender() -> &'static SyncSender<LogMsg> {
 /// `LOG_SENDER` 是进程级单例、永不 drop，writer 原先只能靠 `recv` 返回 Err 才退出，
 /// 末尾的「退出前尽力冲刷」因此永远走不到；这里改为显式发一条 Flush 命令并等回执。
 /// try_send 重试保证 Flush 排在此前所有 try_send 的行之后（FIFO），回执时它们都已落盘。
-/// 总截止时间防止满队列或慢盘把退出路径挂死；writer 不存在或回执超时一律静默降级。
+/// 入队与回执各有独立上限：入队几乎耗尽时限时不能啃掉回执的等待时间，否则 Flush
+/// 已进队列却立即 recv_timeout(0) 超时返回，违背"返回时已落盘"的契约。总时长最多
+/// 约 4s，退出路径仍不会挂死；writer 不存在或回执超时一律静默降级。
 pub fn flush_logs() {
     let tx = log_sender();
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     // 不能用阻塞 send：队列满且 writer 卡在慢盘时会无限等待，而 recv_timeout 在
-    // send 成功后才生效，根本挡不住这里。改为 try_send + 总截止时间重试，
+    // send 成功后才生效，根本挡不住这里。改为 try_send + 入队截止时间重试，
     // 每次只短暂休眠，且不在持锁时等待。
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let enqueue_deadline = Instant::now() + Duration::from_secs(2);
     let mut pending = LogMsg::Flush(reply_tx);
     loop {
         match tx.try_send(pending) {
             Ok(()) => break,
             Err(TrySendError::Full(returned)) => {
-                if Instant::now() >= deadline {
-                    return; // 总时长已达上限，静默降级
+                if Instant::now() >= enqueue_deadline {
+                    return; // 入队时长已达上限，静默降级
                 }
                 pending = returned;
                 std::thread::sleep(Duration::from_millis(1));
@@ -321,9 +323,9 @@ pub fn flush_logs() {
             Err(TrySendError::Disconnected(_)) => return, // writer 未启动/已退出
         }
     }
-    // 回执等待与入队共用截止时间，保证整个冲刷流程耗时有上限。
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let _ = reply_rx.recv_timeout(remaining);
+    // 回执单独计时：Flush 一旦入队，就给它完整的等待窗口，保证返回时前面的
+    // 日志确实已 flush；入队耗时不再侵蚀这段等待。
+    let _ = reply_rx.recv_timeout(Duration::from_secs(2));
 }
 
 fn append_log(target: Target, msg: &str) {
@@ -408,6 +410,16 @@ fn rotate_target(handle: &mut Option<BufWriter<std::fs::File>>, path: &Path) {
 /// 重建则把残留内容退化为 `*.log.1` 备份，不覆盖新日志。任一步失败都保留临时
 /// 文件等待下次重试，保证旧日志不会永久丢失。
 fn recover_rotating(path: &Path) -> bool {
+    recover_rotating_impl(path, |from, to| std::fs::rename(from, to).is_ok())
+}
+
+/// 单测注入 rename：令「残留 -> .log.1」这一步失败，验证旧备份不会被先删。
+#[cfg(test)]
+fn recover_rotating_with<F: Fn(&Path, &Path) -> bool>(path: &Path, rename: F) -> bool {
+    recover_rotating_impl(path, rename)
+}
+
+fn recover_rotating_impl<F: Fn(&Path, &Path) -> bool>(path: &Path, rename: F) -> bool {
     let temp = path.with_extension("log.rotating");
     if !temp.exists() {
         return true;
@@ -416,13 +428,26 @@ fn recover_rotating(path: &Path) -> bool {
     if !path.exists() {
         // 当前日志缺失：直接把临时名改回 path，旧日志完整恢复。
         // 失败则保留临时文件，下次打开再试。
-        return std::fs::rename(&temp, path).is_ok();
+        return rename(&temp, path);
     }
     // 当前日志已被重建：残留内容不能覆盖它，退化为一代备份保存。
-    if rotated.exists() && std::fs::remove_file(&rotated).is_err() {
+    // 与 rotate_file 同一约定：绝不先删旧 .1。先把旧备份挪到临时名，残留确实
+    // 落位成功后才删除它；落位失败则把旧备份改回 .1，残留保留等待下次重试。
+    let backup = path.with_extension("log.1.recovering");
+    let had_backup = rotated.exists();
+    if had_backup && !rename(&rotated, &backup) {
         return false;
     }
-    std::fs::rename(&temp, &rotated).is_ok()
+    if !rename(&temp, &rotated) {
+        if had_backup {
+            let _ = rename(&backup, &rotated);
+        }
+        return false;
+    }
+    if had_backup {
+        let _ = std::fs::remove_file(&backup);
+    }
+    true
 }
 
 /// 打开日志前先恢复残留临时文件，再按需轮转，避免从上一轮残留的大文件继续追加。
@@ -853,6 +878,57 @@ mod tests {
             "旧日志应能在 .1 中找到"
         );
         assert!(!temp.exists(), "临时文件应已被消费");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rotating_keeps_old_backup_when_residue_rename_fails() {
+        // path 已重建 + .1 有上一代备份 + .rotating 有残留：残留落位失败时，
+        // 旧备份必须原样留在 .1，不能像旧实现那样先删后 rename 导致永久丢失。
+        let dir = test_dir("recover-rotating-fail");
+        let _ = create_dir_all(&dir);
+        let path = dir.join("app.log");
+        let temp = dir.join("app.log.rotating");
+        let backup = dir.join("app.log.1");
+        let old_backup = "previous generation backup";
+        let residue = "stranded residue";
+        let current = "new current log";
+        std::fs::write(&path, current).expect("准备重建后的当前日志");
+        std::fs::write(&backup, old_backup).expect("准备旧备份");
+        std::fs::write(&temp, residue).expect("准备残留临时文件");
+
+        // 只让「残留 -> .1」这一步失败，其余 rename 仍走真实文件系统。
+        let fail_residue_rename = |from: &Path, to: &Path| {
+            if from == temp.as_path() && to == backup.as_path() {
+                false
+            } else {
+                std::fs::rename(from, to).is_ok()
+            }
+        };
+        assert!(
+            !recover_rotating_with(&path, fail_residue_rename),
+            "残留落位失败时恢复应返回 false"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("读回旧备份"),
+            old_backup,
+            "旧 .log.1 不得因恢复失败而丢失"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("读回当前日志"),
+            current,
+            "当前日志不应被改动"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&temp).expect("读回残留"),
+            residue,
+            "残留文件应保留以便下次重试"
+        );
+        assert!(
+            !dir.join("app.log.1.recovering").exists(),
+            "临时备份名应已改回 .1，不应留下第二个残留"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

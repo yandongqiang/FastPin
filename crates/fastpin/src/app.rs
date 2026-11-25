@@ -288,10 +288,8 @@ pub fn run() -> Result<()> {
     // Before anything reads settings: move the pre-rebrand profile over. It is
     // a no-op on second start and never aborts startup.
     crate::migrate::migrate_legacy_paths();
-    // Reclaim directories left by an interrupted history delete and apply
-    // retention to records accumulated while the app was closed. No-op when
-    // history is disabled.
-    crate::history::startup_maintenance();
+    // History 维护已移到 run_tray() 的单实例 acquire 之后：prune 会整份重写
+    // index.json，STORE_LOCK 只是进程内锁，挡不住第二实例并发读改写索引。
     // Drop installer .part files left behind by a killed or failed download.
     crate::update::cleanup_downloads();
     let args: Vec<String> = std::env::args().collect();
@@ -699,6 +697,16 @@ fn run_tray() -> Result<()> {
     // （Windows 下 FILE_SHARE_DELETE 允许跨进程删除未关闭句柄的文件），令截图丢失。
     // 放在 CoInitializeEx 之后：默认截图目录要走 SHGetKnownFolderPath。
     cleanup_stale_image_temps();
+    // 清理上次写盘失败残留的 settings.tmp-*，同样必须在 acquire 成功之后，
+    // 否则第二实例早退前会删掉第一实例正在写的临时配置。
+    crate::config::cleanup_stale_temp_files();
+    // 回收中断删除留下的历史目录，并应用停机期间累积记录的保留策略。同样必须
+    // 在单实例 acquire 成功之后：cleanup_pending()/prune() 会整份重写 index.json，
+    // 而 STORE_LOCK 只是进程内锁，挡不住另一个进程。若第二实例在“已在运行”
+    // 早退前先 prune，会和第一实例并发读改写索引——旧快照覆盖新记录（目录成
+    // 孤儿），或把第一实例的记录当 victim 删掉。早退路径绝不执行到此处。
+    // （history 关闭时只做回收、不 prune；config 由 config::get() 按需加载。）
+    crate::history::startup_maintenance();
 
     let cleanup_hwnd = std::rc::Rc::new(std::cell::RefCell::new(None::<HWND>));
     let boot_error = std::rc::Rc::new(std::cell::RefCell::new(None::<Error>));

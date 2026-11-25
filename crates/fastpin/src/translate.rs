@@ -376,9 +376,10 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
         dwExtraInfoLength: u32::MAX,
         ..Default::default()
     };
+    // 与设置页的「接口地址」保持同一术语；地址里的用户名密码须脱敏后再回显。
     unsafe { WinHttpCrackUrl(&wide, 0, &mut parts) }.map_err(|_| {
         Error::new(format!(
-            "Translation Base URL is not a valid URL: {}",
+            "接口地址无效，请在 设置 → 翻译 中检查地址：{}",
             crate::net::redact_url(url)
         ))
     })?;
@@ -407,7 +408,8 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
             0,
         ));
         if session.0.is_null() {
-            return Err(Error::new("WinHttpOpen failed"));
+            // 本地网络栈初始化失败，给出可操作的方向。
+            return Err(Error::new("网络初始化失败，请检查网络或代理设置后重试"));
         }
         // 配置值是整个请求的总预算：四段各拿约四分之一（并有 2 s 下限），
         // 墙钟因此接近配置值；接收超时按块重计时，慢速流仍可能超出。
@@ -423,7 +425,8 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
             0,
         ));
         if connect.0.is_null() {
-            return Err(Error::new("WinHttpConnect failed"));
+            // 连不上翻译接口，多为代理或 DNS 问题，提示稍后重试。
+            return Err(Error::new("无法连接到翻译服务器，请稍后重试"));
         }
 
         let verb = nul_terminated("POST");
@@ -442,7 +445,8 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
             },
         ));
         if request.0.is_null() {
-            return Err(Error::new("WinHttpOpenRequest failed"));
+            // 会话与连接都有效却建不出请求，按瞬时故障提示重试。
+            return Err(Error::new("无法创建翻译请求，请稍后重试"));
         }
 
         let header_w: Vec<u16> = headers.encode_utf16().collect();

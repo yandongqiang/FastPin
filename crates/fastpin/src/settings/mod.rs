@@ -1995,7 +1995,9 @@ impl SettingsView {
                 self.persist(cx);
             }
             Err(e) => {
-                self.fail(format!("{e}"));
+                // 系统选择器返回的是英文 HRESULT（如 0x80004005），补上中文
+                // 上下文；取消走上面的 Ok(None)，不会误报。
+                self.fail(format!("选择目录失败：{e}，请重试"));
                 cx.notify();
             }
         }
@@ -2039,7 +2041,8 @@ impl SettingsView {
                 self.persist(cx);
             }
             Err(e) => {
-                self.fail(format!("{e}"));
+                // 同上：补中文上下文，取消是 Ok(None)，不会进入这里。
+                self.fail(format!("选择图片失败：{e}，请重试"));
                 cx.notify();
             }
         }
@@ -2710,7 +2713,9 @@ impl SettingsView {
                             this.reset_all(cx);
                         } else {
                             this.confirm_reset_all = true;
-                            this.ok("再次点击「重置所有设置」以确认");
+                            this.ok(
+                                "再次点击确认：将清除全部设置、删除已保存的 API Key 并关闭开机启动",
+                            );
                             cx.notify();
                         }
                     }),
@@ -3334,10 +3339,13 @@ impl SettingsView {
         let current: SharedString = if h.keep_permanently {
             "永久".into()
         } else {
+            // 手改配置可能写入超界天数（如 5000）：显示与实际清理保持一致，
+            // 都用 clamp 后的 getter，而不是原始字段。
+            let days_value = h.retention_days();
             days.iter()
-                .find(|(_, d)| *d == h.retention_days)
+                .find(|(_, d)| *d == days_value)
                 .map(|(label, _)| (*label).into())
-                .unwrap_or_else(|| format!("{} 天", h.retention_days).into())
+                .unwrap_or_else(|| format!("{} 天", days_value).into())
         };
         let rows = days
             .iter()
@@ -3348,7 +3356,7 @@ impl SettingsView {
                 let selected = if day == Self::RETENTION_FOREVER {
                     h.keep_permanently
                 } else {
-                    !h.keep_permanently && day == h.retention_days
+                    !h.keep_permanently && day == h.retention_days()
                 };
                 widgets::select_option(("hist-ret", day as u32), *label, selected).on_mouse_down(
                     MouseButton::Left,
@@ -3375,11 +3383,13 @@ impl SettingsView {
             ("1000 张", 1000),
         ];
         let h = &self.settings.history;
-        let current: SharedString = format!("{} 张", h.limit).into();
+        // 与 config::History::limit 的 clamp 保持一致，手改的超界值不误导用户。
+        let limit = h.limit();
+        let current: SharedString = format!("{} 张", limit).into();
         let rows = LIMITS
             .iter()
             .map(|(label, n)| {
-                widgets::select_option(("hist-limit", *n as u32), *label, *n == h.limit)
+                widgets::select_option(("hist-limit", *n as u32), *label, *n == limit)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.set_history_limit(*n, cx)),
@@ -3405,15 +3415,17 @@ impl SettingsView {
             ("10 GB", 10240),
         ];
         let h = &self.settings.history;
-        let current: SharedString = if h.max_disk_mib >= 1024 {
-            format!("{} GB", h.max_disk_mib / 1024).into()
+        // getter 返回字节，这里转回 MiB 显示；单位与 config 的 clamp 保持一致。
+        let max_disk_mib = h.max_disk_bytes() / (1024 * 1024);
+        let current: SharedString = if max_disk_mib >= 1024 {
+            format!("{} GB", max_disk_mib / 1024).into()
         } else {
-            format!("{} MB", h.max_disk_mib).into()
+            format!("{} MB", max_disk_mib).into()
         };
         let rows = SIZES
             .iter()
             .map(|(label, m)| {
-                widgets::select_option(("hist-disk", *m as u32), *label, *m == h.max_disk_mib)
+                widgets::select_option(("hist-disk", *m as u32), *label, *m == max_disk_mib)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.set_history_disk(*m, cx)),
@@ -4150,12 +4162,13 @@ impl SettingsView {
                 "PNG 为无损格式，质量设置对它不生效；不支持的格式会自动回退为 PNG，选择 JPG（或可用的 WebP）后可调。",
             );
         }
+        // 与 app.rs 导出线程一致用 clamp 后的值，手改超界配置不显示假数字。
+        let quality = export.clamped_quality();
         let current: SharedString = EXPORT_QUALITIES
             .iter()
-            .find(|(_, v)| *v == export.quality)
+            .find(|(_, v)| *v == quality)
             .map(|(label, _)| (*label).into())
-            .unwrap_or_else(|| format!("{}%", export.quality).into());
-        let quality = export.quality;
+            .unwrap_or_else(|| format!("{}%", quality).into());
         let rows = EXPORT_QUALITIES
             .map(|(label, v)| {
                 widgets::select_option(("export-q", v as u32), label, v == quality).on_mouse_down(

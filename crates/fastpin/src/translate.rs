@@ -146,6 +146,28 @@ impl VaultPassword {
     }
 }
 
+/// `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`。Credential Manager 对"没有该条目"
+/// 返回这个码；这是全新安装、需要从 legacy 迁移的正常场景，而不是读失败。
+const HRESULT_NOT_FOUND: i32 = 0x8007_0490u32 as i32;
+
+/// 区分"条目不存在"与"读取条目/密码失败"：
+/// - 条目不存在：等同空条目，允许从 legacy 补写（正常迁移路径）；
+/// - 其它 Retrieve 错误 / 密码读取失败：视为瞬时不可读，跳过迁移，绝不删 key；
+/// - 条目存在：只有密码读取成功且确认为空时才允许替换。
+fn classify_current(
+    existing: Option<&PasswordCredential>,
+    retrieve_error: Option<i32>,
+) -> VaultPassword {
+    if let Some(cred) = existing {
+        return VaultPassword::read(cred);
+    }
+    match retrieve_error {
+        Some(code) if code != HRESULT_NOT_FOUND => VaultPassword::Unreadable,
+        // 没有条目（None）或未找到（HRESULT_NOT_FOUND）都按空条目处理。
+        _ => VaultPassword::Empty,
+    }
+}
+
 /// 迁移决策。current 只有在确认密码为空时才可能被替换；读取失败或已有效
 /// 时一律保留。legacy 无可用值时同样保留 current，绝不留下"两边都删空"。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,8 +196,9 @@ fn migration_decision(current: VaultPassword, legacy: VaultPassword) -> Migratio
 /// the normal case (fresh install), not an error. Best-effort: every failure is
 /// reported as a note for the caller to log and never blocks startup.
 /// A current entry whose password reads as empty is replaced with the legacy
-/// value; an unreadable password counts as a transient failure and leaves both
-/// entries untouched so a failed read can never delete a valid key.
+/// value; a failed `Retrieve` of the current entry (including "not found") and
+/// an unreadable password count as transient failures and leave both entries
+/// untouched so a failed read can never delete a valid key.
 pub(crate) fn migrate_legacy_vault() -> Vec<String> {
     let vault = match PasswordVault::new() {
         Ok(v) => v,
@@ -193,12 +216,17 @@ pub(crate) fn migrate_legacy_vault() -> Vec<String> {
     }
 
     // Retrieve 成功只说明条目存在，不代表 key 可用；读不到密码就更不能删。
-    // 当前条目不存在时按 Empty 处理：没有 key 需要保护，legacy 有值就补写。
-    let existing = vault.Retrieve(&current, &account).ok();
-    let current_password = existing
-        .as_ref()
-        .map(VaultPassword::read)
-        .unwrap_or(VaultPassword::Empty);
+    // Retrieve 失败（含条目不存在）也不能当成"确认空条目"：没读到就没有
+    // 替换权限，按 Unreadable 跳过，只有确认空才走替换路径。
+    // Retrieve 失败要区分"没有条目"（正常迁移）与"读失败"（瞬时错误）。
+    // 后者绝不能当成空条目去替换，否则杀软/凭据管理器瞬时抖动就可能删掉有效 key。
+    let mut existing = None;
+    let mut retrieve_error = None;
+    match vault.Retrieve(&current, &account) {
+        Ok(cred) => existing = Some(cred),
+        Err(e) => retrieve_error = Some(e.code().0),
+    }
+    let current_password = classify_current(existing.as_ref(), retrieve_error);
 
     match migration_decision(current_password, legacy_password) {
         // 幂等：current 已有有效 key，绝不动它，只清掉重复的 legacy 条目。
@@ -557,6 +585,37 @@ mod tests {
             MigrationDecision::SkipUnreadableCurrent,
             "both unreadable still preserves the current entry"
         );
+    }
+
+    #[test]
+    fn a_transient_current_retrieve_failure_never_counts_as_confirmed_empty() {
+        // 非 NotFound 的 Retrieve 失败可能只是瞬时错误，绝不当空条目补写。
+        let transient_error = HRESULT_NOT_FOUND.wrapping_add(1);
+        let decision = migration_decision(
+            classify_current(None, Some(transient_error)),
+            VaultPassword::Valid("sk-legacy".into()),
+        );
+        assert_eq!(
+            decision,
+            MigrationDecision::SkipUnreadableCurrent,
+            "a failed retrieve must skip migration, not replace the entry"
+        );
+    }
+
+    #[test]
+    fn a_missing_current_entry_still_migrates_the_legacy_key() {
+        // 条目不存在是正常迁移场景（全新安装），不能被当成读取失败跳过。
+        let expected = MigrationDecision::ReplaceEmptyCurrent("sk-legacy".into());
+        let decision = migration_decision(
+            classify_current(None, None),
+            VaultPassword::Valid("sk-legacy".into()),
+        );
+        assert_eq!(decision, expected.clone(), "no entry at all must migrate");
+        let decision = migration_decision(
+            classify_current(None, Some(HRESULT_NOT_FOUND)),
+            VaultPassword::Valid("sk-legacy".into()),
+        );
+        assert_eq!(decision, expected, "ERROR_NOT_FOUND must migrate");
     }
 
     #[test]

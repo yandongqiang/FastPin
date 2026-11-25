@@ -421,7 +421,12 @@ pub fn global_limit() -> u64 {
 /// Reserves `bytes` bytes against [`global_limit`]. On success the caller owns
 /// a `MemoryPermit`; dropping it (with the buffer) returns the reservation.
 pub fn try_reserve(bytes: u64) -> Result<MemoryPermit, BudgetError> {
-    let limit = global_limit();
+    try_reserve_with_limit(bytes, global_limit())
+}
+
+/// 与 [`try_reserve`] 相同，但上限由调用方注入。生产路径始终重读
+/// [`global_limit`]；测试传入固定值，避免可用内存波动改变结果。
+pub(crate) fn try_reserve_with_limit(bytes: u64, limit: u64) -> Result<MemoryPermit, BudgetError> {
     let mut live = LIVE_BYTES.load(Ordering::Relaxed);
     loop {
         let next = live.checked_add(bytes).ok_or(BudgetError::Overflow {
@@ -446,7 +451,15 @@ pub fn try_reserve(bytes: u64) -> Result<MemoryPermit, BudgetError> {
 impl MemoryPermit {
     /// 用单次 CAS 把这份预留调整为 new_bytes。失败时 self 与全局账本都不变。
     pub fn resize(&mut self, new_bytes: u64) -> Result<(), BudgetError> {
-        let limit = global_limit();
+        self.resize_with_limit(new_bytes, global_limit())
+    }
+
+    /// 与 [`MemoryPermit::resize`] 相同，但上限由调用方注入，供测试使用。
+    pub(crate) fn resize_with_limit(
+        &mut self,
+        new_bytes: u64,
+        limit: u64,
+    ) -> Result<(), BudgetError> {
         let mut live = LIVE_BYTES.load(Ordering::Relaxed);
         loop {
             // `live` 已含 self.bytes；只有 permit 被重复释放才可能下溢，仍
@@ -484,6 +497,17 @@ impl MemoryPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// 进程级 LIVE_BYTES 由所有测试共享：cargo test 默认并行，另一个测试
+    /// 的 permit 进出会打断基于精确等式的断言，所以触碰它的测试必须串行。
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 测试专用的固定上限，不再每次重读 GlobalMemoryStatusEx。取生产代码
+    /// 在平台无法报告内存时的回退值，语义上仍然是一个真实可用的上限。
+    fn test_limit() -> u64 {
+        MAX_BYTES.saturating_mul(2)
+    }
 
     /// A budget with realistic sides but tiny pixel/byte caps, so the pixel
     /// and byte branches are reachable without allocating anything large.
@@ -639,23 +663,40 @@ mod tests {
 
     #[test]
     fn global_ledger_reports_overflow_and_tracks_a_permit() {
-        assert!(global_limit() >= MAX_BYTES);
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let limit = test_limit();
+        assert!(limit >= MAX_BYTES);
         // With nothing live, `0 + u64::MAX` does not overflow — the global
         // limit (not the arithmetic) is what refuses it.
-        assert!(try_reserve(u64::MAX).is_err());
+        let err = try_reserve_with_limit(u64::MAX, limit).unwrap_err();
+        // 别的模块若仍有 permit 未释放，算术会先拒绝；两种错误都可接受，
+        // 但走到上限分支时报告的必须是注入的固定 limit。
+        if let BudgetError::GlobalLimit {
+            limit: reported, ..
+        } = err
+        {
+            assert_eq!(
+                reported, limit,
+                "the error must report the injected global limit"
+            );
+        }
         let before = live_bytes();
-        let permit = try_reserve(4096).expect("a small reservation fits");
+        let permit = try_reserve_with_limit(4096, limit).expect("a small reservation fits");
         assert!(live_bytes() >= before + 4096);
         drop(permit); // balanced; other tests may reserve concurrently
     }
 
     #[test]
     fn resize_replaces_the_reservation_and_drop_releases_the_new_size() {
-        // global_limit() 取决于可用物理内存，所有额度都从它推导，不硬编码。
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 上限由测试注入，不再重读取决于可用物理内存的 global_limit()：
+        // 可用内存波动会让新 limit 变大，使预期失败的 resize 反而成功。
+        let limit = test_limit();
         let before = live_bytes();
-        let chunk = global_limit().saturating_sub(before) / 4;
+        let chunk = limit.saturating_sub(before) / 4;
         assert!(chunk > 0, "the global limit must leave room for a permit");
-        let mut permit = try_reserve(chunk).expect("a quarter of the remaining budget fits");
+        let mut permit =
+            try_reserve_with_limit(chunk, limit).expect("a quarter of the remaining budget fits");
         assert_eq!(
             live_bytes(),
             before + chunk,
@@ -664,7 +705,7 @@ mod tests {
 
         let grown = chunk * 2;
         permit
-            .resize(grown)
+            .resize_with_limit(grown, limit)
             .expect("resizing within the global limit fits");
         assert_eq!(
             live_bytes(),
@@ -682,16 +723,18 @@ mod tests {
 
     #[test]
     fn resize_past_the_global_limit_keeps_the_ledger_and_permit_unchanged() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = live_bytes();
-        let limit = global_limit();
+        let limit = test_limit();
         let granted = limit.saturating_sub(before) / 4;
         assert!(granted > 0, "the global limit must leave room for a permit");
-        let mut permit = try_reserve(granted).expect("a quarter of the remaining budget fits");
+        let mut permit =
+            try_reserve_with_limit(granted, limit).expect("a quarter of the remaining budget fits");
         let observed = live_bytes();
 
-        // 请求超过整个上限，因此无论已有多少 live 都必然被拒。
+        // 请求超过注入的固定上限，因此无论已有多少 live 都必然被拒。
         let too_big = limit.saturating_add(1);
-        let err = permit.resize(too_big).unwrap_err();
+        let err = permit.resize_with_limit(too_big, limit).unwrap_err();
         assert!(matches!(err, BudgetError::GlobalLimit { .. }), "{err}");
         match err {
             BudgetError::GlobalLimit {

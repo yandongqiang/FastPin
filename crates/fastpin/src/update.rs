@@ -575,15 +575,41 @@ fn unique_temp_path(dir: &Path, version: &str) -> PathBuf {
     ))
 }
 
-/// `.part` 临时文件超过这个时长就视为崩溃/中断遗留，可以安全删除。
-const PART_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// 下载临时文件与已下载的安装包超过这个时长就视为遗留，可以安全删除。
+/// 24 小时门槛给「下载完但还没点安装」的用户留足时间，避免误删刚下好的包。
+const DOWNLOAD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// 删除 `dir` 中过期的 `.part` 下载临时文件，返回删除的个数。
+/// 本程序下载的成品安装包名：`FastPin-v<版本>-x64-setup.exe`；撞名时为
+/// `...-setup-2.exe` 等。只认这套命名，绝不删除下载目录里的其它 exe。
+fn is_downloaded_installer(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".exe") else {
+        return false;
+    };
+    let Some(rest) = stem.strip_prefix("FastPin-v") else {
+        return false;
+    };
+    let version = if let Some(v) = rest.strip_suffix("-setup") {
+        v
+    } else if let Some((v, seq)) = rest.rsplit_once("-setup-") {
+        if seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        v
+    } else {
+        return false;
+    };
+    // 版本号必须以数字开头，避免把 `FastPin-v-x64-setup.exe` 这类名字算进来。
+    valid_version(version) && version.bytes().next().is_some_and(|b| b.is_ascii_digit())
+}
+
+/// 删除 `dir` 中过期的下载文件，返回删除的个数。
 ///
-/// 只按修改时间删旧文件：新下载总是用 `unique_temp_path` 生成的唯一文件名，
-/// 且 `File::create` 会立即写入，所以按 24 小时门槛清理不会误删正在进行中的
-/// 下载。目录不存在或不可读时静默返回 0 —— 清理是尽力而为的，不能影响主流程。
-fn cleanup_part_files(dir: &Path, max_age: Duration) -> usize {
+/// 两类都清：`.part` 临时文件（崩溃/中断遗留）和改名后的成品安装包（用户
+/// 下载完却一直没点安装，否则会长期堆积）。只按修改时间删旧文件：新下载
+/// 总是用 `unique_temp_path` 生成的唯一文件名，且 `File::create` 会立即写入，
+/// 所以按 24 小时门槛清理不会误删正在进行中的下载或刚下好的包。目录不存在
+/// 或不可读时静默返回 0 —— 清理是尽力而为的，不能影响主流程。
+fn cleanup_download_files(dir: &Path, max_age: Duration) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
     };
@@ -593,9 +619,13 @@ fn cleanup_part_files(dir: &Path, max_age: Duration) -> usize {
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        if !metadata.is_file()
-            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("part")
-        {
+        if !metadata.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_part = entry.path().extension().and_then(|ext| ext.to_str()) == Some("part")
+            && name.starts_with("FastPin-v");
+        if !is_part && !is_downloaded_installer(&name) {
             continue;
         }
         let stale = metadata
@@ -610,11 +640,12 @@ fn cleanup_part_files(dir: &Path, max_age: Duration) -> usize {
     removed
 }
 
-/// 清理 downloads 目录中超过 24 小时的 `.part` 临时文件，供上层启动时调用。
+/// 清理 downloads 目录中超过 24 小时的 `.part` 临时文件与成品安装包，供
+/// 上层启动时和每次下载前调用。
 ///
 /// 不返回错误也不打扰用户：磁盘清理失败不应阻止应用启动。
 pub fn cleanup_downloads() {
-    cleanup_part_files(&download_dir(), PART_MAX_AGE);
+    cleanup_download_files(&download_dir(), DOWNLOAD_MAX_AGE);
 }
 
 /// Download the installer for `version` and return the path to the final
@@ -633,11 +664,11 @@ pub fn download_release_asset(
         return Err(Error::new("版本号无效"));
     }
 
-    // 新一次下载开始前，先清理同一下载目录里遗留的过期 .part：崩溃或中断
-    // 留下的临时文件从此有上限，不会无限堆积。新文件用唯一名字创建，不会
-    // 与（万一存在的）并发下载冲突。
+    // 新一次下载开始前，先清理同一下载目录里遗留的过期下载：崩溃/中断的
+    // .part 与一直没点安装的成品包从此都有上限，不会无限堆积。新文件用
+    // 唯一名字创建，不会与（万一存在的）并发下载冲突。
     let dir = download_dir();
-    cleanup_part_files(&dir, PART_MAX_AGE);
+    cleanup_download_files(&dir, DOWNLOAD_MAX_AGE);
 
     let mut current = asset_download_url(version);
     let (mut session, mut head) = unsafe { begin_download(&current)? };
@@ -808,6 +839,27 @@ mod tests {
             installer_candidate_name("v0.3.0-beta", 3),
             "FastPin-v0.3.0-beta-x64-setup-3.exe",
             "版本号前缀与序号同时生效"
+        );
+    }
+
+    #[test]
+    fn downloaded_installer_names_are_recognized_for_cleanup() {
+        assert!(
+            is_downloaded_installer(&installer_candidate_name("0.3.0", 1)),
+            "首次下载的成品包要能清理"
+        );
+        assert!(
+            is_downloaded_installer(&installer_candidate_name("0.3.0", 2)),
+            "撞名追加序号的成品包也要清理"
+        );
+        assert!(!is_downloaded_installer("setup.exe"), "无关 exe 不能误删");
+        assert!(
+            !is_downloaded_installer("FastPin-v0.3.0-x64-setup.exe.bak"),
+            "备份文件不能被当成安装包"
+        );
+        assert!(
+            !is_downloaded_installer("FastPin-v-x64-setup.exe"),
+            "空版本号不认，避免误删同名前缀的文件"
         );
     }
 

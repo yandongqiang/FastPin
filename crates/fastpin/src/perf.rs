@@ -1,7 +1,7 @@
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -298,15 +298,32 @@ fn log_sender() -> &'static SyncSender<LogMsg> {
 /// 退出前调用：把队列里尚未落盘的日志写完并逐句柄 flush，返回时日志已安全落盘。
 /// `LOG_SENDER` 是进程级单例、永不 drop，writer 原先只能靠 `recv` 返回 Err 才退出，
 /// 末尾的「退出前尽力冲刷」因此永远走不到；这里改为显式发一条 Flush 命令并等回执。
-/// 阻塞发送保证 Flush 排在此前所有 try_send 的行之后（FIFO），回执时它们都已落盘。
-/// 超时上限防止慢盘把退出路径挂死；writer 不存在或回执超时一律静默降级。
+/// try_send 重试保证 Flush 排在此前所有 try_send 的行之后（FIFO），回执时它们都已落盘。
+/// 总截止时间防止满队列或慢盘把退出路径挂死；writer 不存在或回执超时一律静默降级。
 pub fn flush_logs() {
     let tx = log_sender();
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    if tx.send(LogMsg::Flush(reply_tx)).is_err() {
-        return; // writer 未启动/已退出，没有可冲刷的日志
+    // 不能用阻塞 send：队列满且 writer 卡在慢盘时会无限等待，而 recv_timeout 在
+    // send 成功后才生效，根本挡不住这里。改为 try_send + 总截止时间重试，
+    // 每次只短暂休眠，且不在持锁时等待。
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut pending = LogMsg::Flush(reply_tx);
+    loop {
+        match tx.try_send(pending) {
+            Ok(()) => break,
+            Err(TrySendError::Full(returned)) => {
+                if Instant::now() >= deadline {
+                    return; // 总时长已达上限，静默降级
+                }
+                pending = returned;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(TrySendError::Disconnected(_)) => return, // writer 未启动/已退出
+        }
     }
-    let _ = reply_rx.recv_timeout(Duration::from_secs(2));
+    // 回执等待与入队共用截止时间，保证整个冲刷流程耗时有上限。
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let _ = reply_rx.recv_timeout(remaining);
 }
 
 fn append_log(target: Target, msg: &str) {
@@ -341,7 +358,8 @@ fn log_exceeds(path: &Path, max_bytes: u64) -> bool {
 
 /// 把 `path` 改名为 `*.log.1`。Windows 上 rename 目标已存在会失败，但绝不先删
 /// 旧备份：先把 `path` 挪到临时名，再删旧 `.1`，最后把临时名改成 `.1`；
-/// 任一步失败都把临时名改回 `path` 并返回 false，保住当前日志与旧备份。
+/// 任一步失败都尝试把临时名改回 `path` 并返回 false，保住当前日志与旧备份；
+/// 回滚本身也可能失败，残留的 `*.log.rotating` 由 `recover_rotating` 兜底恢复。
 fn rotate_file(path: &Path) -> bool {
     let rotated = path.with_extension("log.1");
     let temp = path.with_extension("log.rotating");
@@ -385,8 +403,31 @@ fn rotate_target(handle: &mut Option<BufWriter<std::fs::File>>, path: &Path) {
     }
 }
 
-/// 打开日志前先按需轮转，避免从上一轮残留的大文件继续追加。
+/// 轮转回滚失败时会残留 `*.log.rotating`（旧日志仍在其中，`path` 可能已消失）。
+/// 每次打开日志前先尝试恢复它：`path` 不存在就把临时名改回 `path`；`path` 已被
+/// 重建则把残留内容退化为 `*.log.1` 备份，不覆盖新日志。任一步失败都保留临时
+/// 文件等待下次重试，保证旧日志不会永久丢失。
+fn recover_rotating(path: &Path) -> bool {
+    let temp = path.with_extension("log.rotating");
+    if !temp.exists() {
+        return true;
+    }
+    let rotated = path.with_extension("log.1");
+    if !path.exists() {
+        // 当前日志缺失：直接把临时名改回 path，旧日志完整恢复。
+        // 失败则保留临时文件，下次打开再试。
+        return std::fs::rename(&temp, path).is_ok();
+    }
+    // 当前日志已被重建：残留内容不能覆盖它，退化为一代备份保存。
+    if rotated.exists() && std::fs::remove_file(&rotated).is_err() {
+        return false;
+    }
+    std::fs::rename(&temp, &rotated).is_ok()
+}
+
+/// 打开日志前先恢复残留临时文件，再按需轮转，避免从上一轮残留的大文件继续追加。
 fn open_rotated(path: &Path) -> Option<BufWriter<std::fs::File>> {
+    let _ = recover_rotating(path);
     if log_exceeds(path, LOG_ROTATE_BYTES) {
         rotate_file(path);
     }
@@ -760,6 +801,58 @@ mod tests {
             std::fs::read_to_string(&backup).expect("读回覆盖后的备份"),
             newer
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rotating_restores_missing_current_log() {
+        // 模拟 rotate_file 双重失败：path 已消失，旧日志全留在 *.log.rotating 里。
+        let dir = test_dir("recover-rotating");
+        let _ = create_dir_all(&dir);
+        let path = dir.join("app.log");
+        let temp = dir.join("app.log.rotating");
+        let old = "old log left in rotating file";
+        std::fs::write(&temp, old).expect("准备残留临时文件");
+        assert!(!path.exists(), "前置条件：当前日志不存在");
+
+        assert!(recover_rotating(&path), "恢复应成功");
+        assert!(path.exists(), "当前日志应已恢复");
+        assert!(!temp.exists(), "临时文件应已被消费");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("读回恢复的日志"),
+            old,
+            "旧日志内容应完整恢复到 path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rotating_saves_residue_as_backup_when_path_rebuilt() {
+        // 回滚失败后 path 被同步写入重建：残留内容不能覆盖新日志，应退化为 .1。
+        let dir = test_dir("recover-rotating-backup");
+        let _ = create_dir_all(&dir);
+        let path = dir.join("app.log");
+        let temp = dir.join("app.log.rotating");
+        let backup = dir.join("app.log.1");
+        let old = "stranded old log";
+        std::fs::write(&path, "new current log").expect("准备重建后的当前日志");
+        std::fs::write(&temp, old).expect("准备残留临时文件");
+
+        assert!(recover_rotating(&path), "恢复应成功");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("读回当前日志"),
+            "new current log",
+            "当前日志不应被残留内容覆盖"
+        );
+        assert!(backup.exists(), "残留内容应保存为 .1 备份");
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("读回备份"),
+            old,
+            "旧日志应能在 .1 中找到"
+        );
+        assert!(!temp.exists(), "临时文件应已被消费");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

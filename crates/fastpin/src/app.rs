@@ -671,9 +671,6 @@ fn run_tray() -> Result<()> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
     set_dpi_aware();
-    // 单实例，此刻不会有本程序在途写盘：清掉上次退出遗留的半截截图临时文件。
-    // 放在 CoInitializeEx 之后：默认截图目录要走 SHGetKnownFolderPath。
-    cleanup_stale_image_temps();
     let mut perf_boot = PerfSession::start();
     perf_boot.mark("T0");
     let _instance = match SingleInstance::acquire() {
@@ -697,6 +694,11 @@ fn run_tray() -> Result<()> {
             return Ok(());
         }
     };
+    // 清掉上次退出遗留的半截截图临时文件。必须在单实例 acquire 成功之后：
+    // 若第二实例在早退前清理，会按前缀删掉第一实例正在写/等待 rename 的临时文件
+    // （Windows 下 FILE_SHARE_DELETE 允许跨进程删除未关闭句柄的文件），令截图丢失。
+    // 放在 CoInitializeEx 之后：默认截图目录要走 SHGetKnownFolderPath。
+    cleanup_stale_image_temps();
 
     let cleanup_hwnd = std::rc::Rc::new(std::cell::RefCell::new(None::<HWND>));
     let boot_error = std::rc::Rc::new(std::cell::RefCell::new(None::<Error>));
@@ -1445,9 +1447,10 @@ fn publish_image(temp: &Path, target: &Path) -> Result<PathBuf> {
     unreachable!("候选路径序列无限，总会返回一个")
 }
 
-/// 启动时清理上次退出遗留的截图临时文件。单实例保证此刻没有本程序在途写盘，
-/// 目录里带本程序前缀的文件都是崩溃/强杀残留，直接删除（比 update.rs 的按龄
-/// 清理更及时：用户很快重启也不该看到半截文件）。失败一律静默。
+/// 启动时清理上次退出遗留的截图临时文件。调用方须在单实例 acquire 成功之后
+/// 调用，此刻才保证没有本程序在途写盘，目录里带本程序前缀的文件都是崩溃/强杀
+/// 残留，可直接删除（比 update.rs 的按龄清理更及时：用户很快重启也不该看到半截
+/// 文件）。失败一律静默。
 fn cleanup_stale_image_temps() {
     let Ok(dir) = crate::config::screenshot_dir() else {
         return;
@@ -1493,7 +1496,7 @@ mod tests {
         // Scratch under target/: the harness sandbox denies writes to %TEMP%.
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join("unique-path-test");
+            .join(format!("unique-path-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
 
@@ -1520,7 +1523,7 @@ mod tests {
         // Scratch under target/: the harness sandbox denies writes to %TEMP%.
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join("atomic-image-test");
+            .join(format!("atomic-image-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let target = dir.join("shot.png");

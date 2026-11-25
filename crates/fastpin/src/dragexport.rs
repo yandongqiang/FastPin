@@ -29,6 +29,13 @@ pub const MAX_RETAINED_BYTES: u64 = 512 * 1024 * 1024;
 /// matches upstream and is long enough that a user never sees a missing file.
 pub const TRANSFER_GRACE: Duration = Duration::from_secs(30 * 60);
 
+/// retry 条目最多允许失败的删除次数；到达后放弃，避免接收方长期持有句柄时
+/// 永久占用一个文件名额。
+pub const MAX_RETRY_ATTEMPTS: usize = 4;
+
+/// retry 条目的最长保留时间；即使次数未用尽，超时也要放弃并归还名额。
+pub const RETRY_GIVE_UP_AFTER: Duration = Duration::from_secs(5 * 60);
+
 /// One reserved drag file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
@@ -52,7 +59,7 @@ pub struct Retention {
     /// Files whose grace already elapsed but whose deletion failed, with the
     /// time to retry. A receiver can still hold a Windows handle, and dropping
     /// the record would leak the file with no owner left to clean it up.
-    retry: Vec<(PathBuf, u64, Instant)>,
+    retry: Vec<Retry>,
 }
 
 #[derive(Debug)]
@@ -63,6 +70,18 @@ struct Live {
     expires_at: Option<Instant>,
 }
 
+/// 删除失败后转入 retry 的记录：`since` 与 `attempts` 共同决定何时放弃，
+/// 防止一直删不掉的文件永远占住 64 个名额中的一个。
+#[derive(Debug, Clone)]
+struct Retry {
+    path: PathBuf,
+    bytes: u64,
+    /// 首次转入 retry 的时刻，用于判断放弃期限。
+    since: Instant,
+    /// 已经失败的删除次数。
+    attempts: usize,
+}
+
 /// 锁内摘取的删除目标：仅复制路径与预算交给锁外处理，不直接改动账本。
 #[derive(Debug, Clone)]
 pub struct DeleteTarget {
@@ -71,6 +90,8 @@ pub struct DeleteTarget {
     /// 来自 retry 队列：删除失败时留在 retry，不需要再次入队。
     retrying: bool,
     since: Instant,
+    /// retry 条目已经失败的删除次数，live 条目为 0。
+    attempts: usize,
 }
 
 /// 锁外删除的结果，交回 `apply_deletes` 才能更新账本与预算。
@@ -85,9 +106,10 @@ impl Retention {
         Self::default()
     }
 
-    /// Files currently held (dragging or inside their grace window).
+    /// Files currently held (dragging, inside their grace window, or waiting
+    /// in retry after a failed delete). Retry entries still occupy a slot.
     pub fn retained_files(&self) -> usize {
-        self.live.len()
+        self.live.len() + self.retry.len()
     }
 
     /// Bytes currently reserved.
@@ -104,7 +126,11 @@ impl Retention {
         // 这里不再调用 expire()：remove_file / 删目录是阻塞 I/O，若在持锁的
         // reserve() 里执行，会连带卡住其它拖出。过期统一交给 app.rs 的 sweep，
         // 由「锁内快照 -> 锁外删除 -> 锁内回填」三步完成。
-        if self.live.len() >= MAX_RETAINED_FILES || bytes > MAX_RETAINED_BYTES - self.bytes {
+        // retry 里的文件仍在磁盘上，必须和 live 一起占名额：否则 64 条删除失败
+        // 的记录转到 retry 后 live 归零，下一轮又能放进 64 个新文件，无上限累积。
+        if self.live.len() + self.retry.len() >= MAX_RETAINED_FILES
+            || bytes > MAX_RETAINED_BYTES - self.bytes
+        {
             return None;
         }
         let lease = Lease { path, bytes };
@@ -142,15 +168,17 @@ impl Retention {
                     bytes: live.lease.bytes,
                     retrying: false,
                     since: now,
+                    attempts: 0,
                 });
             }
         }
-        for (path, bytes, since) in &self.retry {
+        for retry in &self.retry {
             out.push(DeleteTarget {
-                path: path.clone(),
-                bytes: *bytes,
+                path: retry.path.clone(),
+                bytes: retry.bytes,
                 retrying: true,
-                since: *since,
+                since: retry.since,
+                attempts: retry.attempts,
             });
         }
         out
@@ -179,26 +207,53 @@ impl Retention {
             .collect()
     }
 
-    /// 第三步（持锁、无 I/O）：按删除结果更新账本。
+    /// 第三步（持锁）：按删除结果更新账本；只有到达放弃条件的 retry 条目
+    /// 才会在归还名额时做一次尽力删除的 I/O。
     ///
     /// 成功才归还预算并移除记录；首次删除失败（接收方仍持句柄）转入 retry，
-    /// 继续占用预算，等下一次 sweep 重试。
+    /// 继续占用预算与名额，等下一次 sweep 重试。retry 达到次数上限或保留期限
+    /// 后放弃，避免一条永远删不掉的文件把名额永久占死。
     pub fn apply_deletes(&mut self, results: Vec<DeleteResult>) {
         for DeleteResult { target, deleted } in results {
             if deleted {
                 if target.retrying {
-                    self.retry.retain(|(p, _, _)| p != &target.path);
+                    self.retry.retain(|r| r.path != target.path);
                 } else {
                     self.live.retain(|l| l.lease.path != target.path);
                 }
                 self.bytes = self.bytes.saturating_sub(target.bytes);
             } else if !target.retrying {
+                // 首次失败：从 live 移到 retry，名额与字节继续占用。
                 self.live.retain(|l| l.lease.path != target.path);
-                if !self.retry.iter().any(|(p, _, _)| p == &target.path) {
-                    self.retry.push((target.path, target.bytes, target.since));
+                if !self.retry.iter().any(|r| r.path == target.path) {
+                    self.retry.push(Retry {
+                        path: target.path,
+                        bytes: target.bytes,
+                        since: target.since,
+                        attempts: 1,
+                    });
+                }
+            } else {
+                // retry 再次失败：累计次数，到达上限或超时就放弃该条目。
+                let attempts = target.attempts + 1;
+                let give_up =
+                    attempts >= MAX_RETRY_ATTEMPTS || target.since.elapsed() >= RETRY_GIVE_UP_AFTER;
+                if give_up {
+                    self.retry.retain(|r| r.path != target.path);
+                    self.bytes = self.bytes.saturating_sub(target.bytes);
+                    // 最后一次尽力删除；仍删不掉也只记日志，名额必须归还。
+                    // 这里的 I/O 只发生在放弃路径（极少数），不会让每次 sweep
+                    // 都在持锁状态下做磁盘操作。
+                    discard(&target.path);
+                    eprintln!(
+                        "[FastPin] 拖出文件重试 {} 次后放弃: {}",
+                        attempts,
+                        target.path.display()
+                    );
+                } else if let Some(retry) = self.retry.iter_mut().find(|r| r.path == target.path) {
+                    retry.attempts = attempts;
                 }
             }
-            // 已在 retry 且仍然失败：原样留在 retry，下轮再试。
         }
     }
 
@@ -280,10 +335,16 @@ mod tests {
     fn scratch() -> PathBuf {
         // The sandbox denies writes to the system temp dir, so tests stage
         // inside the workspace's own target directory instead.
+        // 加进程 id：nextest 一测试一进程时，避免多个进程都拿到 fastpin-drag-0
+        // 并在结束时互相 remove_dir_all 删掉对方的文件。
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test-tmp")
-            .join(format!("fastpin-drag-{}", unique_counter()));
+            .join(format!(
+                "fastpin-drag-{}-{}",
+                std::process::id(),
+                unique_counter()
+            ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -347,6 +408,101 @@ mod tests {
         assert_eq!(retention.retry.len(), 0);
         assert_eq!(retention.retained_files(), 0);
         assert_eq!(retention.retained_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_deletes_still_count_against_the_file_budget() {
+        let dir = scratch();
+        // 目录无法被 remove_file 删除：sweep 后这条记录必然进入 retry。
+        let blocked = dir.join("blocked.png");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut retention = Retention::new();
+        let blocked_lease = retention.reserve(blocked.clone(), 1).unwrap();
+        for i in 0..MAX_RETAINED_FILES - 1 {
+            let path = dir.join(format!("live-{i}.png"));
+            std::fs::write(&path, b"x").unwrap();
+            assert!(retention.reserve(path, 1).is_some());
+        }
+        retention.complete(&blocked_lease, true);
+        for live in retention.live.iter_mut() {
+            if live.lease.path == blocked {
+                live.expires_at = Some(Instant::now() - Duration::from_secs(1));
+            }
+        }
+        retention.expire();
+
+        assert_eq!(retention.retry.len(), 1, "删除失败应转入 retry");
+        assert_eq!(
+            retention.live.len(),
+            MAX_RETAINED_FILES - 1,
+            "失败的条目应从 live 移走"
+        );
+        assert_eq!(
+            retention.retained_files(),
+            MAX_RETAINED_FILES,
+            "retry 条目仍应占用文件名额"
+        );
+        // 中危回归点：64 条都在账本里，不能再放进第 65 个文件。
+        assert!(
+            retention.reserve(dir.join("one-too-many.png"), 1).is_none(),
+            "retry 队列不得绕过文件数上限"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_gives_up_after_max_attempts_and_reclaims_the_slot() {
+        let dir = scratch();
+        // 每次 sweep 都失败，直到累计次数达到上限。
+        let blocked = dir.join("always-blocked.png");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut retention = Retention::new();
+        let lease = retention.reserve(blocked.clone(), 7).unwrap();
+        retention.complete(&lease, true);
+        for live in retention.live.iter_mut() {
+            live.expires_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        for _ in 0..MAX_RETRY_ATTEMPTS {
+            retention.expire();
+        }
+        assert_eq!(retention.retry.len(), 0, "重试达到上限后应放弃条目");
+        assert_eq!(retention.retained_bytes(), 0, "放弃后应归还字节预算");
+        assert_eq!(retention.retained_files(), 0, "放弃后应归还文件名额");
+        assert!(
+            retention.reserve(dir.join("fresh.png"), 1).is_some(),
+            "名额回收后新的拖出应能成功"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_gives_up_after_timeout_and_reclaims_the_slot() {
+        let dir = scratch();
+        let blocked = dir.join("timed-out.png");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut retention = Retention::new();
+        let lease = retention.reserve(blocked.clone(), 3).unwrap();
+        retention.complete(&lease, true);
+        for live in retention.live.iter_mut() {
+            live.expires_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+        retention.expire();
+        assert_eq!(retention.retry.len(), 1, "首次失败应进入 retry");
+
+        // 次数还没用完，但首次失败时间已超过保留期限，也应放弃。
+        retention.retry[0].since = Instant::now() - RETRY_GIVE_UP_AFTER;
+        retention.expire();
+        assert_eq!(retention.retry.len(), 0, "超时后应放弃 retry 条目");
+        assert_eq!(retention.retained_bytes(), 0, "超时放弃后应归还字节预算");
+        assert_eq!(retention.retained_files(), 0, "超时放弃后应回收文件名额");
+        assert!(
+            retention
+                .reserve(dir.join("after-timeout.png"), 1)
+                .is_some(),
+            "回收后应能再次 reserve"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

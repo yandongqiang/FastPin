@@ -1782,6 +1782,23 @@ fn recover_split(input: Option<&serde_json::Value>) -> crate::imagesplit::SplitS
 mod tests {
     use super::*;
 
+    /// %TEMP% 在受限 CI / 沙箱里可能不可写。测试文件统一放到 crate 的
+    /// target/ 下（cargo 已为该目录授予写权限），pid + 序号保证并行测试
+    /// 各有独立目录；各测试结束时用 remove_dir_all 清理自己的目录。
+    fn test_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::AtomicUsize;
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "fastpin-config-test-{}-{seq}-{label}",
+                std::process::id()
+            ));
+        std::fs::create_dir_all(&dir).expect("creates test dir under target");
+        dir
+    }
+
     #[test]
     fn missing_or_broken_file_falls_back_to_defaults() {
         for text in ["", "not json", "{", "[]"] {
@@ -2296,21 +2313,13 @@ mod tests {
     /// 加载路径必须先把损坏文件改名留档，且不覆盖已有备份。
     #[test]
     fn broken_config_is_quarantined_before_defaults_are_saved() {
-        let unique = format!(
-            "settings-quarantine-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock after epoch")
-                .as_nanos()
-        );
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("{unique}.json"));
-        let prefix = format!("{unique}.json.broken-");
+        let dir = test_dir("quarantine");
+        let path = dir.join("settings.json");
+        let prefix = "settings.json.broken-";
 
         fn backups(dir: &Path, prefix: &str) -> Vec<PathBuf> {
             let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
-                .expect("reads temp dir")
+                .expect("reads test dir")
                 .filter_map(|entry| entry.ok().map(|e| e.path()))
                 .filter(|p| {
                     p.file_name()
@@ -2327,7 +2336,7 @@ mod tests {
         std::fs::write(&path, first).expect("writes broken file");
         assert!(quarantine_broken(&path, Some(first)));
         assert!(!path.exists(), "损坏文件应已被移走");
-        let first_backups = backups(&dir, &prefix);
+        let first_backups = backups(&dir, prefix);
         assert_eq!(first_backups.len(), 1, "应留下一份备份");
         let saved = std::fs::read_to_string(&first_backups[0]).expect("reads backup");
         assert_eq!(saved, first, "备份内容必须原样保留");
@@ -2338,7 +2347,7 @@ mod tests {
         std::fs::write(&path, second).expect("writes second broken file");
         assert!(quarantine_broken(&path, Some(second)));
         assert!(!path.exists());
-        let all = backups(&dir, &prefix);
+        let all = backups(&dir, prefix);
         assert_eq!(all.len(), 2, "第二次隔离应另建备份");
         let first_saved = std::fs::read_to_string(&all[0]).expect("reads first backup");
         let second_saved = std::fs::read_to_string(&all[1]).expect("reads second backup");
@@ -2349,9 +2358,7 @@ mod tests {
         assert!(!is_broken_config(r#"{"appearance":"Default Light"}"#));
         assert!(!is_broken_config("   "));
 
-        for backup in all {
-            let _ = std::fs::remove_file(backup);
-        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 读取失败（杀软/同步占用/权限）不能被当成空配置：加载路径会用
@@ -2368,29 +2375,21 @@ mod tests {
         assert!(load_text_is_recoverable(&Err(not_found)));
         assert!(!load_text_is_recoverable(&Err(denied)));
 
-        let unique = format!(
-            "settings-unreadable-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock after epoch")
-                .as_nanos()
-        );
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("{unique}.json"));
-        let prefix = format!("{unique}.json.broken-");
+        let dir = test_dir("unreadable");
+        let path = dir.join("settings.json");
+        let prefix = "settings.json.broken-";
         // 合法配置：读取失败时绝不能被默认值覆盖，必须先原样留档。
         let original = r#"{"translation":{"baseUrl":"https://api.example.com/v1"}}"#;
         std::fs::write(&path, original).expect("writes valid config");
         assert!(quarantine_broken(&path, None));
         assert!(!path.exists(), "读取失败时原文件应已被隔离");
         let backups: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .expect("reads temp dir")
+            .expect("reads test dir")
             .filter_map(|entry| entry.ok().map(|e| e.path()))
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(&prefix))
+                    .is_some_and(|n| n.starts_with(prefix))
             })
             .collect();
         assert_eq!(backups.len(), 1, "应留下一份备份");
@@ -2406,7 +2405,7 @@ mod tests {
             defaults.translation.base_url, "",
             "默认值不应带用户的 baseUrl"
         );
-        let _ = std::fs::remove_file(&backups[0]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

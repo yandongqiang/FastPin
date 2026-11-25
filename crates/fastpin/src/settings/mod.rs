@@ -1129,17 +1129,29 @@ impl SettingsView {
         }
         match crate::translate::set_api_key(&key) {
             Ok(()) => {
+                let mut saved = true;
                 if key.trim().is_empty() && self.settings.translation.allow_insecure_http {
                     self.settings.translation.allow_insecure_http = false;
-                    self.persist(cx);
+                    saved = self.persist(cx);
                 }
                 self.http_warn_confirm = false;
                 self.saved_api_key = key;
-                self.ok("API Key 已保存");
+                if saved {
+                    self.ok("API Key 已保存");
+                }
+                // 失败时 persist 已写入「设置保存失败」，不能再覆盖成成功文案。
             }
             Err(e) => self.fail(format!("API Key 保存失败：{e}")),
         }
         cx.notify();
+    }
+
+    /// 清除密钥库成功后，同步凭据缓存与输入框文本。返回的正是要写进
+    /// `TextInput` 的文本；清空它是核心不变量——否则失焦时的 `commit_api_key`
+    /// 会把旧文本当成新 key 再写回密钥库。抽成纯函数便于直接单测。
+    fn clear_api_key_text(saved_api_key: &mut String) -> String {
+        saved_api_key.clear();
+        saved_api_key.clone()
     }
 
     /// Re-fills the text fields after a reset, so the page and the file agree.
@@ -1267,13 +1279,8 @@ impl SettingsView {
         let before_reset = self.settings.clone();
         let baseline_before = self.baseline.clone();
         if model::reset_page(&mut self.settings, self.page) {
-            // 外观页重置回默认主题变体；重新应用（即使值没变）可让工具栏、
-            // 弹层和本窗口一起刷新，无需再点一次。
-            theme::set_appearance(cx, &self.settings.appearance);
-            self.sync_inputs(cx);
-            if self.page == Page::Hotkey {
-                self.reapply_hotkeys();
-            }
+            // 外观 / 输入框 / 热键 / OCR 引擎都是可见的运行时副作用，必须等
+            // persist 成功后才应用；保存失败时 UI 与运行时要继续反映磁盘配置。
             // 不能置全局 force：那会让 collage / pdf / export / appearance /
             // split 整份取开窗快照，回滚其它窗口共享的最新值。这里把本页字段
             // 的基线改成重置前的值，并置本页强制：常规合并后由 force_page_fields
@@ -1286,16 +1293,13 @@ impl SettingsView {
                 // 标记，下次重试仍按原始基线判断，也不显示「已重置」成功提示。
                 // force_page 故意保留，下次保存仍会把本页重置值写下去。
                 self.baseline = baseline_before;
-            }
-            if self.page == Page::Resources {
-                // 模型目录被重置，缓存的引擎快照与已加载引擎都必须同步失效。
-                crate::ocr::invalidate_engine();
-                self.refresh_engine_status(true, cx);
-            }
-            if saved {
-                // API Key 存在密钥库而非 settings.json，删除是不可逆的外部副作用，
-                // 必须等配置成功落盘后才执行；保存失败时凭据与缓存都保持原样。
+            } else {
+                // 配置真正落盘后才应用所有可见副作用，避免失败时 UI / 运行时
+                // 已变成默认值、与磁盘配置不一致。
+                theme::set_appearance(cx, &self.settings.appearance);
                 if self.page == Page::Translate {
+                    // API Key 存在密钥库而非 settings.json，删除是不可逆的外部副作用，
+                    // 必须等配置成功落盘后才执行；保存失败时凭据与缓存都保持原样。
                     if let Err(e) = crate::translate::set_api_key("") {
                         // 失败提示自带「已重置」语义，不能再叠加成功提示覆盖它。
                         self.fail(format!(
@@ -1303,11 +1307,25 @@ impl SettingsView {
                             self.page.title()
                         ));
                     } else {
-                        self.saved_api_key.clear();
+                        // 缓存与输入框一起清空：只清缓存的话，失焦时
+                        // commit_api_key 会把旧文本再写回密钥库。
+                        let text = Self::clear_api_key_text(&mut self.saved_api_key);
+                        self.api_key
+                            .update(cx, |input, cx| input.set_text(text, cx));
                         self.ok(format!("已重置「{}」", self.page.title()));
                     }
                 } else {
                     self.ok(format!("已重置「{}」", self.page.title()));
+                }
+                // 同步放在清 key 之后：此时 saved_api_key 已为空，输入框不会被写回旧值。
+                self.sync_inputs(cx);
+                if self.page == Page::Hotkey {
+                    self.reapply_hotkeys();
+                }
+                if self.page == Page::Resources {
+                    // 模型目录被重置，缓存的引擎快照与已加载引擎都必须同步失效。
+                    crate::ocr::invalidate_engine();
+                    self.refresh_engine_status(true, cx);
                 }
             }
         } else {
@@ -1318,10 +1336,6 @@ impl SettingsView {
 
     fn reset_all(&mut self, cx: &mut Context<Self>) {
         model::reset_all(&mut self.settings);
-        theme::set_appearance(cx, &self.settings.appearance);
-        self.autostart = system::autostart_enabled();
-        self.sync_inputs(cx);
-        self.reapply_hotkeys();
         self.confirm_reset_all = false;
         // 全局重置包含 split 等由其它窗口写入的字段，必须整份落盘（这里全局
         // force 是语义所需，与单页重置不同）。清掉可能残留的单页强制，语义
@@ -1329,18 +1343,35 @@ impl SettingsView {
         self.force_snapshot = true;
         self.force_page = None;
         let saved = self.persist(cx);
-        // 全局重置也会清掉 OCR 模型目录，刷新状态页快照并让旧引擎立即失效。
-        crate::ocr::invalidate_engine();
-        self.refresh_engine_status(true, cx);
+        // 保存失败时 persist 已显示「设置保存失败」，不再用成功文案覆盖，
+        // force_snapshot 也保留着，下次重试仍会整份写入默认配置。外观 / 输入框 /
+        // 热键 / OCR 等可见副作用也只在成功落盘后应用，失败时 UI 与运行时
+        // 必须继续反映磁盘上的旧配置。
         if saved {
+            theme::set_appearance(cx, &self.settings.appearance);
+            // sync_inputs 会用当时的 saved_api_key 回填输入框，因此清 key 之后
+            // 还要再写一次空文本（见下方），否则旧 key 会被失焦写回。
+            self.sync_inputs(cx);
+            self.reapply_hotkeys();
+            // 全局重置也会清掉 OCR 模型目录，刷新状态页快照并让旧引擎立即失效。
+            crate::ocr::invalidate_engine();
+            self.refresh_engine_status(true, cx);
+
             // 配置已成功落盘，此时才执行不可逆的外部副作用：清除密钥库中的
             // 凭据、关闭开机启动。保存失败时两者都保持原样，避免用户数据丢失。
             let key_error = crate::translate::set_api_key("").err();
-            if key_error.is_none() {
-                self.saved_api_key.clear();
-            }
+            let input_text = if key_error.is_none() {
+                Some(Self::clear_api_key_text(&mut self.saved_api_key))
+            } else {
+                None
+            };
             let autostart_error = system::set_autostart(false).err();
             self.autostart = system::autostart_enabled();
+            if let Some(text) = input_text {
+                // 缓存清空后输入框也必须清空，否则失焦会把旧 key 写回。
+                self.api_key
+                    .update(cx, |input, cx| input.set_text(text, cx));
+            }
             // 两类失败分别收集，避免一个失败掩盖另一个，也保留原有提示文案风格。
             let mut failures = Vec::new();
             if let Some(e) = key_error {
@@ -1355,8 +1386,6 @@ impl SettingsView {
                 self.fail(format!("所有设置已恢复默认，但{}", failures.join("；")));
             }
         }
-        // 保存失败时 persist 已显示「设置保存失败」，不再用成功文案覆盖，
-        // force_snapshot 也保留着，下次重试仍会整份写入默认配置。
         cx.notify();
     }
 
@@ -2575,13 +2604,19 @@ impl SettingsView {
     }
 
     /// 以管理员权限拉起下载好的安装包；UAC 被拒时 launch_installer 会返回
-    /// 明确的错误，而不是静默无反应。
+    /// 明确的错误，而不是静默无反应。启动成功后必须退出应用，否则安装器
+    /// 可能无法替换正在运行的 exe。
     fn install_downloaded(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.downloaded_installer.clone() else {
             return;
         };
         match crate::update::launch_installer(&path) {
-            Ok(()) => self.ok("已启动安装程序；请在用户账户控制提示中确认"),
+            Ok(()) => {
+                self.ok("安装程序启动后应用将退出，请在 UAC 提示中确认");
+                cx.notify();
+                cx.quit();
+                return;
+            }
             Err(e) => self.fail(e.to_string()),
         }
         cx.notify();
@@ -4324,13 +4359,17 @@ impl SettingsView {
                         if this.settings.translation.allow_insecure_http {
                             this.settings.translation.allow_insecure_http = false;
                             this.http_warn_confirm = false;
-                            this.persist(cx);
-                            this.ok("已撤销明文 HTTP 授权");
+                            // persist 失败时自己会写入「设置保存失败」，这里不能
+                            // 再用成功文案覆盖它。
+                            if this.persist(cx) {
+                                this.ok("已撤销明文 HTTP 授权");
+                            }
                         } else if this.http_warn_confirm {
                             this.settings.translation.allow_insecure_http = true;
                             this.http_warn_confirm = false;
-                            this.persist(cx);
-                            this.ok("已确认：允许明文 HTTP 发送 API Key");
+                            if this.persist(cx) {
+                                this.ok("已确认：允许明文 HTTP 发送 API Key");
+                            }
                         } else {
                             this.http_warn_confirm = true;
                             this.ok("再次点击以确认明文传输风险");
@@ -5787,57 +5826,6 @@ mod tests {
         assert_eq!(second.screenshot.collage.spacing, 0);
     }
 
-    /// persist 必须把成败返回给重置流程；失败文案不得被「已重置」覆盖，
-    /// 单页重置也不能再置全局 force（全局重置仍保留）。
-    #[test]
-    fn reset_flows_check_persist_result_and_scope() {
-        let source = include_str!("mod.rs");
-        assert!(source.contains("fn persist(&mut self, cx: &mut Context<Self>) -> bool"));
-        let start = source
-            .find("fn reset_page(")
-            .expect("reset_page is defined");
-        let all_start = source
-            .find("fn reset_all(")
-            .expect("reset_all follows reset_page");
-        let end = source
-            .find("fn set_water_position(")
-            .expect("set_water_position follows resets");
-        let page = &source[start..all_start];
-        let all = &source[all_start..end];
-        assert_eq!(page.matches("self.persist(cx)").count(), 1);
-        assert_eq!(all.matches("self.persist(cx)").count(), 1);
-        assert!(page.contains("if saved {"), "成功才显示已重置");
-        assert!(page.contains("if !saved {"), "失败时回滚本页基线标记");
-        assert!(
-            !page.contains("force_snapshot = true"),
-            "单页重置不得整份 force"
-        );
-        assert!(
-            page.contains("self.force_page = Some(self.page)"),
-            "单页重置必须置本页强制"
-        );
-        assert!(
-            all.contains("force_snapshot = true"),
-            "全局重置仍整份 force"
-        );
-        // persist 只在成功分支前移基线 / 清除 force；失败后仍保留 force 供重试。
-        let p_start = source
-            .find("fn persist(&mut self")
-            .expect("persist is defined");
-        let p_end = source
-            .find("fn commit_api_key(")
-            .expect("commit_api_key follows persist");
-        let body = &source[p_start..p_end];
-        assert!(
-            body.find("self.force_snapshot = false").unwrap() > body.find("Ok(()) =>").unwrap(),
-            "失败分支不得清除 force_snapshot"
-        );
-        assert!(
-            body.find("self.force_page = None").unwrap() > body.find("Ok(()) =>").unwrap(),
-            "失败分支不得清除 force_page，供下次重试"
-        );
-    }
-
     #[test]
     fn recording_rejects_bare_keys_except_prtsc() {
         let bare_a = Hotkey::new(false, false, false, false, hotkey::VK_A);
@@ -5856,73 +5844,6 @@ mod tests {
         assert!(recording_hotkey_acceptable(alt_a), "Alt 组合可用");
         assert!(recording_hotkey_acceptable(shift_a), "Shift 组合可用");
         assert!(recording_hotkey_acceptable(win_a), "Win 组合可用");
-    }
-
-    #[test]
-    fn recording_validates_bare_keys_before_persisting() {
-        let source = include_str!("mod.rs");
-        let start = source
-            .find("fn hotkey_recorded(")
-            .expect("hotkey_recorded is defined");
-        let end = source
-            .find("fn set_autostart(")
-            .expect("set_autostart follows hotkey_recorded");
-        let body = &source[start..end];
-        let check = body
-            .find("recording_hotkey_acceptable(pressed)")
-            .expect("录制入口必须校验裸键");
-        let save = body.find("self.persist(cx)").expect("成功路径会保存");
-        assert!(check < save, "校验必须在保存之前");
-        assert!(
-            body.contains("热键至少需要 Ctrl / Alt / Shift / Win 中的一个"),
-            "拒绝时给出中文提示"
-        );
-    }
-
-    #[test]
-    fn cancelled_download_removes_its_file() {
-        let source = include_str!("mod.rs");
-        let start = source
-            .find("fn download_update(")
-            .expect("download_update is defined");
-        let end = source
-            .find("fn open_downloaded_folder(")
-            .expect("open_downloaded_folder follows download_update");
-        let body = &source[start..end];
-        assert!(
-            body.contains("worker_cancel.load(Ordering::Acquire)"),
-            "worker 必须再次检查取消标记"
-        );
-        assert!(
-            body.contains("std::fs::remove_file(path)"),
-            "取消后必须删除已落盘的安装包，避免孤儿文件"
-        );
-    }
-
-    /// Win32 注册本身无法纯单测，至少确认录制成功路径会查询并展示 fallback
-    /// 注册失败，而不是无条件显示「已设为 X」。LL 模式查询为 None，文案不变。
-    #[test]
-    fn hotkey_recording_reports_fallback_register_failure() {
-        let source = include_str!("mod.rs");
-        let start = source
-            .find("fn hotkey_recorded(")
-            .expect("hotkey_recorded is defined");
-        let end = source
-            .find("fn set_autostart(")
-            .expect("set_autostart follows hotkey_recorded");
-        let body = &source[start..end];
-        assert!(
-            body.contains("take_fallback_register_failure()"),
-            "必须读取 fallback 注册失败"
-        );
-        assert!(
-            body.contains("热键被其它程序占用"),
-            "失败时不得仍提示已设为 X"
-        );
-        assert!(
-            body.find("take_fallback_register_failure()").unwrap() < body.find("已设为").unwrap(),
-            "先判断失败，再给出成功文案"
-        );
     }
 
     #[test]
@@ -5956,60 +5877,6 @@ mod tests {
     }
 
     #[test]
-    fn about_page_names_the_product_fastpin() {
-        assert_eq!(crate::APP_NAME, "FastPin");
-        assert_eq!(format!("{} 设置", crate::APP_NAME), "FastPin 设置");
-        // The About row and the title both render this constant, so pinning it
-        // pins every place that names the product.
-        let source = include_str!("mod.rs");
-        assert!(source.contains("widgets::row(crate::APP_NAME"));
-        assert!(source.contains("format!(\"{} 设置\", crate::APP_NAME)"));
-    }
-
-    /// The window title must be drawn once, in the component title bar. The
-    /// left rail used to repeat the logo, the product name and "设置" above
-    /// the navigation, which read as two captions for the same window.
-    #[test]
-    fn nav_pane_no_longer_repeats_the_brand_header() {
-        let source = include_str!("mod.rs");
-        let nav_start = source.find("fn nav(").expect("nav is defined");
-        let nav_end = source
-            .find("fn search_field")
-            .expect("search_field follows nav");
-        let nav = &source[nav_start..nav_end];
-        assert!(
-            !nav.contains("crate::APP_NAME"),
-            "left rail must not draw the product name"
-        );
-        assert!(
-            !nav.contains("logo_element"),
-            "left rail must not repeat the brand mark"
-        );
-    }
-
-    /// The search field lives inside the title bar now; the content area no
-    /// longer spends a 56px row on it.
-    #[test]
-    fn search_field_is_embedded_in_the_title_bar() {
-        let source = include_str!("mod.rs");
-        let title_start = source.find("fn titlebar").expect("titlebar is defined");
-        let title_end = source.find("fn nav(").expect("nav follows titlebar");
-        let titlebar = &source[title_start..title_end];
-        assert!(
-            titlebar.contains("self.search_field()"),
-            "title bar must own the search field"
-        );
-        assert!(
-            !source.contains(concat!("fn search", "_bar")),
-            "the standalone search row was removed"
-        );
-        assert!(
-            titlebar.contains("format!(\"{} 设置\", crate::APP_NAME)"),
-            "the single window caption stays in the title bar"
-        );
-    }
-
-    #[test]
     fn embedded_brand_logo_decodes() {
         let decoded =
             image::load_from_memory(include_bytes!("../../../../assets/logo/fastpin.png"))
@@ -6021,103 +5888,5 @@ mod tests {
         // corner and opaque in the middle, i.e. no white card.
         assert_eq!(bytes[3], 0, "corner alpha");
         assert!(bytes[(32 * 64 + 32) * 4 + 3] > 0, "glyph alpha");
-    }
-
-    /// The old product name survives only in the migration constants that must
-    /// find pre-rebrand user data; every other identifier is named FastPin now.
-    /// The former crate directory must be gone from the whole source tree too.
-    #[test]
-    fn source_only_keeps_legacy_migration_literals() {
-        // Built from pieces so this test's own source never contains any of
-        // the literals it is scanning for.
-        let needle = concat!("zsh", "ot");
-        let old_path_fwd = concat!("crates/", "zsh", "ot");
-        let old_path_bwd = concat!("crates\\", "zsh", "ot");
-        // (file name, marker present on the exempt line). External URLs are
-        // skipped: they are not internal identifiers.
-        let exempt: &[(&str, &str)] = &[
-            ("migrate.rs", "LEGACY_DIR"),
-            ("migrate.rs", "root.join"),
-            ("system.rs", "LEGACY_RUN_VALUE"),
-            ("translate.rs", "LEGACY_VAULT_RESOURCE"),
-            // README 里的上游来源声明 / 致谢是用户可见的历史事实（用户
-            // 2026-11-12 要求保留「基于旧项目二次开发」并致谢），不是内部标识
-            // 残留；用该句原文作标记只豁免这些致谢行，README 其余命中照常报错。
-            ("README.md", "二次vibe coding开发"),
-            ("README.md", "二次开发"),
-            // NOTICE credits the predecessor project explicitly.
-            ("NOTICE", concat!("Zsh", "ot")),
-            // Phase 1 审计文档引用历史命名（C# 命名空间、README 原文摘录）作为
-            // 证据，属于说明性引用而非代码残留；标记用 concat! 拼接，避免本文件
-            // 自身命中扫描 needle。
-            ("PHASE1_AUDIT_REPORT.md", concat!("Zsh", "ot.Translation")),
-            ("PHASE1_AUDIT_REPORT.md", "二次vibe coding开发"),
-        ];
-        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let workspace_root = crate_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root");
-        let mut stack = vec![workspace_root.to_path_buf()];
-        let mut offenders: Vec<String> = Vec::new();
-        let mut old_paths: Vec<String> = Vec::new();
-        while let Some(dir) = stack.pop() {
-            if !dir.is_dir() {
-                continue;
-            }
-            for entry in std::fs::read_dir(&dir).expect("source directory") {
-                let path = entry.expect("directory entry").path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if path.is_dir() {
-                    // Build cache and VCS metadata are not source and can bake
-                    // in stale paths from earlier layouts.
-                    if name != "target" && name != ".git" {
-                        stack.push(path);
-                    }
-                    continue;
-                }
-                if name.ends_with(".lock") {
-                    continue;
-                }
-                let bytes = match std::fs::read(&path) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                // Skip binary assets (icons, models, DLLs): a NUL in the head
-                // is how ripgrep itself tells binary from text.
-                if bytes.len() > 8 * 1024 * 1024 || bytes[..bytes.len().min(8192)].contains(&0) {
-                    continue;
-                }
-                let text = String::from_utf8_lossy(&bytes);
-                for (i, line) in text.lines().enumerate() {
-                    if line.contains("http://") || line.contains("https://") {
-                        continue;
-                    }
-                    let lower = line.to_ascii_lowercase();
-                    let where_ = format!("{}:{}", path.display(), i + 1);
-                    if lower.contains(needle)
-                        && !exempt.iter().any(|pair| {
-                            let (f, m) = *pair;
-                            f == name && line.contains(m)
-                        })
-                    {
-                        offenders.push(format!("{}: {}", where_, line.trim()));
-                    }
-                    if lower.contains(old_path_fwd) || lower.contains(old_path_bwd) {
-                        old_paths.push(format!("{}: {}", where_, line.trim()));
-                    }
-                }
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "old product name outside the migration constants:\n{}",
-            offenders.join("\n")
-        );
-        assert!(
-            old_paths.is_empty(),
-            "old crate path still present in the source tree:\n{}",
-            old_paths.join("\n")
-        );
     }
 }

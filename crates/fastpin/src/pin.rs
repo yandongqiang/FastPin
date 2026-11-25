@@ -1726,13 +1726,6 @@ impl PinView {
             crate::drag::drag_file_async(path.clone(), move |outcome| {
                 let _ = tx.send(outcome);
             });
-            // OLE needs an MTA here: the writer thread below touches WIC.
-            unsafe {
-                let _ = windows::Win32::System::Com::CoInitializeEx(
-                    None,
-                    windows::Win32::System::Com::COINIT_MULTITHREADED,
-                );
-            }
             // OLE 卡死时回调可能永远不来：无限 recv 会让租约的 expires_at
             // 永远是 None，白占一个名额和预算。超时按"拒绝"收尾，complete()
             // 会照常启动宽限期，使条目进入过期流程；迟到的 send 只会 Err，无害。

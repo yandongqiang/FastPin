@@ -399,6 +399,25 @@ impl Drop for Apartment {
     }
 }
 
+/// `Split Images_<name>` 中 `<name>` 的字符上限。前缀 13 字节、冲突后缀
+/// ` (n)` 也要占空间，字符数上限先挡住超长中文名。
+const MAX_EXPORT_NAME_CHARS: usize = 80;
+/// NTFS 单组件上限 255 字节，给前缀与序号后缀留足余量。
+const MAX_EXPORT_NAME_BYTES: usize = 96;
+
+/// 按字符数和 UTF-8 字节数双重预算截断，返回仍是合法 UTF-8 的前缀。
+/// `char_indices` 保证不会把一个多字节汉字切成两半。
+fn truncate_export_name(text: &str) -> &str {
+    let mut end = 0;
+    for (chars, (i, c)) in text.char_indices().enumerate() {
+        if chars >= MAX_EXPORT_NAME_CHARS || i + c.len_utf8() > MAX_EXPORT_NAME_BYTES {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    &text[..end]
+}
+
 /// Replace characters that are awkward in a folder name.
 fn sanitize_name(name: &str) -> String {
     let cleaned: String = name
@@ -412,10 +431,13 @@ fn sanitize_name(name: &str) -> String {
         })
         .collect();
     let cleaned = cleaned.trim().trim_matches(|c| c == '.' || c == ' ');
-    if cleaned.is_empty() {
+    // 先截到预算内，再修一次尾部：截断可能刚好留下一个点或空格。
+    let capped = truncate_export_name(cleaned);
+    let capped = capped.trim().trim_matches(|c| c == '.' || c == ' ');
+    if capped.is_empty() {
         "Screenshot".into()
     } else {
-        cleaned.into()
+        capped.into()
     }
 }
 
@@ -431,6 +453,9 @@ fn is_empty_dir(path: &Path) -> std::io::Result<bool> {
 /// once every tile succeeded, so a failed export never leaves half-written
 /// tiles behind.
 fn resolve_export_directory(parent: &Path, image_name: &str) -> std::io::Result<PathBuf> {
+    // 导出父目录可能来自深 save_dir；先转长路径，后续的 is_dir / try_exists /
+    // create_dir 都继承前缀。短路径原样返回，幂等。
+    let parent = crate::config::extended_path(parent);
     if !parent.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -472,13 +497,17 @@ fn publish_staging_directory(
     parent: &Path,
     image_name: &str,
 ) -> std::io::Result<PathBuf> {
+    let parent = crate::config::extended_path(parent);
     let mut final_dir = first_choice;
     for _ in 0..64 {
         // Windows 上 rename 到已存在的空目录也会失败，先移除空壳。
         if final_dir.is_dir() && is_empty_dir(&final_dir).unwrap_or(false) {
-            let _ = std::fs::remove_dir(&final_dir);
+            let _ = std::fs::remove_dir(crate::config::extended_path(&final_dir));
         }
-        match std::fs::rename(staging, &final_dir) {
+        match std::fs::rename(
+            crate::config::extended_path(staging),
+            crate::config::extended_path(&final_dir),
+        ) {
             Ok(()) => return Ok(final_dir),
             Err(e)
                 if e.kind() == std::io::ErrorKind::AlreadyExists
@@ -486,7 +515,7 @@ fn publish_staging_directory(
             {
                 // 期间有别的导出占了这个名字（Windows 上 rename 到非空目录
                 // 返回 DirectoryNotEmpty 而非 AlreadyExists），顺着序号再找一个。
-                final_dir = resolve_export_directory(parent, image_name)?;
+                final_dir = resolve_export_directory(&parent, image_name)?;
             }
             Err(e) => return Err(e),
         }
@@ -500,6 +529,7 @@ fn publish_staging_directory(
 /// Claim a unique hidden staging directory next to the final one. `create_dir`
 /// is atomic, so concurrent exports never share a staging folder.
 fn create_staging_directory(parent: &Path) -> std::io::Result<PathBuf> {
+    let parent = crate::config::extended_path(parent);
     for suffix in 0..i32::MAX {
         let candidate = parent.join(format!(".Split Images_tmp-{}-{suffix}", std::process::id()));
         match std::fs::create_dir(&candidate) {
@@ -533,7 +563,8 @@ fn export_one_tile(
         crate::codec::encode_bgra(format, quality, &crop, region.width, region.height, stride)
             .map_err(|e| format!("第 {} 块编码失败：{e}", index + 1))?;
     let path = dir.join(format!("{}.{}", index + 1, format.extension()));
-    std::fs::write(&path, encoded).map_err(|e| format!("第 {} 块写入失败：{e}", index + 1))?;
+    std::fs::write(crate::config::extended_path(&path), encoded)
+        .map_err(|e| format!("第 {} 块写入失败：{e}", index + 1))?;
     Ok(())
 }
 
@@ -553,6 +584,8 @@ pub fn export_split_images(
     parent: &Path,
     image_name: &str,
 ) -> SplitExportResult {
+    // 深 save_dir 下的整批导出同样需要长路径前缀；子函数会重复调用（幂等）。
+    let parent = crate::config::extended_path(parent);
     let mut result = SplitExportResult {
         total_count: layout.output_count(),
         ..SplitExportResult::default()
@@ -564,14 +597,14 @@ pub fn export_split_images(
         result.error = "图片或切图配置无效".into();
         return result;
     }
-    let final_dir = match resolve_export_directory(parent, image_name) {
+    let final_dir = match resolve_export_directory(&parent, image_name) {
         Ok(d) => d,
         Err(e) => {
             result.error = format!("无法创建输出目录：{e}");
             return result;
         }
     };
-    let staging = match create_staging_directory(parent) {
+    let staging = match create_staging_directory(&parent) {
         Ok(d) => d,
         Err(e) => {
             result.error = format!("无法创建临时目录：{e}");
@@ -582,7 +615,7 @@ pub fn export_split_images(
     let _apartment = Apartment::join();
     for index in 0..result.total_count {
         if let Err(e) = export_one_tile(&staging, pixels, layout, format, quality, index) {
-            let _ = std::fs::remove_dir_all(&staging);
+            let _ = std::fs::remove_dir_all(crate::config::extended_path(&staging));
             result.error = e;
             return result;
         }
@@ -591,10 +624,10 @@ pub fn export_split_images(
     // Every tile is on disk: publish the folder atomically. `directory` is
     // assigned only here, so a rename failure also reports an empty directory.
     // 冲突时由 publish_staging_directory 改用带序号的目录重试。
-    match publish_staging_directory(&staging, final_dir, parent, image_name) {
+    match publish_staging_directory(&staging, final_dir, &parent, image_name) {
         Ok(dir) => result.directory = dir,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging);
+            let _ = std::fs::remove_dir_all(crate::config::extended_path(&staging));
             result.saved_count = 0;
             result.error = format!("导出目录落盘失败：{e}");
         }
@@ -613,6 +646,43 @@ mod tests {
             split_type: SplitType::Equal,
             ..SplitSettings::default()
         }
+    }
+
+    /// 超长中文名必须截到预算内且不切断多字节字符；短名不受影响。
+    #[test]
+    fn sanitize_name_caps_long_names_and_keeps_utf8_intact() {
+        let capped = sanitize_name(&"汉".repeat(200));
+        assert!(
+            capped.chars().count() <= MAX_EXPORT_NAME_CHARS,
+            "按字符上限截断"
+        );
+        assert!(
+            capped.len() <= MAX_EXPORT_NAME_BYTES,
+            "按 UTF-8 字节预算截断"
+        );
+        assert!(
+            capped.chars().all(|c| c == '汉'),
+            "截断后仍是合法汉字，不出现半个 UTF-8 字符"
+        );
+        assert!(
+            format!("Split Images_{capped} (999)").len() < 255,
+            "目录名（含前缀与冲突后缀）必须小于 NTFS 组件上限"
+        );
+
+        let ascii = sanitize_name(&"a".repeat(500));
+        assert_eq!(
+            ascii.len(),
+            MAX_EXPORT_NAME_CHARS,
+            "ASCII 超长名截到字符上限"
+        );
+
+        let mixed = sanitize_name(&format!("{}汉b", "a".repeat(79)));
+        assert_eq!(
+            mixed,
+            format!("{}汉", "a".repeat(79)),
+            "截断不得切断多字节字符"
+        );
+        assert_eq!(sanitize_name("Shot"), "Shot", "短名保持不变");
     }
 
     #[test]

@@ -26,6 +26,15 @@ fn coverage_buffer(width: usize, height: usize) -> Option<Vec<u8>> {
     BUDGET.alloc_zeroed(len).ok()
 }
 
+/// 文本栅格返回值的二次预算校验：即便 rasterize 以后漏掉检查，这里也会挡住
+/// 超大位图。失败时调用方只跳过该文字/标注，绝不 panic。
+fn text_layer_within_budget(w: u32, h: u32, px_len: usize) -> bool {
+    let Ok(len) = BUDGET.checked_bytes(w as u64, h as u64, 4) else {
+        return false;
+    };
+    px_len >= len
+}
+
 pub fn apply_annotations(
     pixels: &mut [u8],
     width: u32,
@@ -1057,6 +1066,10 @@ fn draw_badge(buf: &mut Bgra<'_>, el: &Element, number: u32, style: BadgeStyle, 
     };
     let font = badge_font_size(r);
     if let Ok((px, w, h)) = text_raster::rasterize(&number.to_string(), font, numeral) {
+        if !text_layer_within_budget(w, h, px.len()) {
+            crate::perf::log_app("badge numeral skipped: text raster over budget");
+            return;
+        }
         // Premultiplied BGRA: out = src + dst over (1 - srcA).
         let lw = w as i32;
         let lh = h as i32;
@@ -1125,6 +1138,11 @@ fn apply_watermark(buf: &mut Bgra<'_>, width: u32, height: u32, wm: &Watermark) 
     let Ok((px, w, h)) = text_raster::rasterize(&text, font_size, 0xFFFF_FFFF) else {
         return;
     };
+    // 预算拒绝时只跳过文字水印；水印永远不能让捕获失败。
+    if !text_layer_within_budget(w, h, px.len()) {
+        crate::perf::log_app("watermark text skipped: raster over budget");
+        return;
+    }
     if wm.tiled {
         tile_premult_layer(buf, width, height, &px, w, h, alpha);
     } else {
@@ -1299,6 +1317,12 @@ fn draw_text(buf: &mut Bgra<'_>, bounds: Rect, text: &str, font_size: f64, argb:
             return;
         }
     };
+    // 栅格尺寸已由 raster_size 检查过；这里再独立复核一次，超预算只跳过这条
+    // 标注，不影响同一张图上的其他元素。
+    if !text_layer_within_budget(w, h, px_data.len()) {
+        crate::perf::log_app("text annotation skipped: raster over budget");
+        return;
+    }
     let x0 = bounds.x.floor() as i32;
     let y0 = bounds.y.floor() as i32;
     let stride = (w * 4) as usize;
@@ -1393,6 +1417,22 @@ mod tests {
             line_style: Default::default(),
             shape: Shape::Rect,
         }
+    }
+
+    #[test]
+    fn text_layer_budget_rejects_an_oversized_or_short_raster() {
+        assert!(
+            !text_layer_within_budget(u32::MAX, u32::MAX, 0),
+            "an over-budget raster must be refused"
+        );
+        assert!(
+            !text_layer_within_budget(4, 4, 4 * 4 * 3),
+            "a buffer shorter than w*h*4 must be refused"
+        );
+        assert!(
+            text_layer_within_budget(4, 4, 4 * 4 * 4),
+            "a normal raster must pass"
+        );
     }
 
     /// A smudge stroke sweeping left-to-right across the middle of `bounds`.

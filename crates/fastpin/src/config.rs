@@ -360,13 +360,20 @@ impl Export {
     /// left verbatim so a typo is visible in the resulting file name instead of
     /// being silently dropped.
     pub fn expand_name(&self, date: &str, time: &str) -> String {
+        self.expand_name_for(date, time, None)
+    }
+
+    /// 同样展开模板，但按 `parent` 的剩余路径预算截断主干：深目录下不再
+    /// 固定留 200 字符，而是 `MAX_PATH - parent_len - ext_len - 余量`，
+    /// 从源头避免"深父目录 + 长文件名"超过 MAX_PATH。
+    pub fn expand_name_for(&self, date: &str, time: &str, parent: Option<&Path>) -> String {
         let datetime = format!("{date}_{time}");
         let expanded = self
             .effective_template()
             .replace("{date}", date)
             .replace("{time}", time)
             .replace("{datetime}", &datetime);
-        sanitize_stem(&expanded)
+        sanitize_stem_with_budget(&expanded, stem_budget(parent, self.format.extension()))
     }
 }
 
@@ -687,9 +694,74 @@ pub enum ExportMode {
     PerPage,
 }
 
-/// 文件名主干的长度上限。模板会被手工改得很长，截到 200 个字符可以给目录、
-/// 扩展名和 MAX_PATH 留出充足余量，正常模板完全不受影响。
+/// Windows 传统路径上限（UTF-16 码元）。超过这个长度的路径必须走 `\\?\`。
+const MAX_PATH_CHARS: usize = 260;
+/// 超过此长度的绝对路径才加 `\\?\` 前缀，给扩展名与序号后缀留出余量。
+const LONG_PATH_THRESHOLD: usize = 240;
+/// 文件名主干的硬上限，路径预算更紧时按预算进一步缩短。
 const MAX_FILENAME_STEM_CHARS: usize = 200;
+/// 父目录极深时仍保留的主干长度，避免算出空名字。
+const MIN_FILENAME_STEM_CHARS: usize = 24;
+/// 扩展名、分隔符、`_2` 序号后缀及 `\\?\` 前缀的预留长度。
+const PATH_RESERVE_CHARS: usize = 32;
+
+/// 路径长度按 UTF-16 码元计：`CreateFileW` 的 MAX_PATH 限制就是按码元算的，
+/// 一个 BMP 汉字与一个 ASCII 字符等价，代理对算两个。
+fn path_length(p: &Path) -> usize {
+    p.to_string_lossy().encode_utf16().count()
+}
+
+/// 词法规范化 Windows 绝对路径：消去 `.` / `..` 并把 `/` 统一成 `\`。
+/// `\\?\` 路径不解析这两个组件，所以加前缀前必须先规范化。不访问磁盘，
+/// 目标不存在也能处理。
+fn normalize_windows_path(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push("\\"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+/// Windows 长路径助手：绝对路径超过 [`LONG_PATH_THRESHOLD`] 时转成 `\\?\`
+/// 形式，绕开 MAX_PATH=260；UNC 路径映射为 `\\?\UNC\server\share\...`。
+/// 相对路径、短路径以及已有 `\\?\` / `\\.\` 前缀的路径原样返回，因此可在
+/// 文件操作处重复调用（幂等）。非 Windows 平台一律原样返回。
+pub(crate) fn extended_path(p: &Path) -> PathBuf {
+    if !cfg!(windows) || !p.is_absolute() || path_length(p) <= LONG_PATH_THRESHOLD {
+        return p.to_path_buf();
+    }
+    let normalized = normalize_windows_path(p);
+    let raw = normalized.to_string_lossy();
+    if raw.starts_with(r"\\?\") || raw.starts_with(r"\\.\") {
+        return normalized;
+    }
+    if let Some(unc) = raw.strip_prefix(r"\\") {
+        PathBuf::from(format!(r"\\?\UNC\{unc}"))
+    } else {
+        PathBuf::from(format!(r"\\?\{raw}"))
+    }
+}
+
+/// 按父目录已占用的长度计算文件名主干预算：`MAX_PATH - parent - ext - 余量`。
+/// 没有父目录上下文（例如单纯展开模板做展示）时沿用 200 字符硬上限。
+fn stem_budget(parent: Option<&Path>, extension: &str) -> usize {
+    let Some(parent) = parent else {
+        return MAX_FILENAME_STEM_CHARS;
+    };
+    let used = path_length(parent) + 1 + extension.encode_utf16().count() + PATH_RESERVE_CHARS;
+    MAX_PATH_CHARS
+        .saturating_sub(used)
+        .clamp(MIN_FILENAME_STEM_CHARS, MAX_FILENAME_STEM_CHARS)
+}
 
 /// Windows 保留设备名。即使后面带扩展名（如 `con.txt`）也不能作为文件名，
 /// `CreateFile` 会直接失败；大小写不敏感，这里统一按大写比较。
@@ -704,7 +776,13 @@ const WINDOWS_RESERVED_STEMS: [&str; 24] = [
 /// [`DEFAULT_FILENAME_TEMPLATE`] if nothing usable survives. Also caps the
 /// length and escapes reserved device names so a hand-edited template cannot
 /// produce an unsaveable path.
+#[cfg(test)]
 fn sanitize_stem(raw: &str) -> String {
+    sanitize_stem_with_budget(raw, MAX_FILENAME_STEM_CHARS)
+}
+
+/// 与 [`sanitize_stem`] 相同，但按 `budget` 截断，供深目录场景压缩文件名。
+fn sanitize_stem_with_budget(raw: &str, budget: usize) -> String {
     let cleaned: String = raw
         .chars()
         .map(|c| match c {
@@ -719,7 +797,7 @@ fn sanitize_stem(raw: &str) -> String {
     }
     // 按字符截断（不是字节），避免把一个多字节汉字切成两半；截断后可能
     // 又留下尾部点/空格，再修一次。
-    let mut stem: String = trimmed.chars().take(MAX_FILENAME_STEM_CHARS).collect();
+    let mut stem: String = trimmed.chars().take(budget).collect();
     let end = stem.trim_end_matches(['.', ' ']).len();
     stem.truncate(end);
     if stem.is_empty() {
@@ -791,13 +869,17 @@ impl History {
 
     /// Directory history lives in. A configured path wins; otherwise the
     /// per-user application data folder.
+    /// 历史模块的建目录/写索引/删除都在别的模块里，这里直接返回 `\\?\` 形式的
+    /// 长路径，调用方无需改动即可绕过 MAX_PATH（短路径原样返回）。
     pub fn store_dir(&self) -> Result<PathBuf> {
         if let Some(dir) = &self.dir {
-            return Ok(dir.clone());
+            return Ok(extended_path(dir));
         }
         let base =
             std::env::var("LOCALAPPDATA").map_err(|_| Error::new("LOCALAPPDATA is not set"))?;
-        Ok(PathBuf::from(base).join("FastPin").join("capture_history"))
+        Ok(extended_path(
+            &PathBuf::from(base).join("FastPin").join("capture_history"),
+        ))
     }
 
     /// Convert to the store's retention view, applying the same clamps as the
@@ -1256,6 +1338,8 @@ pub fn parse_hex_color(text: &str) -> Option<u32> {
 /// Where saved PNGs land. A configured directory wins; otherwise
 /// `Pictures\FastPin`, the folder the build has always used. Not created here
 /// — the caller writes into it and `create_dir_all` right before.
+/// 这里保留用户配置原值供设置页/文件夹对话框显示；真正落盘前调用方必须用
+/// [`extended_path`] 转换，否则深目录下的截图会卡在 MAX_PATH 上写不进去。
 pub fn screenshot_dir() -> Result<PathBuf> {
     if let Some(dir) = get().screenshot.save_dir {
         return Ok(dir);
@@ -2344,6 +2428,92 @@ mod tests {
         assert_eq!(
             normal.expand_name("20260101", "120000"),
             "FastPin_20260101_120000"
+        );
+    }
+
+    /// 长路径助手：只有长绝对路径才加 `\\?\`，短路径、相对路径与已有
+    /// 前缀的路径保持原样，UNC 映射到 `\\?\UNC\` 形式。
+    #[test]
+    #[cfg(windows)]
+    fn extended_path_prefixes_only_long_absolute_paths() {
+        let short = Path::new(r"C:\Users\me\FastPin\shot.png");
+        assert_eq!(
+            extended_path(short),
+            short.to_path_buf(),
+            "短绝对路径不应加 \\?\\ 前缀"
+        );
+
+        let long = Path::new(r"C:\").join("d".repeat(250)).join("shot.png");
+        let extended = extended_path(&long);
+        let text = extended.to_string_lossy();
+        assert!(text.starts_with(r"\\?\C:\"), "长绝对路径应加 \\?\\ 前缀");
+        assert!(!text.contains('/'), "\\?\\ 路径不得保留正斜杠");
+        assert_eq!(extended_path(&extended), extended, "重复调用应幂等");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn extended_path_leaves_relative_paths_untouched() {
+        let relative = Path::new(
+            "some/relative/path/with/a/very/very/very/long/name/that/definitely/exceeds/the/extended/path/threshold",
+        );
+        assert_eq!(
+            extended_path(relative),
+            relative.to_path_buf(),
+            "相对路径不能加前缀"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn extended_path_handles_unc_and_dot_components() {
+        let unc = Path::new(r"\\server\share")
+            .join("d".repeat(250))
+            .join("shot.png");
+        let text = extended_path(&unc).to_string_lossy().into_owned();
+        assert!(
+            text.starts_with(r"\\?\UNC\server\share\"),
+            "UNC 应转成 \\?\\UNC\\ 形式"
+        );
+
+        let dotted = Path::new(r"C:\a\..\b").join("d".repeat(250));
+        let normalized = extended_path(&dotted).to_string_lossy().into_owned();
+        assert!(!normalized.contains(".."), "\\?\\ 路径必须消去 .. 组件");
+        assert!(
+            normalized.starts_with(r"\\?\C:\b\"),
+            "规范化后应为 C:\\b\\..."
+        );
+    }
+
+    /// 深目录必须压缩文件名主干预算，普通目录沿用 200 字符硬上限。
+    #[test]
+    fn stem_budget_shrinks_for_deep_parent_directories() {
+        let shallow = Path::new(r"C:\Pictures\FastPin");
+        let deep = Path::new(r"C:\Pictures").join("d".repeat(250));
+        assert_eq!(
+            stem_budget(None, "png"),
+            MAX_FILENAME_STEM_CHARS,
+            "无父目录时沿用固定上限"
+        );
+        assert!(
+            stem_budget(Some(&deep), "png") < stem_budget(Some(shallow), "png"),
+            "深目录应留出更多路径预算"
+        );
+        assert_eq!(
+            stem_budget(Some(&deep), "png"),
+            MIN_FILENAME_STEM_CHARS,
+            "极深目录至少保留最小主干"
+        );
+
+        let export = Export {
+            filename_template: "a".repeat(200),
+            ..Default::default()
+        };
+        let stem = export.expand_name_for("20260101", "120000", Some(&deep));
+        assert_eq!(
+            stem.chars().count(),
+            MIN_FILENAME_STEM_CHARS,
+            "深目录下按剩余预算截断主干"
         );
     }
 

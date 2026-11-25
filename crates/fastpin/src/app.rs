@@ -1370,13 +1370,16 @@ fn export_pixels_shared_with_source(
 /// 不再用 `create_new` 在目标路径预留 0 字节文件：进程在写盘前退出时它会永久残留。
 /// 写盘线程只写带 `IMAGE_TMP_PREFIX` 的临时文件，写完再原子 rename 到目标。
 fn default_image_path(export: &crate::config::Export) -> Result<(PathBuf, PathBuf)> {
-    let dir = crate::config::screenshot_dir()?;
+    // 配置里保存的是用户可见的原始路径；落盘前转成 `\\?\` 长路径，
+    // 否则深 save_dir + 长文件名会在 create_dir_all / 写盘时撞上 MAX_PATH。
+    let dir = crate::config::extended_path(&crate::config::screenshot_dir()?);
     std::fs::create_dir_all(&dir)?;
     // Local time, not UTC: the name is for the user reading their own folder.
     let t = unsafe { GetLocalTime() };
     let date = format!("{:04}{:02}{:02}", t.wYear, t.wMonth, t.wDay);
     let time = format!("{:02}{:02}{:02}", t.wHour, t.wMinute, t.wSecond);
-    let stem = export.expand_name(&date, &time);
+    // 文件名主干按目录剩余预算截断，与长路径前缀一起双保险。
+    let stem = export.expand_name_for(&date, &time, Some(&dir));
     let extension = export.format.extension();
 
     // 从查重到预留目标名全程持锁：进程内两个同时完成的截屏不能拿到同一个名字。
@@ -1412,14 +1415,16 @@ fn write_image_atomically(
     target: &Path,
     write: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<PathBuf> {
-    if let Err(e) = write(temp) {
-        let _ = std::fs::remove_file(temp);
+    // 写盘/删除处再转一次：幂等，确保直接调用本函数时深路径也能落盘。
+    let temp = crate::config::extended_path(temp);
+    if let Err(e) = write(&temp) {
+        let _ = std::fs::remove_file(&temp);
         return Err(e);
     }
-    match publish_image(temp, target) {
+    match publish_image(&temp, target) {
         Ok(published) => Ok(published),
         Err(e) => {
-            let _ = std::fs::remove_file(temp);
+            let _ = std::fs::remove_file(&temp);
             Err(e)
         }
     }
@@ -1441,14 +1446,17 @@ fn publish_image(temp: &Path, target: &Path) -> Result<PathBuf> {
         .into_owned();
     let candidates = std::iter::once(target.to_path_buf())
         .chain((2..).map(|n| dir.join(format!("{stem}_{n}.{ext}"))));
+    let temp = crate::config::extended_path(temp);
     for candidate in candidates {
-        if candidate.exists() {
+        // 查重与 rename 都用长路径形式，但返回给用户的是原始候选路径。
+        let io_candidate = crate::config::extended_path(&candidate);
+        if io_candidate.exists() {
             continue;
         }
-        match std::fs::rename(temp, &candidate) {
+        match std::fs::rename(&temp, &io_candidate) {
             Ok(()) => return Ok(candidate),
             // rename 与 exists 之间被外部抢占：换下一个候选名重试。
-            Err(_) if candidate.exists() => continue,
+            Err(_) if io_candidate.exists() => continue,
             Err(e) => return Err(e.into()),
         }
     }
@@ -1463,7 +1471,10 @@ fn cleanup_stale_image_temps() {
     let Ok(dir) = crate::config::screenshot_dir() else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    // 启动清理同样要能穿透深目录；entry.path() 已继承前缀，remove_file 处
+    // 仍再转一次以保证幂等。
+    let dir = crate::config::extended_path(&dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1473,7 +1484,7 @@ fn cleanup_stale_image_temps() {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with(IMAGE_TMP_PREFIX));
         if is_temp && path.is_file() {
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(crate::config::extended_path(&path));
         }
     }
 }

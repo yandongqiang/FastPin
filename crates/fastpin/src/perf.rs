@@ -406,9 +406,10 @@ fn rotate_target(handle: &mut Option<BufWriter<std::fs::File>>, path: &Path) {
 }
 
 /// 轮转回滚失败时会残留 `*.log.rotating`（旧日志仍在其中，`path` 可能已消失）。
-/// 每次打开日志前先尝试恢复它：`path` 不存在就把临时名改回 `path`；`path` 已被
-/// 重建则把残留内容退化为 `*.log.1` 备份，不覆盖新日志。任一步失败都保留临时
-/// 文件等待下次重试，保证旧日志不会永久丢失。
+/// 每次打开日志前先尝试恢复它：双重失败遗留在 `*.log.1.recovering` 的旧备份先改
+/// 回 `*.log.1`；`path` 不存在就把临时名改回 `path`；`path` 已被重建则把残留内容
+/// 退化为 `*.log.1` 备份，不覆盖新日志。任一步失败都保留临时文件等待下次重试，
+/// 保证旧日志不会永久丢失。
 fn recover_rotating(path: &Path) -> bool {
     recover_rotating_impl(path, |from, to| std::fs::rename(from, to).is_ok())
 }
@@ -421,10 +422,19 @@ fn recover_rotating_with<F: Fn(&Path, &Path) -> bool>(path: &Path, rename: F) ->
 
 fn recover_rotating_impl<F: Fn(&Path, &Path) -> bool>(path: &Path, rename: F) -> bool {
     let temp = path.with_extension("log.rotating");
+    let rotated = path.with_extension("log.1");
+    let backup = path.with_extension("log.1.recovering");
+
+    // 上一轮双重失败可能把旧 .1 遗留在 .recovering 临时名里：若 .1 已不存在，
+    // 先把它改回 .1，避免这一代旧日志再无引用而永久滞留。必须在 .rotating 的
+    // 提前返回之前处理，否则残留已消失时这个孤儿备份永远不会被扫描到。
+    if !rotated.exists() && backup.exists() && !rename(&backup, &rotated) {
+        return false;
+    }
+
     if !temp.exists() {
         return true;
     }
-    let rotated = path.with_extension("log.1");
     if !path.exists() {
         // 当前日志缺失：直接把临时名改回 path，旧日志完整恢复。
         // 失败则保留临时文件，下次打开再试。
@@ -433,7 +443,6 @@ fn recover_rotating_impl<F: Fn(&Path, &Path) -> bool>(path: &Path, rename: F) ->
     // 当前日志已被重建：残留内容不能覆盖它，退化为一代备份保存。
     // 与 rotate_file 同一约定：绝不先删旧 .1。先把旧备份挪到临时名，残留确实
     // 落位成功后才删除它；落位失败则把旧备份改回 .1，残留保留等待下次重试。
-    let backup = path.with_extension("log.1.recovering");
     let had_backup = rotated.exists();
     if had_backup && !rename(&rotated, &backup) {
         return false;
@@ -929,6 +938,84 @@ mod tests {
             !dir.join("app.log.1.recovering").exists(),
             "临时备份名应已改回 .1，不应留下第二个残留"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rotating_consumes_orphaned_backup() {
+        // 双重失败后：旧 .1 已被挪到 .recovering，两步 rename 均失败，残留
+        // 文件保留；下次恢复时 .1 与 .rotating 都已不存在。若扫描不覆盖这个
+        // 孤儿备份，这一代旧日志将再无引用、永久滞留。
+        let dir = test_dir("recover-rotating-orphan");
+        let _ = create_dir_all(&dir);
+        let path = dir.join("app.log");
+        let backup = dir.join("app.log.1");
+        let recovering = dir.join("app.log.1.recovering");
+        let old_backup = "old generation left in recovering file";
+        std::fs::write(&recovering, old_backup).expect("准备遗留的 .recovering 备份");
+        assert!(!backup.exists(), "前置条件：.log.1 不存在");
+        assert!(
+            !dir.join("app.log.rotating").exists(),
+            "前置条件：没有 .rotating 残留"
+        );
+
+        assert!(recover_rotating(&path), "恢复应成功");
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("读回恢复的 .log.1"),
+            old_backup,
+            "旧备份内容应完整恢复到 .log.1"
+        );
+        assert!(!recovering.exists(), ".recovering 临时名应已被消费");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rotating_retries_double_failure_next_time() {
+        // 复现问题本身：path 已重建 + 旧 .1 + .rotating 残留，
+        // 「残留 -> .1」与回滚「.recovering -> .1」双双失败后返回 false；
+        // 下次恢复必须扫描到遗留的 .recovering，不能让它永久滞留。
+        let dir = test_dir("recover-rotating-retry");
+        let _ = create_dir_all(&dir);
+        let path = dir.join("app.log");
+        let rotated = dir.join("app.log.1");
+        let temp = dir.join("app.log.rotating");
+        let recovering = dir.join("app.log.1.recovering");
+        let old_backup = "previous generation backup";
+        let residue = "stranded residue";
+        std::fs::write(&path, "new current log").expect("准备重建后的当前日志");
+        std::fs::write(&rotated, old_backup).expect("准备旧备份");
+        std::fs::write(&temp, residue).expect("准备残留临时文件");
+
+        // 只让「残留 -> .1」和回滚「.recovering -> .1」失败，旧备份挪到临时名仍成功。
+        let fail_both = |from: &Path, to: &Path| {
+            if (from == temp.as_path() && to == rotated.as_path())
+                || (from == recovering.as_path() && to == rotated.as_path())
+            {
+                false
+            } else {
+                std::fs::rename(from, to).is_ok()
+            }
+        };
+        assert!(
+            !recover_rotating_with(&path, fail_both),
+            "双重失败时恢复应返回 false"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&recovering).expect("读回遗留备份"),
+            old_backup,
+            "旧备份应留在 .recovering 等待下次恢复"
+        );
+
+        assert!(recover_rotating(&path), "下次恢复应成功");
+        assert_eq!(
+            std::fs::read_to_string(&rotated).expect("读回 .log.1"),
+            residue,
+            "残留内容应最终落位为 .1"
+        );
+        assert!(!recovering.exists(), ".recovering 应被消费，不得永久滞留");
+        assert!(!temp.exists(), "临时文件应已被消费");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

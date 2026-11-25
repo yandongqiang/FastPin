@@ -13,7 +13,10 @@ path = "src/lib.rs"
 
 [features]
 perf-instrumentation = []
-default = ["full-image-io"]
+# Keep the default lean: FastPin depends on this crate with `default-features = false`,
+# and workspace feature unification would otherwise force the heavy codecs on for
+# everyone. Tests/examples opt in explicitly through the self dev-dependency below.
+default = []
 # Gates the developer-facing batch-stitch CLI so plain `cargo build` only
 # produces the library consumed by the FFI wrapper. Build the CLI with:
 # `cargo build --features cli --bin snow-stitch-images`
@@ -53,6 +56,9 @@ thiserror.workspace = true
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile.workspace = true
+# Dev-dependencies only affect this package's own tests/examples, so the full
+# codec set stays enabled for them without leaking into FastPin's dependency build.
+snow-stitch-images = { path = ".", features = ["full-image-io"] }
 
 [[bin]]
 name = "snow-stitch-images"

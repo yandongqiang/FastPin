@@ -85,6 +85,31 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 即使保留期很短，也要有至少 30 天的跳变保护窗口：7 天的 2 倍只有 14 天，
+/// 不足以覆盖常见的 RTC/NTP 校正幅度。
+const MIN_CLOCK_JUMP_GUARD_MS: u64 = 30 * 86_400_000;
+
+/// 按龄清理前的时钟可信度检查。`last` 是索引里持久化的「上次成功保留检查」
+/// 时间戳：时间倒流，或向前跳变超过 `2 * retention_days`（且不少于 30 天），
+/// 都说明挂钟不可信，调用方必须跳过按龄清理，只做数量/大小清理。关键是
+/// 异常期间不能推进 `last`：否则下一次调用会把跳变后的时间当成正常基准，
+/// 依旧会一次性删光全部历史。
+fn clock_looks_sane(now: u64, last: u64, retention_days: u64) -> bool {
+    // 老索引缺字段时由 serde 默认值/Default 填入读取时的 now_ms()；仍为 0
+    // 只可能是手工构造的脏数据，没有可比较的基准，不借此阻断按龄清理。
+    if last == 0 {
+        return true;
+    }
+    if now < last {
+        return false;
+    }
+    let max_delta = retention_days
+        .saturating_mul(2)
+        .saturating_mul(86_400_000)
+        .max(MIN_CLOCK_JUMP_GUARD_MS);
+    now - last <= max_delta
+}
+
 /// A unique, lexicographically sortable record id: `<millis>-<counter>`.
 fn next_id(now: u64) -> String {
     let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -178,6 +203,10 @@ pub struct Index {
     records: Vec<HistoryRecord>,
     #[serde(default)]
     pending_deletions: Vec<PendingDeletion>,
+    /// 上次成功执行按龄保留检查的时间戳。缺省值取读取时的时钟，老索引升级后
+    /// 不会因为字段缺失而被误判成跳变；只有时钟可信时才由 prune 推进。
+    #[serde(default = "now_ms")]
+    last_prune_ms: u64,
 }
 
 fn default_version() -> u32 {
@@ -190,6 +219,7 @@ impl Default for Index {
             format_version: INDEX_VERSION,
             records: Vec::new(),
             pending_deletions: Vec::new(),
+            last_prune_ms: now_ms(),
         }
     }
 }
@@ -603,6 +633,8 @@ impl HistoryStore {
     /// if it is older than `retention_days` (unless `keep_permanently`), or if
     /// the count/size budgets are exceeded. Protected records are never older
     /// than "now" in this simplified model, so there is no pin concept here.
+    /// Age pruning is skipped when the wall clock looks untrustworthy (the
+    /// index records the last sane check); count/size budgets still apply.
     /// Returns how many records were removed.
     pub fn prune(&self, retention: &Retention) -> Result<usize> {
         // 读索引到选出 victim 必须在同一把锁保护区；否则另一个截屏线程的 add
@@ -611,7 +643,7 @@ impl HistoryStore {
         // 持锁读 index 再写回，因此并发 add 的新记录同样不会丢。
         let victims = {
             let _guard = lock();
-            let index = self.read_index()?;
+            let mut index = self.read_index()?;
             let mut ordered: Vec<HistoryRecord> = index.records.clone();
             ordered.sort_by(|a, b| {
                 a.created_ms
@@ -620,6 +652,21 @@ impl HistoryStore {
             });
 
             let now = now_ms();
+            let by_age = clock_looks_sane(now, index.last_prune_ms, retention.retention_days);
+            if by_age {
+                // 只在时钟可信时推进基准：跳变期间若把它改成跳变后的时间，
+                // 下一次 prune 就会把异常时间当正常，照样会一次性删光历史。
+                if index.last_prune_ms != now {
+                    index.last_prune_ms = now;
+                    // 必须在锁内写回，否则并发 add 的读-改-写会覆盖这个基准。
+                    self.write_index(&index)?;
+                }
+            } else {
+                eprintln!(
+                    "history: 系统时间异常（now={now}, last_prune_ms={}），跳过按龄清理，仅执行数量/大小清理",
+                    index.last_prune_ms
+                );
+            }
             let cutoff = now.saturating_sub(retention.retention_days.saturating_mul(86_400_000));
             // 损坏/被篡改的索引可能把 bytes 写成接近 u64::MAX 的值；普通求和在
             // debug 下溢出 panic、release 下回绕成很小的值，导致错误的清理决策。
@@ -631,7 +678,8 @@ impl HistoryStore {
             let mut victims = Vec::new();
 
             for r in &ordered {
-                let expired = !retention.keep_permanently
+                let expired = by_age
+                    && !retention.keep_permanently
                     && retention.retention_days > 0
                     && r.created_ms < cutoff;
                 let over_count = count > retention.limit;
@@ -994,6 +1042,131 @@ mod tests {
             })
             .unwrap();
         assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn clock_looks_sane_rejects_backward_and_large_forward_jumps() {
+        let day: u64 = 86_400_000;
+        let now = 1_800_000_000_000; // 仅作相对比较的毫秒时间戳
+        assert!(clock_looks_sane(now, now, 7), "相同时间戳应视为正常");
+        assert!(clock_looks_sane(now, 0, 7), "没有基准时不阻断按龄清理");
+        assert!(
+            clock_looks_sane(now + 30 * day, now, 7),
+            "30 天内的差值应视为正常"
+        );
+        assert!(
+            !clock_looks_sane(now + 31 * day, now, 7),
+            "超过 30 天的跳变应视为异常"
+        );
+        assert!(!clock_looks_sane(now - 1, now, 7), "时间倒流应视为异常");
+        assert!(
+            clock_looks_sane(now + 100 * day, now, 365),
+            "长保留期按 2 倍天数放宽"
+        );
+        assert!(
+            !clock_looks_sane(now + 800 * day, now, 365),
+            "超过 2 倍保留期仍应判为异常"
+        );
+    }
+
+    /// RTC 电池耗尽 / NTP 大幅校正让系统时间前跳时，绝不能把所有旧记录
+    /// 按龄判为过期；异常期间基准也必须保持旧值，避免下一次 prune 误删。
+    #[test]
+    fn prune_skips_age_cleanup_after_a_forward_clock_jump() {
+        let store = HistoryStore::new(scratch());
+        let rec = sample(&store, 1, 1);
+        let stale = now_ms().saturating_sub(60 * 86_400_000);
+        let mut index = store.read_index().unwrap();
+        index.last_prune_ms = stale;
+        index.records[0].created_ms = 1; // 远早于任何合理的 cutoff
+        store.write_index(&index).unwrap();
+
+        let removed = store
+            .prune(&Retention {
+                limit: 100,
+                retention_days: 7,
+                max_disk_bytes: u64::MAX,
+                keep_permanently: false,
+            })
+            .unwrap();
+        assert_eq!(removed, 0, "时钟前跳时必须跳过按龄清理");
+        let list = store.list().unwrap();
+        assert_eq!(list.len(), 1, "跳变前写入的记录不能在一次 prune 中全部消失");
+        assert_eq!(list[0].id, rec.id, "跳变前写入的记录必须仍在");
+        assert_eq!(
+            store.read_index().unwrap().last_prune_ms,
+            stale,
+            "异常时不能把基准推进到跳变后的时间"
+        );
+    }
+
+    /// 跳过按龄清理不等于完全不清理：数量/大小预算仍照常生效。
+    #[test]
+    fn prune_still_enforces_budgets_during_a_clock_jump() {
+        let store = HistoryStore::new(scratch());
+        for i in 0..3 {
+            sample(&store, i, i);
+        }
+        let mut index = store.read_index().unwrap();
+        index.last_prune_ms = now_ms().saturating_sub(60 * 86_400_000);
+        index.records[0].created_ms = 1;
+        store.write_index(&index).unwrap();
+
+        let removed = store
+            .prune(&Retention {
+                limit: 1,
+                retention_days: 7,
+                max_disk_bytes: u64::MAX,
+                keep_permanently: false,
+            })
+            .unwrap();
+        assert_eq!(removed, 2, "跳变时数量清理仍应生效");
+        assert_eq!(store.list().unwrap().len(), 1, "跳变时只保留最新的记录");
+    }
+
+    /// 时间正常流逝时保留策略必须照常生效，不能因为加了防护而永久不清。
+    #[test]
+    fn prune_with_a_recent_baseline_still_deletes_expired_records() {
+        let store = HistoryStore::new(scratch());
+        sample(&store, 1, 1);
+        let mut index = store.read_index().unwrap();
+        index.last_prune_ms = now_ms().saturating_sub(86_400_000);
+        index.records[0].created_ms = 1;
+        store.write_index(&index).unwrap();
+
+        let removed = store
+            .prune(&Retention {
+                limit: 100,
+                retention_days: 7,
+                max_disk_bytes: u64::MAX,
+                keep_permanently: false,
+            })
+            .unwrap();
+        assert_eq!(removed, 1, "时间正常时按龄清理应照常生效");
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    /// 老索引没有 last_prune_ms 字段：serde 缺省值必须取读取时的时钟，
+    /// 否则 0 与 now 的巨大差值会被误判成跳变，按龄清理永久失效。
+    #[test]
+    fn legacy_index_without_prune_baseline_still_prunes_by_age() {
+        let root = scratch();
+        std::fs::write(
+            root.join(INDEX_FILE),
+            r#"{"format_version":1,"records":[{"id":"0000000000001-000000","created_ms":1,"width":1,"height":1,"bytes":4,"extension":"png","file":"image.png","source":"region"}],"pending_deletions":[]}"#,
+        )
+        .unwrap();
+        let store = HistoryStore::new(root);
+        assert!(store.read_index().unwrap().last_prune_ms > 0);
+        let removed = store
+            .prune(&Retention {
+                limit: 100,
+                retention_days: 7,
+                max_disk_bytes: u64::MAX,
+                keep_permanently: false,
+            })
+            .unwrap();
+        assert_eq!(removed, 1, "老索引缺字段时按龄清理仍应生效");
     }
 
     /// "永久" in the settings UI maps to keep_permanently = true. An old record

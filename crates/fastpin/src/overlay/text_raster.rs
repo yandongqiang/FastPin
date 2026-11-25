@@ -31,8 +31,50 @@ use crate::error::{Error, Result};
 /// user sees is what the PNG gets.
 pub const FONT_FAMILY: &str = "Microsoft YaHei UI";
 
+/// 文本位图的宽度上限，与 `image_budget::MAX_SIDE`（D3D11 纹理上限）一致。
+/// DirectWrite 的排版宽度只是换行提示，WIC 位图仍必须走同一套像素/字节预算。
+pub const MAX_TEXT_WIDTH: u32 = crate::image_budget::MAX_SIDE;
+
+/// 文本位图的高度上限。超长文本（粘贴/OCR 回填）到达这个高度即截断并记日志，
+/// 而不是逐行增高直到吃满进程内存。
+pub const MAX_TEXT_HEIGHT: u32 = 4096;
+
+/// 布局前参与的 UTF-16 单元上限（约 2 MiB 文本），防止 10 MB 单行文本先让
+/// DirectWrite 做一遍无界布局再被我们拒绝。
+const MAX_TEXT_UNITS: usize = 1 << 20;
+
 fn wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 纯函数：按 UTF-16 单元把超长文本截到 `max_units`，返回片段与是否截断。
+/// 逐 char 累加，保证不会切开代理对。
+fn truncate_text(text: &str, max_units: usize) -> (&str, bool) {
+    let mut end = 0usize;
+    let mut units = 0usize;
+    for (i, ch) in text.char_indices() {
+        let need = ch.len_utf16();
+        if units.saturating_add(need) > max_units {
+            break;
+        }
+        units += need;
+        end = i + ch.len_utf8();
+    }
+    (&text[..end], end != text.len())
+}
+
+/// 纯函数：把 DirectWrite 量出的浮点尺寸收敛为受预算约束的整数尺寸。
+/// 先按 `MAX_TEXT_WIDTH`/`MAX_TEXT_HEIGHT` 截断，再走与 capture/stitch/encode
+/// 相同的 `checked_bytes(w, h, 4)`；超限返回 Err，调用方跳过该文字而不分配。
+fn raster_size(
+    width: f32,
+    height: f32,
+    budget: crate::image_budget::ImageBudget,
+) -> std::result::Result<(u32, u32), crate::image_budget::BudgetError> {
+    let width = (width.ceil() as u32).clamp(1, MAX_TEXT_WIDTH);
+    let height = (height.ceil() as u32).clamp(1, MAX_TEXT_HEIGHT);
+    budget.checked_bytes(width as u64, height as u64, 4)?;
+    Ok((width, height))
 }
 
 /// Joins COM on the current thread for the lifetime of the value.
@@ -94,14 +136,36 @@ pub fn rasterize(text: &str, font_size: f64, argb: u32) -> Result<(Vec<u8>, u32,
             PCWSTR(locale.as_ptr()),
         )?;
 
+        // 先在布局前截断超长文本：否则 10 MB 粘贴内容会让 DirectWrite 先把
+        // 上百万行排完，度量值再大也来不及阻止无界位图。
+        let (text, truncated) = truncate_text(text, MAX_TEXT_UNITS);
+        if truncated {
+            crate::perf::log_app(&format!(
+                "text raster: input truncated to {MAX_TEXT_UNITS} UTF-16 units"
+            ));
+        }
         let text_nul = wide_null(text);
         let text_w = &text_nul[..text_nul.len() - 1];
-        let max_extent = (1u32 << 15) as f32;
+        // 换行宽度同样封顶到纹理上限；原先的 32768 px 会让单行宽过纹理，
+        // 多出来的部分在栅格化时只能被裁掉。
+        let max_extent = MAX_TEXT_WIDTH as f32;
         let layout = dwrite.CreateTextLayout(text_w, &format, max_extent, max_extent)?;
         let mut metrics = DWRITE_TEXT_METRICS::default();
         layout.GetMetrics(&mut metrics)?;
-        let width = (metrics.widthIncludingTrailingWhitespace.ceil() as u32).max(1);
-        let height = (metrics.height.ceil() as u32).max(1);
+        // 预算检查必须在 WIC CreateBitmap 之前：那个调用才真正按 w*h*4 分配。
+        let (width, height) = raster_size(
+            metrics.widthIncludingTrailingWhitespace,
+            metrics.height,
+            crate::image_budget::BUDGET,
+        )?;
+        if (metrics.widthIncludingTrailingWhitespace.ceil() as u32) > MAX_TEXT_WIDTH
+            || (metrics.height.ceil() as u32) > MAX_TEXT_HEIGHT
+        {
+            crate::perf::log_app(&format!(
+                "text raster: layout {:.0}x{:.0} px clamped to {MAX_TEXT_WIDTH}x{MAX_TEXT_HEIGHT} px",
+                metrics.widthIncludingTrailingWhitespace, metrics.height
+            ));
+        }
 
         let wic: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
@@ -147,9 +211,9 @@ pub fn rasterize(text: &str, font_size: f64, argb: u32) -> Result<(Vec<u8>, u32,
         );
         target.EndDraw(None, None)?;
 
-        // Width comes from DWrite (up to 32767 px) but the product is still
-        // unchecked in release builds: a wrapped stride/length would make
-        // CopyPixels write past the buffer. Route it through the shared cap.
+        // raster_size 已按共享预算校验过 width*height*4；这里再对实际步长/长度
+        // 做一次 checked_len，避免 CopyPixels 写出缓冲区（两级防护，任一级被
+        // 后续改动绕开时仍能安全失败）。
         let stride = width
             .checked_mul(4)
             .ok_or_else(|| Error::new("text raster too wide"))?;
@@ -162,5 +226,72 @@ pub fn rasterize(text: &str, font_size: f64, argb: u32) -> Result<(Vec<u8>, u32,
         buf.resize(len, 0u8);
         bitmap.CopyPixels(ptr::null(), stride, &mut buf)?;
         Ok((buf, width, height))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image_budget::{BudgetError, ImageBudget};
+
+    /// 小预算让超限分支可以在不分配大内存的情况下被测到。
+    fn small() -> ImageBudget {
+        ImageBudget::new(100, 100, 10_000, 40_000)
+    }
+
+    /// 正常尺寸用例需要略宽的预算，否则 124px 会先被 max_width 拒绝。
+    fn normal() -> ImageBudget {
+        ImageBudget::new(200, 100, 10_000, 100_000)
+    }
+
+    #[test]
+    fn raster_size_rounds_up_and_reports_a_normal_size() {
+        let (w, h) = raster_size(123.4, 45.6, normal()).unwrap();
+        assert_eq!(w, 124);
+        assert_eq!(h, 46);
+    }
+
+    #[test]
+    fn raster_size_refuses_dimensions_over_the_injected_budget() {
+        // 100x100x4 = 40000 B 刚好到顶；再多一行必须被拒绝。
+        let err = raster_size(100.0, 101.0, small()).unwrap_err();
+        assert!(
+            matches!(&err, BudgetError::TooHigh { height: 101, .. }),
+            "{err}"
+        );
+        let err = raster_size(101.0, 10.0, small()).unwrap_err();
+        assert!(
+            matches!(&err, BudgetError::TooWide { width: 101, .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn raster_size_clamps_huge_measurements_to_the_text_caps() {
+        let (w, h) = raster_size(1.0e30, 1.0e30, ImageBudget::STANDARD).unwrap();
+        assert_eq!(
+            w, MAX_TEXT_WIDTH,
+            "width must be capped before WIC allocates"
+        );
+        assert_eq!(
+            h, MAX_TEXT_HEIGHT,
+            "height must be capped before WIC allocates"
+        );
+    }
+
+    #[test]
+    fn truncate_text_stops_at_the_unit_cap_without_splitting_a_pair() {
+        let text = "a你b"; // 1 + 1 + 1 = 3 UTF-16 units
+        let (kept, truncated) = truncate_text(text, 2);
+        assert_eq!(kept, "a你");
+        assert!(truncated, "the tail must be reported as truncated");
+        let (kept, truncated) = truncate_text(text, 3);
+        assert_eq!(kept, text);
+        assert!(!truncated);
+
+        let long = "x".repeat(MAX_TEXT_UNITS + 16);
+        let (kept, truncated) = truncate_text(&long, MAX_TEXT_UNITS);
+        assert_eq!(kept.chars().count(), MAX_TEXT_UNITS);
+        assert!(truncated);
     }
 }

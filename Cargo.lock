@@ -6748,6 +6748,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snow-memory",
+ "snow-stitch-images",
  "tempfile",
  "thiserror 2.0.20",
 ]

@@ -107,6 +107,15 @@ fn filter_uia_for_point(rects: &[RECT], pt: POINT, pad: i32) -> Vec<RECT> {
         .collect()
 }
 
+/// 监视器矩形（物理像素），只保留几何字段，便于显示器变化钳制逻辑做纯函数单测。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MonitorRect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
 /// 一次异步 UIA 查询的状态。查询在专用 STA 线程上运行，这里只做非阻塞轮询。
 struct UiaPending {
     rx: std::sync::mpsc::Receiver<crate::uia::UiaReply>,
@@ -247,6 +256,10 @@ pub struct OverlayView {
     /// 60fps for the marching ants, and `active_monitor_rect` is called
     /// several times per frame.
     monitor_rects: Vec<Rect>,
+    /// 冻结图左上角当前所在的虚拟桌面原点（物理像素）。热插拔改变并集原点时
+    /// 用它把 origin_x/origin_y 平移到新坐标系，冻结图 / 监视器 / 长截图 abs
+    /// 坐标才不会各用一套坐标。
+    display_vd_origin: Option<(i32, i32)>,
     /// DPI / 显示器变化后的几何重同步任务是否已排队（避免观察点重复触发）。
     resync_pending: bool,
     /// 显示器观察点：随 view 一起释放时退订，避免 app 级观察点无人回收。
@@ -784,6 +797,11 @@ fn should_accept_result(captured_seq: u64, current_seq: u64) -> bool {
     captured_seq == current_seq
 }
 
+/// 识别序号前进。选区重画、GPU 重置恢复都用它让在途回执过期。
+fn next_result_seq(seq: u64) -> u64 {
+    seq.wrapping_add(1)
+}
+
 /// 长截图失败面板只呈现面向用户的中文：已知底层英文文案映射成原因 + 下一步
 /// 动作；已是中文的回执原样透传；未知英文保留原文但加中文前缀，既不暴露裸
 /// 英文，也不丢掉可用于反馈的诊断信息。
@@ -1145,6 +1163,7 @@ impl OverlayView {
             uia_timeouts: 0,
             uia_blocked_hwnd: None,
             monitor_rects: Vec::new(),
+            display_vd_origin: None,
             resync_pending: false,
             display_subscription: None,
             hit: SelectionHitKind::None,
@@ -1220,6 +1239,7 @@ impl OverlayView {
             uia_timeouts: 0,
             uia_blocked_hwnd: None,
             monitor_rects: Vec::new(),
+            display_vd_origin: None,
             resync_pending: false,
             display_subscription: None,
             hit: SelectionHitKind::None,
@@ -1449,15 +1469,19 @@ impl OverlayView {
         self.origin_x = ox;
         self.origin_y = oy;
         self.freeze_size = (w, h);
-        self.monitor_rects = crate::capture::enumerate_monitors()
-            .map(|mons| {
-                mons.iter()
-                    .map(|m| {
-                        Rect::new((m.x - ox) as f64, (m.y - oy) as f64, m.w as f64, m.h as f64)
-                    })
-                    .collect()
+        let mons = crate::capture::enumerate_monitors().unwrap_or_default();
+        let vd = crate::capture::virtual_desktop(&mons);
+        let monitors: Vec<MonitorRect> = mons
+            .iter()
+            .map(|m| MonitorRect {
+                x: m.x,
+                y: m.y,
+                w: m.w,
+                h: m.h,
             })
-            .unwrap_or_default();
+            .collect();
+        self.display_vd_origin = Some((vd.x, vd.y));
+        self.monitor_rects = monitor_rects_for_origin(&monitors, ox, oy);
         let hwnd = crate::platform::hwnd_of(window);
         self.windows = detect_windows(hwnd, ox, oy);
         // Read the cursor before probing candidates: the first frame used to
@@ -1540,29 +1564,65 @@ impl OverlayView {
 
     fn apply_display_resync(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.resync_pending = false;
-        let (ox, oy, w, h) = match &self.cap {
-            Some(c) => (c.origin_x, c.origin_y, c.width, c.height),
-            None => return,
+        let Some((w, h)) = self.cap.as_ref().map(|c| (c.width, c.height)) else {
+            return;
+        };
+        let hwnd = crate::platform::hwnd_of(window);
+        let mons = crate::capture::enumerate_monitors().unwrap_or_default();
+        let vd = crate::capture::virtual_desktop(&mons);
+        let monitors: Vec<MonitorRect> = mons
+            .iter()
+            .map(|m| MonitorRect {
+                x: m.x,
+                y: m.y,
+                w: m.w,
+                h: m.h,
+            })
+            .collect();
+        // 热插拔会整体平移 Windows 的虚拟桌面坐标：冻结图像素没变，但它所在的
+        // 屏幕已经换了一套坐标。同步平移 origin，冻结图 / 监视器 / 长截图 abs
+        // 才会在同一个坐标系里，绝不把旧 cap 原点与新监视器坐标混用。
+        let mut placement_changed = false;
+        match self.display_vd_origin {
+            Some((prev_x, prev_y)) if prev_x != vd.x || prev_y != vd.y => {
+                self.origin_x = shift_origin_for_desktop(self.origin_x, prev_x, vd.x);
+                self.origin_y = shift_origin_for_desktop(self.origin_y, prev_y, vd.y);
+                self.display_vd_origin = Some((vd.x, vd.y));
+                placement_changed = true;
+            }
+            None => self.display_vd_origin = Some((vd.x, vd.y)),
+            _ => {}
+        }
+        let desired = RECT {
+            left: self.origin_x,
+            top: self.origin_y,
+            right: self.origin_x.saturating_add(w as i32),
+            bottom: self.origin_y.saturating_add(h as i32),
         };
         // 只刷新与物理像素绑定的几何缓存；选区 / 拖动 / UIA 状态不动，避免
         // 用户正在框选时被重置。
-        self.monitor_rects = crate::capture::enumerate_monitors()
-            .map(|mons| {
-                mons.iter()
-                    .map(|m| {
-                        Rect::new((m.x - ox) as f64, (m.y - oy) as f64, m.w as f64, m.h as f64)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let hwnd = crate::platform::hwnd_of(window);
-        let desired = RECT {
-            left: ox,
-            top: oy,
-            right: ox + w as i32,
-            bottom: oy + h as i32,
-        };
-        let outer = window_rect_for_client_area(hwnd, desired);
+        let clamped = clamp_desired_to_workarea(desired, &monitors);
+        if clamped.left != desired.left || clamped.top != desired.top {
+            // 冻结屏已不在当前并集内：整窗搬到可见处，同时把局部→屏幕的原点
+            // 跟着改，框选和工具条才会指向屏幕上真正显示的位置。
+            self.origin_x = clamped.left;
+            self.origin_y = clamped.top;
+            placement_changed = true;
+        }
+        self.monitor_rects = monitor_rects_for_origin(&monitors, self.origin_x, self.origin_y);
+        if placement_changed && self.long.take().is_some() {
+            // 坐标已平移 / 冻结屏已拔掉：继续滚动会把滚轮投到错误的窗口。
+            set_long_passthrough(hwnd, None);
+            self.phase = Phase::Active;
+            self.invalidate_pending_result();
+            self.show_panel(
+                "显示器已变化",
+                "长截图已停止，请重新开始".to_string(),
+                false,
+                cx,
+            );
+        }
+        let outer = window_rect_for_client_area(hwnd, clamped);
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
@@ -1686,6 +1746,8 @@ impl OverlayView {
         if self.long.take().is_some() {
             set_long_passthrough(crate::platform::hwnd_of(window), None);
             self.phase = Phase::Active;
+            // 在途 OCR / 翻译回执不能覆盖恢复提示，也不能被用户复制走旧文字。
+            self.invalidate_pending_result();
             self.show_panel(
                 "显示设备已重置",
                 "长截图已停止，请重新开始".to_string(),
@@ -1735,6 +1797,8 @@ impl OverlayView {
                 // Re-publish into the tree gpui just recreated; gpui keeps the
                 // freeze visual below the UI visual.
                 self.attach_and_show(window, cx);
+                // 重建期间到达的旧截图识别结果一律过期，恢复面板才能留在屏幕上。
+                self.invalidate_pending_result();
                 self.show_panel("显示设备已重置", "截图窗口已恢复".to_string(), false, cx);
                 if crate::gpu_lifecycle::acknowledge_recovery().is_ok() {
                     crate::perf::log_app("gpu reset: overlay freeze visual rebuilt");
@@ -2553,7 +2617,7 @@ impl OverlayView {
     /// 后台 OCR / 翻译回执带着旧序号返回时会被丢弃；清掉面板（包括 busy 的
     /// 「识别中…」）则保证新选区能立刻重新发起识别，也避免旧结果被复制。
     fn invalidate_pending_result(&mut self) {
-        self.result_seq = self.result_seq.wrapping_add(1);
+        self.result_seq = next_result_seq(self.result_seq);
         self.panel = None;
     }
 
@@ -3485,6 +3549,8 @@ impl OverlayView {
         // 已经调用 set_long_passthrough(Some(rect))。用序号把旧任务挡掉。
         let seq = self.long_seq;
         self.phase = Phase::Active;
+        // 与 recover_gpu_after_reset 的两条路径一致：旧识别结果不得覆盖提示。
+        self.invalidate_pending_result();
         self.show_panel(
             "显示设备已重置",
             "长截图已停止，请重新开始".to_string(),
@@ -5489,9 +5555,210 @@ fn apply_nc_borders(window: RECT, client_origin: POINT, client: RECT, desired: R
     }
 }
 
+/// 冻结图矩形在当前监视器并集内的可见性钳制。窗口尺寸保持不变（缩放冻结图会
+/// 破坏像素对齐）：只要还有正面积交集就原样返回，避免正在框选时画面跳位；
+/// 完全离屏则把左上角搬到并集左上角，保证至少一部分可见可点击。纯函数，
+/// 便于单测显示器移除 / 部分相交 / 完全不相交三种场景。
+fn clamp_desired_to_workarea(desired: RECT, monitors: &[MonitorRect]) -> RECT {
+    if desired.right <= desired.left || desired.bottom <= desired.top {
+        return desired;
+    }
+    let Some(first) = monitors.first() else {
+        return desired;
+    };
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x.saturating_add(first.w);
+    let mut max_y = first.y.saturating_add(first.h);
+    for m in &monitors[1..] {
+        min_x = min_x.min(m.x);
+        min_y = min_y.min(m.y);
+        max_x = max_x.max(m.x.saturating_add(m.w));
+        max_y = max_y.max(m.y.saturating_add(m.h));
+    }
+    if max_x <= min_x || max_y <= min_y {
+        return desired;
+    }
+    // 半开区间求交；有正面积交集就不动窗口。
+    if desired.left < max_x
+        && desired.right > min_x
+        && desired.top < max_y
+        && desired.bottom > min_y
+    {
+        return desired;
+    }
+    RECT {
+        left: min_x,
+        top: min_y,
+        right: min_x.saturating_add(desired.right - desired.left),
+        bottom: min_y.saturating_add(desired.bottom - desired.top),
+    }
+}
+
+/// 按冻结图左上角把物理像素监视器矩形换算到截图局部坐标。开场截图与热插拔
+/// 重同步都走这里，保证冻结图 / 监视器 / 长截图 abs 坐标永远同一坐标系。
+fn monitor_rects_for_origin(monitors: &[MonitorRect], ox: i32, oy: i32) -> Vec<Rect> {
+    monitors
+        .iter()
+        .map(|m| Rect::new((m.x - ox) as f64, (m.y - oy) as f64, m.w as f64, m.h as f64))
+        .collect()
+}
+
+/// 虚拟桌面原点变化后冻结图左上角的新屏幕坐标。冻结图像素没动，变的是
+/// Windows 给同一块物理屏幕分配的坐标，所以整体平移原点差值即可。
+fn shift_origin_for_desktop(origin: i32, vd_at_capture: i32, vd_now: i32) -> i32 {
+    origin + (vd_now - vd_at_capture)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 显示器移除后冻结图矩形不能留在已不存在的屏幕上：整窗搬到并集左上角，
+    /// 且尺寸不变（缩放冻结图会破坏像素对齐）。
+    #[test]
+    fn clamp_desired_to_workarea_moves_a_removed_monitor_into_the_union() {
+        let desired = RECT {
+            left: 1920,
+            top: 0,
+            right: 3840,
+            bottom: 1080,
+        };
+        let monitors = [MonitorRect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        }];
+        let out = clamp_desired_to_workarea(desired, &monitors);
+        assert_eq!(
+            (out.left, out.top),
+            (0, 0),
+            "拔掉的副屏矩形要回到主屏左上角"
+        );
+        assert_eq!(
+            (out.right - out.left, out.bottom - out.top),
+            (1920, 1080),
+            "不能缩放冻结图"
+        );
+    }
+
+    /// 部分相交时保持原位：交集已保证窗口可见可点击，框选途中不能让画面跳位。
+    #[test]
+    fn clamp_desired_to_workarea_keeps_a_partially_visible_window() {
+        let desired = RECT {
+            left: 1000,
+            top: 0,
+            right: 2920,
+            bottom: 1080,
+        };
+        let monitors = [MonitorRect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        }];
+        let out = clamp_desired_to_workarea(desired, &monitors);
+        assert_eq!(out.left, 1000, "部分相交时保留原位置");
+        assert_eq!(out.top, 0, "部分相交时保留原位置");
+    }
+
+    /// 完全不相交（多屏并集）时也要搬进并集，绝不让 overlay 离屏不可点击。
+    #[test]
+    fn clamp_desired_to_workarea_disjoint_from_multi_monitor_union() {
+        let desired = RECT {
+            left: 5000,
+            top: 5000,
+            right: 6920,
+            bottom: 6080,
+        };
+        let monitors = [
+            MonitorRect {
+                x: 0,
+                y: 200,
+                w: 1920,
+                h: 1080,
+            },
+            MonitorRect {
+                x: 1920,
+                y: 0,
+                w: 1080,
+                h: 1920,
+            },
+        ];
+        let out = clamp_desired_to_workarea(desired, &monitors);
+        assert_eq!((out.left, out.top), (0, 0), "整窗搬到并集左上角");
+        assert_eq!(
+            (out.right - out.left, out.bottom - out.top),
+            (1920, 1080),
+            "尺寸保持不变"
+        );
+    }
+
+    /// 空监视器列表（枚举失败）不改变窗口，沿用原来的坐标而不是凭空造位置。
+    #[test]
+    fn clamp_desired_to_workarea_without_monitors_is_a_no_op() {
+        let desired = RECT {
+            left: 10,
+            top: 20,
+            right: 30,
+            bottom: 40,
+        };
+        let out = clamp_desired_to_workarea(desired, &[]);
+        assert_eq!(
+            (out.left, out.top, out.right, out.bottom),
+            (10, 20, 30, 40),
+            "枚举失败时保持原矩形"
+        );
+    }
+
+    /// 虚拟桌面原点变化后，冻结图局部坐标与监视器矩形必须整体平移到新坐标系；
+    /// 否则长截图的 abs_x/abs_y 会投到错误屏幕点。
+    #[test]
+    fn display_origin_shift_keeps_monitor_rects_in_freeze_space() {
+        let monitors = [
+            MonitorRect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            MonitorRect {
+                x: 1920,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+        ];
+        let before = monitor_rects_for_origin(&monitors, 0, 0);
+        assert_eq!(
+            (before[0].x, before[1].x),
+            (0.0, 1920.0),
+            "截屏时并集原点为 (0,0)，监视器矩形直接相对冻结图"
+        );
+        // 左侧新增一块屏：并集原点变成 (-1920,0)，同一物理内容的新屏幕坐标左移。
+        let ox = shift_origin_for_desktop(0, 0, -1920);
+        assert_eq!(ox, -1920, "冻结图左上角随虚拟桌面原点平移");
+        let after = monitor_rects_for_origin(&monitors, ox, 0);
+        assert_eq!(
+            (after[0].x, after[1].x),
+            (1920.0, 3840.0),
+            "监视器矩形必须用平移后的原点，仍相对冻结图"
+        );
+    }
+
+    /// GPU 重置恢复的面板路径会先推进识别序号：在途回执不能覆盖「已恢复」提示，
+    /// 也不能被用户当成当前截图文字复制走。
+    #[test]
+    fn gpu_reset_recovery_invalidates_pending_recognition() {
+        let pending_seq = 41;
+        let after_recovery = next_result_seq(pending_seq);
+        assert!(
+            !should_accept_result(pending_seq, after_recovery),
+            "恢复面板显示后旧 OCR 回执必须过期"
+        );
+        assert!(should_accept_result(after_recovery, after_recovery));
+    }
 
     /// The dash phase must stay in [0, period) for every elapsed value, including
     /// large ones: `offset` is negative and grows without bound, so a single `%`

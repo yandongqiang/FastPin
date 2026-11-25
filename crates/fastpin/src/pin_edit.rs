@@ -164,7 +164,7 @@ pub(crate) fn start(cx: &mut App, group: u64, tiles: &[TileSnapshot]) {
             .iter()
             .map(|t| TileImage {
                 rect: t.rect.precise(),
-                pixels: t.pixels.as_slice(),
+                pixels: &t.pixels[..],
                 width: t.size.0,
                 height: t.size.1,
                 zoom: 1.0,
@@ -315,7 +315,7 @@ fn flatten(elements: &[Element], tiles: &[TileSnapshot]) -> Vec<(u64, Vec<u8>, u
         .iter()
         .map(|t| TileImage {
             rect: t.precise_rect,
-            pixels: t.pixels.as_slice(),
+            pixels: &t.pixels[..],
             width: t.size.0,
             height: t.size.1,
             zoom: t.zoom,
@@ -683,7 +683,7 @@ mod tests {
     use super::*;
     use crate::geom::Rect as GRect;
     use crate::overlay::editor::Shape;
-    use std::sync::Arc;
+    use crate::pin::tile_pixels_for_test;
 
     fn tile(id: u64, x: i32, w: u32, h: u32, zoom: f32) -> TileSnapshot {
         let screen_w = (w as f32 * zoom).round() as i32;
@@ -697,7 +697,7 @@ mod tests {
                 w as f64 * zoom as f64,
                 h as f64 * zoom as f64,
             ),
-            pixels: Arc::new(vec![255u8; (w * h * 4) as usize]),
+            pixels: tile_pixels_for_test(vec![255u8; (w * h * 4) as usize], w, h),
             size: (w, h),
             zoom,
         }

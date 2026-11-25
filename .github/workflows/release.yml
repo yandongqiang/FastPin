@@ -58,8 +58,19 @@ jobs:
         run: |
           $ver = "${{ github.ref_name }}".TrimStart('v')
           & $env:ISCC /DAppVersion=$ver installer\fastpin.iss
+      # The in-app updater refuses to execute an installer whose SHA-256 does
+      # not match this manifest. Publish it from the same build so the hash
+      # always describes the exact asset uploaded below.
+      - name: Publish installer checksum
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          $asset = "FastPin-v$ver-x64-setup.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$asset").Hash.ToLowerInvariant()
+          "$hash  $asset" | Out-File -Encoding ascii "dist/SHA256SUMS.txt"
+          Get-Content "dist/SHA256SUMS.txt"
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/FastPin-${{ github.ref_name }}-x64.zip
             dist/FastPin-${{ github.ref_name }}-x64-setup.exe
+            dist/SHA256SUMS.txt

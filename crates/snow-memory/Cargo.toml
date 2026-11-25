@@ -3,6 +3,7 @@ name = "snow-memory"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+rust-version.workspace = true
 description = "Explicit OS-page ownership for large CPU raster buffers"
 # Internal vendored crate — never publish it to crates.io.
 publish = false

@@ -1802,6 +1802,7 @@ dependencies = [
 name = "fastpin"
 version = "0.3.0"
 dependencies = [
+ "arc-swap",
  "chrono",
  "gpui-component",
  "gpui-kit",
@@ -1811,6 +1812,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "snow-stitch-images",
  "windows 0.61.3",
  "windows-core 0.61.2",

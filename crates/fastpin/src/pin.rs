@@ -290,14 +290,35 @@ struct ResizeDrag {
     members: Vec<(WindowHandle<PinView>, Rect, f32)>,
 }
 
+/// Read-only view of a pin's raw pixel bytes, backed by the very same
+/// `RenderImage` the window paints. A separate `Arc<Vec<u8>>` used to sit next
+/// to the render image for a pin's whole life, doubling its footprint (~33 MiB
+/// for a 4K pin, >500 MiB for a 16k stitched pin).
+#[derive(Clone)]
+pub(crate) struct TilePixels(Arc<RenderImage>);
+
+impl TilePixels {
+    fn from_image(image: &Arc<RenderImage>) -> Self {
+        Self(image.clone())
+    }
+}
+
+impl std::ops::Deref for TilePixels {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.0.as_bytes(0).unwrap_or(&[])
+    }
+}
+
 /// What compositing and annotating need to know about one tile.
 pub(crate) struct TileSnapshot {
     pub id: u64,
     /// Client rect, screen physical px.
     pub rect: IRect,
     pub precise_rect: Rect,
-    /// Tight BGRA at native size.
-    pub pixels: Arc<Vec<u8>>,
+    /// Tight BGRA at native size, shared with the rendered image (no copy).
+    pub pixels: TilePixels,
     pub size: (u32, u32),
     pub zoom: f32,
 }
@@ -315,15 +336,13 @@ pub fn show_pin(
     screen_y: i32,
 ) -> crate::error::Result<()> {
     let buf = repack_opaque(&pixels, w, h, stride);
-    let pixels = Arc::new(buf);
-    let Some(image) = render_image(&pixels, w, h) else {
+    let Some(image) = render_image(buf, w, h) else {
         crate::perf::log_app("pin: pixel buffer size mismatch");
         return Err(crate::error::Error::new("像素缓冲区尺寸不匹配"));
     };
-    // A pin keeps one BGRA copy plus the render-image copy for its whole life.
-    // Reserve both against the process-wide ceiling so many pins cannot add up
-    // to an OOM even though each one passes the single-buffer check.
-    let held = (pixels.len() as u64).saturating_mul(2);
+    // The render image owns the one persistent pixel buffer; compositing and
+    // annotation borrow it through `TilePixels` instead of cloning it.
+    let held = image.as_bytes(0).map_or(0, |bytes| bytes.len() as u64);
     let permit = match crate::image_budget::try_reserve(held) {
         Ok(permit) => permit,
         Err(e) => {
@@ -356,7 +375,7 @@ pub fn show_pin(
             window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         },
-        |_window, cx| cx.new(|cx| PinView::new(cx, id, image, pixels, permit, w, h)),
+        |_window, cx| cx.new(|cx| PinView::new(cx, id, image, permit, w, h)),
     ) {
         Ok(handle) => handle,
         Err(e) => {
@@ -395,9 +414,14 @@ pub fn show_pin(
     Ok(())
 }
 
-fn render_image(pixels: &Arc<Vec<u8>>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
-    let rgba = image::RgbaImage::from_raw(w, h, pixels.as_ref().clone())?;
+fn render_image(pixels: Vec<u8>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
+    let rgba = image::RgbaImage::from_raw(w, h, pixels)?;
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+}
+
+#[cfg(test)]
+pub(crate) fn tile_pixels_for_test(bytes: Vec<u8>, w: u32, h: u32) -> TilePixels {
+    TilePixels(render_image(bytes, w, h).expect("test tile buffer must match its size"))
 }
 
 fn bind_pin_keys(cx: &mut App) {
@@ -740,7 +764,7 @@ pub(crate) fn snapshots(cx: &mut App, group: u64, mine: Option<TileSnapshot>) ->
             id: e.id,
             rect,
             precise_rect: view.precise_rect(rect),
-            pixels: view.pixels.clone(),
+            pixels: TilePixels::from_image(&view.image),
             size: view.pixel_size,
             zoom: view.zoom,
         });
@@ -787,9 +811,7 @@ struct Pending {
 pub struct PinView {
     id: u64,
     image: Arc<RenderImage>,
-    /// Tight BGRA at native size, kept for compositing a group.
-    pixels: Arc<Vec<u8>>,
-    /// Process-wide ledger reservation for the two buffers held by this pin.
+    /// Process-wide ledger reservation for this pin's pixel buffer.
     /// `replace_pixels` resizes it in place, so the old and new buffers are
     /// never counted twice; `None` only for a pin built without a reservation.
     permit: Option<crate::image_budget::MemoryPermit>,
@@ -818,7 +840,6 @@ impl PinView {
         cx: &mut Context<Self>,
         id: u64,
         image: Arc<RenderImage>,
-        pixels: Arc<Vec<u8>>,
         permit: crate::image_budget::MemoryPermit,
         w: u32,
         h: u32,
@@ -826,7 +847,6 @@ impl PinView {
         Self {
             id,
             image,
-            pixels,
             permit: Some(permit),
             pixel_size: (w.max(1), h.max(1)),
             zoom: 1.0,
@@ -876,14 +896,13 @@ impl PinView {
 
     /// Swaps in new native pixels (after 完成 flattens the marks).
     pub(crate) fn replace_pixels(&mut self, pixels: Vec<u8>, w: u32, h: u32, zoom: f32) {
-        let pixels = Arc::new(pixels);
-        let Some(image) = render_image(&pixels, w, h) else {
+        let Some(image) = render_image(pixels, w, h) else {
             return;
         };
-        let held = (pixels.len() as u64).saturating_mul(2);
+        let held = image.as_bytes(0).map_or(0, |bytes| bytes.len() as u64);
         // 就地把旧许可调整为新字节数：单一 CAS 不会要求 old + new 同时
         // 装进全局上限，也没有预留到归还之间的双倍计费窗口。失败时旧
-        // permit、self.pixels/self.image 全都不变，编辑安全地放弃。
+        // permit、self.image 全都不变，编辑安全地放弃。
         if let Some(permit) = self.permit.as_mut() {
             if let Err(e) = permit.resize(held) {
                 crate::perf::log_app(&format!("pin edit refused: {e}"));
@@ -899,7 +918,6 @@ impl PinView {
             };
             self.permit = Some(permit);
         }
-        self.pixels = pixels;
         self.image = image;
         self.pixel_size = (w.max(1), h.max(1));
         self.zoom = zoom;
@@ -915,7 +933,7 @@ impl PinView {
             id: self.id,
             rect,
             precise_rect: self.precise_rect(rect),
-            pixels: self.pixels.clone(),
+            pixels: TilePixels::from_image(&self.image),
             size: self.pixel_size,
             zoom: self.zoom,
         })
@@ -1606,7 +1624,7 @@ impl PinView {
                 .iter()
                 .map(|t| TileImage {
                     rect: t.precise_rect,
-                    pixels: t.pixels.as_slice(),
+                    pixels: &t.pixels[..],
                     width: t.size.0,
                     height: t.size.1,
                     zoom: t.zoom,
@@ -1680,7 +1698,7 @@ impl PinView {
                 .iter()
                 .map(|t| TileImage {
                     rect: t.precise_rect,
-                    pixels: t.pixels.as_slice(),
+                    pixels: &t.pixels[..],
                     width: t.size.0,
                     height: t.size.1,
                     zoom: t.zoom,

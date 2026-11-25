@@ -413,8 +413,15 @@ impl Gpu {
     ) -> Result<(Vec<u8>, u32, u32, u32)> {
         self.ensure_current()?;
         let desc = texture_desc(src);
-        let w = w.min(desc.Width.saturating_sub(x)).max(1);
-        let h = h.min(desc.Height.saturating_sub(y)).max(1);
+        // 越界请求必须报错：静默裁剪会产出尺寸不符的图，调用方（尤其是长截图
+        // 与显示器热插拔后的裁剪）无从知道画面缺了一块。image_budget 的其它
+        // 路径同样要求拒绝而非 clamp，这里保持一致。
+        if !readback_region_fits(x, y, w, h, desc.Width, desc.Height) {
+            return Err(Error::new(format!(
+                "readback region ({x}, {y}, {w}, {h}) is outside texture {}x{}",
+                desc.Width, desc.Height
+            )));
+        }
         let staging = match create_texture(
             &self.device,
             w,
@@ -533,6 +540,16 @@ impl Gpu {
         }
         self.read_raw_region(ctx, src, x, y, w, h)
     }
+}
+
+/// 只读回弹必须完整落在纹理内；任何越界、零尺寸或加法溢出都拒绝，绝不
+/// 静默裁剪成更小的图。
+fn readback_region_fits(x: u32, y: u32, w: u32, h: u32, tex_w: u32, tex_h: u32) -> bool {
+    if w == 0 || h == 0 || x >= tex_w || y >= tex_h {
+        return false;
+    }
+    x.checked_add(w).is_some_and(|right| right <= tex_w)
+        && y.checked_add(h).is_some_and(|bottom| bottom <= tex_h)
 }
 
 pub fn texture_desc(tex: &ID3D11Texture2D) -> D3D11_TEXTURE2D_DESC {
@@ -763,5 +780,16 @@ mod golden {
                 expected[i]
             );
         }
+    }
+
+    #[test]
+    fn readback_regions_are_rejected_instead_of_clamped() {
+        assert!(readback_region_fits(0, 0, 64, 64, 1920, 1080));
+        assert!(readback_region_fits(1919, 1079, 1, 1, 1920, 1080));
+        assert!(!readback_region_fits(1900, 0, 64, 64, 1920, 1080));
+        assert!(!readback_region_fits(0, 1070, 64, 64, 1920, 1080));
+        assert!(!readback_region_fits(0, 0, 0, 64, 1920, 1080));
+        assert!(!readback_region_fits(1920, 0, 1, 1, 1920, 1080));
+        assert!(!readback_region_fits(u32::MAX, 0, 2, 1, 1920, 1080));
     }
 }

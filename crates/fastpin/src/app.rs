@@ -1464,10 +1464,17 @@ fn publish_image(temp: &Path, target: &Path) -> Result<PathBuf> {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let candidates = std::iter::once(target.to_path_buf())
-        .chain((2..).map(|n| dir.join(format!("{stem}_{n}.{ext}"))));
+    // 候选名无限递增在数学上不会耗尽，但文件系统异常（权限、命名冲突、长
+    // 路径边界）可能让每一次 rename 都失败。release 下 panic=abort 会让
+    // unreachable! 直接杀死托盘进程，所以这里必须返回可上报的错误。
+    const MAX_CANDIDATES: u32 = 999;
     let temp = crate::config::extended_path(temp);
-    for candidate in candidates {
+    for n in 0..MAX_CANDIDATES {
+        let candidate = if n == 0 {
+            target.to_path_buf()
+        } else {
+            dir.join(format!("{stem}_{}.{ext}", n + 1))
+        };
         // 查重与 rename 都用长路径形式，但返回给用户的是原始候选路径。
         let io_candidate = crate::config::extended_path(&candidate);
         if io_candidate.exists() {
@@ -1480,7 +1487,7 @@ fn publish_image(temp: &Path, target: &Path) -> Result<PathBuf> {
             Err(e) => return Err(e.into()),
         }
     }
-    unreachable!("候选路径序列无限，总会返回一个")
+    Err(Error::new("无法为截图分配文件名，请检查保存目录后重试"))
 }
 
 /// 启动时清理上次退出遗留的截图临时文件。调用方须在单实例 acquire 成功之后

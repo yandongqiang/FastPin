@@ -197,7 +197,9 @@ cargo fmt --all -- --check    # CI 同款格式检查
 cargo clippy --workspace --all-targets --locked -- -D warnings   # CI 同款检查
 ```
 
-OCR 模型已入库（`models/v6/`），发布包会把它们放在 exe 旁边的 `models\v6\`。`FASTPIN_MODELS` 是可选的：从源码直接运行时，不设置也能回退到仓库内的模型目录。仅当需要指向其它模型目录时才设置：
+OCR 模型已入库（`models/v6/`，约 31 MiB），发布包会把它们放在 exe 旁边的 `models\v6\`。这是有意选择：克隆后无需 LFS、无需联网即可从源码运行，且发布包天然离线可用；代价是 clone 较重、模型升级会产生较大的二进制 diff。只关心源码的贡献者可用 `git clone --depth 1` 减少下载量。若将来要切到 Git LFS，需要重写历史并强制推送，属于独立的仓库迁移，不在普通代码改动范围内。
+
+`FASTPIN_MODELS` 是可选的：从源码直接运行时，不设置也能回退到仓库内的模型目录。仅当需要指向其它模型目录时才设置：
 
 ```text
 set FASTPIN_MODELS=<你的仓库路径>\models\v6

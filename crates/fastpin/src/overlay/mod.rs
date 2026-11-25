@@ -1062,7 +1062,7 @@ fn show_overlay_inner(
     if let Some(handle) = OVERLAY_WINDOW.with(|slot| *slot.borrow()) {
         if let Ok(entity) = handle.entity(cx) {
             let _ = handle.update(cx, |view, window, cx| {
-                view.reset_from_capture(cap, perf, swap, copy_only, smart_selection, window);
+                view.reset_from_capture(cap, perf, swap, copy_only, smart_selection, window, cx);
                 view.attach_and_show(window, cx);
             });
             return Ok(entity);
@@ -1282,6 +1282,7 @@ impl OverlayView {
         view
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reset_from_capture(
         &mut self,
         cap: CapturedDesktop,
@@ -1290,12 +1291,14 @@ impl OverlayView {
         copy_only: bool,
         smart_selection: crate::config::SmartSelectionMode,
         window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         let screenshot = crate::config::get().screenshot;
         self.selection = Rect::new(0.0, 0.0, 0.0, 0.0);
         self.hover = None;
         self.mouse = Point { x: 0.0, y: 0.0 };
         self.freeze_size = (cap.width, cap.height);
+        let missing_regions = cap.missing_regions.clone();
         self.cap = Some(cap);
         self.perf = Rc::new(RefCell::new(Some(perf)));
         self.freeze_swap = Some(swap);
@@ -1342,6 +1345,30 @@ impl OverlayView {
         self.invalidate_pending_result();
         set_long_passthrough(crate::platform::hwnd_of(window), None);
         self.sync_from_cap(window);
+        // 多显示器时某一路 WGC/DXGI 都失败会留下空白区域。采集层已写日志，
+        // 这里必须让用户看见：静默缺一块比明确报错更糟。
+        if !missing_regions.is_empty() {
+            let detail = missing_regions
+                .iter()
+                .map(|m| {
+                    format!(
+                        "显示器 {}（{}, {}，{}×{}）",
+                        m.monitor + 1,
+                        m.x,
+                        m.y,
+                        m.w,
+                        m.h
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("；");
+            self.show_panel(
+                "截图不完整",
+                format!("{detail} 未能采集，截图对应区域为空白。请检查显示器连接后重试。"),
+                false,
+                cx,
+            );
+        }
     }
 
     /// 记一次 UIA 失败；连续 UIA_TIMEOUT_TRIP 次后熔断该窗口，之后不再投递。
@@ -1819,6 +1846,7 @@ impl OverlayView {
 
         match rebuilt {
             Ok((cap, swap)) => {
+                let missing_count = cap.missing_regions.len();
                 self.freeze_size = (cap.width, cap.height);
                 self.cap = Some(cap);
                 self.freeze_swap = Some(swap);
@@ -1832,7 +1860,12 @@ impl OverlayView {
                 self.attach_and_show(window, cx);
                 // 重建期间到达的旧截图识别结果一律过期，恢复面板才能留在屏幕上。
                 self.invalidate_pending_result();
-                self.show_panel("显示设备已重置", "截图窗口已恢复".to_string(), false, cx);
+                let recovery_text = if missing_count == 0 {
+                    "截图窗口已恢复".to_string()
+                } else {
+                    format!("截图窗口已恢复，但 {missing_count} 块显示器未能采集，对应区域为空白")
+                };
+                self.show_panel("显示设备已重置", recovery_text, false, cx);
                 if crate::gpu_lifecycle::acknowledge_recovery().is_ok() {
                     crate::perf::log_app("gpu reset: overlay freeze visual rebuilt");
                 }
@@ -3731,8 +3764,6 @@ impl OverlayView {
         self.show_panel(COPIED_TITLE, body, false, cx);
     }
 
-    /// Pixelated tiles plus the ids of the elements that produced them; an element
-    /// missing from that list still needs a placeholder drawn for it.
     /// Pixelated tiles plus the ids of the elements that produced them; an element
     /// missing from that list still needs a placeholder drawn for it.
     fn mosaic_tiles(&self, marks: &[Element], cx: &mut App) -> Rc<MosaicTiles> {

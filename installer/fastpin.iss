@@ -21,9 +21,12 @@ AppPublisher=yandongqiang
 AppPublisherURL=https://github.com/yandongqiang/FastPin
 AppSupportURL=https://github.com/yandongqiang/FastPin/issues
 AppUpdatesURL=https://github.com/yandongqiang/FastPin/releases/latest
-; Per-user install: no UAC prompt, matches how a tray screenshot tool is used.
+; Default to a per-user install (no UAC prompt). The updater asks which scope
+; the user wants and passes /CURRENTUSER or /ALLUSERS; a manually launched
+; setup shows Inno Setup's own scope dialog instead. Both paths are supported.
 PrivilegesRequired=lowest
-DefaultDirName={localappdata}\Programs\FastPin
+PrivilegesRequiredOverridesAllowed=dialog
+DefaultDirName={autopf}\FastPin
 DefaultGroupName=FastPin
 OutputDir=..\dist
 OutputBaseFilename=FastPin-v{#AppVersion}-x64-setup

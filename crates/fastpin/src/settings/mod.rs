@@ -2611,16 +2611,22 @@ impl SettingsView {
         }
     }
 
-    /// 以管理员权限拉起下载好的安装包；UAC 被拒时 launch_installer 会返回
-    /// 明确的错误，而不是静默无反应。启动成功后必须退出应用，否则安装器
-    /// 可能无法替换正在运行的 exe。
-    fn install_downloaded(&mut self, cx: &mut Context<Self>) {
+    /// 按用户选择的范围拉起下载好的安装包。每用户模式不弹 UAC；全机器模式
+    /// 由 ShellExecuteW 的 runas 触发 UAC，被拒时 launch_installer 会返回明确
+    /// 错误，而不是静默无反应。启动成功后必须退出应用，否则安装器可能无法
+    /// 替换正在运行的 exe。
+    fn install_downloaded(&mut self, scope: crate::update::InstallScope, cx: &mut Context<Self>) {
         let Some(path) = self.downloaded_installer.clone() else {
             return;
         };
-        match crate::update::launch_installer(&path) {
+        match crate::update::launch_installer(&path, scope) {
             Ok(()) => {
-                self.ok("安装程序启动后应用将退出，请在 UAC 提示中确认");
+                self.ok(match scope {
+                    crate::update::InstallScope::CurrentUser => "安装程序已启动，应用将退出",
+                    crate::update::InstallScope::AllUsers => {
+                        "安装程序已启动，应用将退出；请在 UAC 提示中确认"
+                    }
+                });
                 cx.notify();
                 cx.quit();
                 return;
@@ -5149,15 +5155,34 @@ impl SettingsView {
             )
             .child(widgets::control(download_button)),
         ];
-        // 安装包落盘后才出现安装入口；点击以管理员权限运行，失败有明确反馈。
+        // 安装包落盘后才出现安装入口。范围由用户选：默认每用户安装不弹
+        // UAC，需要全机器安装时才提权；两条路径都与安装器的权限声明一致。
         if self.downloaded_installer.is_some() {
+            let install_user = widgets::button("update-install-user", "仅当前用户").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.install_downloaded(crate::update::InstallScope::CurrentUser, cx)
+                }),
+            );
+            let install_all = widgets::button("update-install-all", "所有用户（需管理员）")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.install_downloaded(crate::update::InstallScope::AllUsers, cx)
+                    }),
+                );
             rows.push(
-                widgets::row("安装更新", "以管理员权限运行下载好的安装包。").child(
-                    widgets::control(widgets::button("update-install", "安装更新").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.install_downloaded(cx)),
-                    )),
-                ),
+                widgets::row(
+                    "安装更新",
+                    "选择安装范围；仅当前用户无需管理员权限，所有用户会弹出 UAC。",
+                )
+                .child(widgets::control(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(install_user)
+                        .child(install_all),
+                )),
             );
         }
         widgets::rows(rows)

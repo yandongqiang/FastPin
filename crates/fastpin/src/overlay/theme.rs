@@ -364,12 +364,6 @@ pub fn accent_hover() -> Hsla {
     current().accent_hover
 }
 
-// Reserved for pressed-state fills; the color test below pins the value.
-#[allow(dead_code)]
-pub fn accent_pressed() -> Hsla {
-    current().accent_pressed
-}
-
 /// Text or icon painted on top of [`accent`].
 pub fn on_accent() -> Hsla {
     current().on_accent

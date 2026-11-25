@@ -4,11 +4,13 @@
 //! The release source is the compile-time `GITHUB_REPO` constant below.
 
 use std::ffi::c_void;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::ERROR_CANCELLED;
 use windows::Win32::Networking::WinHttp::{
@@ -31,6 +33,12 @@ const GITHUB_REPO: &str = "yandongqiang/FastPin";
 
 /// Generous bound for one tiny JSON document on a flaky connection.
 const TIMEOUT_SECONDS: u32 = 15;
+
+/// Release-side checksum manifest. `release.yml` publishes it next to the
+/// installer; the downloader refuses to hand an unverified exe to the user.
+const CHECKSUMS_FILE_NAME: &str = "SHA256SUMS.txt";
+/// The manifest is a few lines of ASCII, not a download-sized blob.
+const MAX_CHECKSUM_BYTES: u64 = 8 * 1024;
 
 pub struct Release {
     pub version: String,
@@ -303,9 +311,11 @@ fn asset_file_name(version: &str) -> String {
     format!("FastPin-v{}-x64-setup.exe", normalize_version(version))
 }
 
-fn asset_download_url(version: &str) -> String {
+/// Every download -- installer and checksum manifest alike -- starts from the
+/// same trusted `github.com` release path; redirects are validated separately.
+fn release_asset_url(version: &str, file_name: &str) -> String {
     let v = normalize_version(version);
-    format!("https://github.com/{GITHUB_REPO}/releases/download/v{v}/FastPin-v{v}-x64-setup.exe")
+    format!("https://github.com/{GITHUB_REPO}/releases/download/v{v}/{file_name}")
 }
 
 /// 下载完成后的安装包名：`seq == 1` 用发布资产原名，撞名则追加 `-2`、`-3`…。
@@ -337,36 +347,162 @@ fn finalize_download(part: &Path, dir: &Path, version: &str) -> Result<PathBuf> 
     Err(Error::new("安装包命名冲突过多，无法保存"))
 }
 
-/// 用 ShellExecuteW 拉起下载好的安装包。`runas` 请求管理员权限；若失败且不是
-/// 用户明确拒绝 UAC，再退回 `open` 试一次（例如策略不允许 runas 的环境）。
-pub fn launch_installer(path: &Path) -> Result<()> {
+/// Resolve the GitHub asset URL through the same host-checked redirect chain as
+/// the installer download. Status is left to the caller so each asset can give
+/// its own actionable error (a missing checksum file is not a missing exe).
+fn open_release_asset(version: &str, file_name: &str) -> Result<(DownloadSession, ResponseHead)> {
+    let mut current = release_asset_url(version, file_name);
+    let (mut session, mut head) = unsafe { begin_download(&current)? };
+    let mut hops = 0usize;
+    while is_redirect(head.status) {
+        let location = head
+            .location
+            .take()
+            .ok_or_else(|| Error::new("更新包重定向缺少地址"))?;
+        current = resolve_redirect(&current, &location)
+            .ok_or_else(|| Error::new("更新包重定向地址不可信"))?;
+        hops += 1;
+        if hops > MAX_DOWNLOAD_REDIRECTS {
+            return Err(Error::new("更新包重定向次数过多"));
+        }
+        let (next_session, next_head) = unsafe { begin_download(&current)? };
+        session = next_session;
+        head = next_head;
+    }
+    Ok((session, head))
+}
+
+/// Parse one `<sha256>  <filename>` entry from a SHA256SUMS file. Both GNU
+/// separators (`  ` for binary, ` *` for text) are accepted; comments, blank
+/// lines and unrelated assets are ignored. A conflicting duplicate is fatal —
+/// an ambiguous checksum file must never turn into a successful verification.
+fn parse_sha256sums(contents: &str, expected_file: &str) -> Result<[u8; 32]> {
+    let mut found: Option<[u8; 32]> = None;
+    for line in contents.lines() {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((hex, name)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let name = name.trim_start_matches([' ', '\t', '*']);
+        if name != expected_file || hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let mut bytes = [0u8; 32];
+        for (slot, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let pair = std::str::from_utf8(pair).map_err(|_| Error::new("校验文件包含无效字符"))?;
+            bytes[slot] = u8::from_str_radix(pair, 16)
+                .map_err(|_| Error::new("校验文件包含无效 SHA-256 值"))?;
+        }
+        match found {
+            Some(previous) if previous != bytes => {
+                return Err(Error::new("SHA256SUMS.txt 中安装包校验值冲突"));
+            }
+            _ => found = Some(bytes),
+        }
+    }
+    found.ok_or_else(|| Error::new(format!("SHA256SUMS.txt 缺少 {expected_file} 的校验值")))
+}
+
+/// Download and parse the release-side checksum manifest. A 404 is a hard
+/// failure: an unsigned, unverified exe must never reach ShellExecuteW just
+/// because an older release forgot to publish its hashes.
+fn fetch_expected_hash(version: &str) -> Result<[u8; 32]> {
+    let (session, head) = open_release_asset(version, CHECKSUMS_FILE_NAME)?;
+    if head.status == 404 {
+        return Err(Error::new(
+            "发布页缺少 SHA256SUMS.txt，出于安全考虑拒绝安装；请到发布页手动下载",
+        ));
+    }
+    if !(200..300).contains(&head.status) {
+        return Err(Error::new(format!(
+            "下载校验文件失败（HTTP {}）",
+            head.status
+        )));
+    }
+    if !content_length_within_limit(head.total, MAX_CHECKSUM_BYTES) {
+        return Err(Error::new("校验文件过大，已拒绝"));
+    }
+    let body = crate::net::read_response(session.request.0, MAX_CHECKSUM_BYTES as usize)?;
+    let text = String::from_utf8(body).map_err(|_| Error::new("校验文件不是有效的 UTF-8"))?;
+    parse_sha256sums(&text, &asset_file_name(version))
+}
+
+/// Streaming SHA-256: the installer can be hundreds of MiB, so never read it
+/// into memory just to hash it.
+fn hash_file(path: &Path) -> Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Called on the `.part` before it is renamed into its final installer name,
+/// so an unverified file is never presented as a downloadable installer.
+fn verify_installer(part: &Path, version: &str) -> Result<()> {
+    let expected = fetch_expected_hash(version)?;
+    let actual = hash_file(part)?;
+    if actual != expected {
+        return Err(Error::new(
+            "安装包 SHA-256 校验失败：下载内容与发布文件不一致，已删除该文件",
+        ));
+    }
+    Ok(())
+}
+
+/// 安装范围由用户选择，而不是由启动器擅自提权。安装器用
+/// `PrivilegesRequiredOverridesAllowed` 接受 `/CURRENTUSER` 与 `/ALLUSERS`，
+/// 命令行参数会抑制安装器自己的范围询问对话框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallScope {
+    /// 每用户安装：不弹 UAC，与安装器的 `PrivilegesRequired=lowest` 一致。
+    CurrentUser,
+    /// 全机器安装：必须用 `runas` 提权，UAC 拒绝时明确报错。
+    AllUsers,
+}
+
+/// 用 ShellExecuteW 拉起下载好的安装包。verb 与安装范围一一对应，不再有
+/// "runas 失败偷偷退回 open" 造成的权限模型错乱。
+pub fn launch_installer(path: &Path, scope: InstallScope) -> Result<()> {
     if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("exe") {
         return Err(Error::new("安装程序不存在或已失效，请重新下载"));
     }
-    for verb in ["runas", "open"] {
-        let wide_verb = nul_terminated(verb);
-        let target = nul_terminated(&path.to_string_lossy());
-        let result = unsafe {
-            ShellExecuteW(
-                None,
-                PCWSTR(wide_verb.as_ptr()),
-                PCWSTR(target.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            )
-        };
-        // ShellExecuteW 把失败码伪装成 HINSTANCE；UAC 被拒时返回 1223（>32），
-        // 不能只看 <= 32，否则用户点了“否”也会被当成启动成功、毫无反馈。
-        let code = result.0 as usize;
-        if code == ERROR_CANCELLED.0 as usize {
-            return Err(Error::new("已取消安装：请在用户账户控制提示中选择“是”"));
-        }
-        if code > 32 {
-            return Ok(());
-        }
+    let (verb, params) = match scope {
+        InstallScope::CurrentUser => ("open", "/CURRENTUSER"),
+        InstallScope::AllUsers => ("runas", "/ALLUSERS"),
+    };
+    let wide_verb = nul_terminated(verb);
+    let target = nul_terminated(&path.to_string_lossy());
+    let wide_params = nul_terminated(params);
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(wide_verb.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR(wide_params.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW 把失败码伪装成 HINSTANCE；UAC 被拒时返回 1223（>32），
+    // 不能只看 <= 32，否则用户点了“否”也会被当成启动成功、毫无反馈。
+    let code = result.0 as usize;
+    if code == ERROR_CANCELLED.0 as usize {
+        return Err(Error::new("已取消安装：请在用户账户控制提示中选择“是”"));
     }
-    Err(Error::new("无法启动安装程序，请手动到下载目录运行"))
+    if code <= 32 {
+        return Err(Error::new("无法启动安装程序，请手动到下载目录运行"));
+    }
+    Ok(())
 }
 
 fn is_redirect(status: u32) -> bool {
@@ -660,9 +796,11 @@ pub fn cleanup_downloads() {
 }
 
 /// Download the installer for `version` and return the path to the final
-/// installer file (streamed into a `.part` first, then renamed atomically).
-/// No shell execution, extraction or installation happens here; the caller
-/// decides what to do with the returned path.
+/// installer file (streamed into a `.part`, SHA-256 verified against the
+/// release's SHA256SUMS.txt, then renamed atomically). A failed verification
+/// deletes the partial file and returns an error: no unverified exe is ever
+/// handed back for execution. No shell execution, extraction or installation
+/// happens here; the caller decides what to do with the returned path.
 ///
 /// Blocking. Call it off the UI thread. `on_progress` is called once before
 /// the first read (with `received == 0` and the parsed `Content-Length`) and
@@ -681,25 +819,7 @@ pub fn download_release_asset(
     let dir = download_dir();
     cleanup_download_files(&dir, DOWNLOAD_MAX_AGE);
 
-    let mut current = asset_download_url(version);
-    let (mut session, mut head) = unsafe { begin_download(&current)? };
-
-    let mut hops = 0usize;
-    while is_redirect(head.status) {
-        let location = head
-            .location
-            .take()
-            .ok_or_else(|| Error::new("更新包重定向缺少地址"))?;
-        current = resolve_redirect(&current, &location)
-            .ok_or_else(|| Error::new("更新包重定向地址不可信"))?;
-        hops += 1;
-        if hops > MAX_DOWNLOAD_REDIRECTS {
-            return Err(Error::new("更新包重定向次数过多"));
-        }
-        let (next_session, next_head) = unsafe { begin_download(&current)? };
-        session = next_session;
-        head = next_head;
-    }
+    let (session, head) = open_release_asset(version, &asset_file_name(version))?;
 
     if head.status == 404 {
         return Err(Error::new(format!(
@@ -725,11 +845,15 @@ pub fn download_release_asset(
     fs::create_dir_all(&dir)?;
     let path = unique_temp_path(&dir, version);
 
-    match stream_body_to_file(session.request.0, &path, total, &mut on_progress) {
-        // 写完后立刻改名：`.part` 会被 24 小时清理任务删除，而且没有安装器
-        // 会用它。改名在同目录内完成，是原子操作，撞名时换序号而非覆盖。
+    match stream_body_to_file(session.request.0, &path, total, &mut on_progress)
+        .and_then(|()| verify_installer(&path, version))
+    {
+        // 哈希校验通过后立刻改名：`.part` 会被 24 小时清理任务删除，而且没有
+        // 安装器会用它。改名在同目录内完成，是原子操作，撞名时换序号而非覆盖。
         Ok(()) => finalize_download(&path, &dir, version),
         Err(e) => {
+            // 截断、超限或哈希不符的文件一律不留：下次启动的清理任务不该是
+            // 唯一拦住未验证安装包的防线。
             let _ = fs::remove_file(&path);
             Err(e)
         }
@@ -825,13 +949,15 @@ mod tests {
 
     #[test]
     fn asset_url_points_at_setup_installer() {
+        let url = |version: &str| release_asset_url(version, &asset_file_name(version));
         assert_eq!(
-            asset_download_url("0.3.0"),
+            url("0.3.0"),
             "https://github.com/yandongqiang/FastPin/releases/download/v0.3.0/FastPin-v0.3.0-x64-setup.exe"
         );
         // A tag that already carries `v` produces exactly the same URL.
-        assert_eq!(asset_download_url("v0.3.0"), asset_download_url("0.3.0"));
-        assert!(asset_download_url("0.3.0").ends_with(asset_file_name("0.3.0").as_str()));
+        assert_eq!(url("v0.3.0"), url("0.3.0"));
+        assert!(url("0.3.0").ends_with(asset_file_name("0.3.0").as_str()));
+        assert!(release_asset_url("0.3.0", CHECKSUMS_FILE_NAME).ends_with(CHECKSUMS_FILE_NAME));
     }
 
     #[test]
@@ -876,8 +1002,51 @@ mod tests {
 
     #[test]
     fn launcher_refuses_missing_or_non_executable_paths() {
-        assert!(launch_installer(Path::new("C:/definitely/missing/FastPin.exe")).is_err());
-        assert!(launch_installer(Path::new("C:/definitely/missing/FastPin.part")).is_err());
+        for scope in [InstallScope::CurrentUser, InstallScope::AllUsers] {
+            assert!(
+                launch_installer(Path::new("C:/definitely/missing/FastPin.exe"), scope).is_err()
+            );
+            assert!(
+                launch_installer(Path::new("C:/definitely/missing/FastPin.part"), scope).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn checksum_manifest_matches_only_the_named_asset() {
+        let name = asset_file_name("0.3.0");
+        let sum = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let manifest = format!(
+            "# release checksums\n0000000000000000000000000000000000000000000000000000000000000000  unrelated.exe\n{sum}  {name}\n"
+        );
+        assert_eq!(parse_sha256sums(&manifest, &name).unwrap()[0], 0xba);
+        // GNU text mode uses ` *` instead of two spaces.
+        let text_mode = format!("{sum} *{name}\r\n");
+        assert_eq!(parse_sha256sums(&text_mode, &name).unwrap()[31], 0xad);
+        assert!(parse_sha256sums(&manifest, "other.exe").is_err());
+        assert!(parse_sha256sums("not a manifest\n", &name).is_err());
+        let other = format!("{:064}", 1);
+        let conflict = format!("{sum}  {name}\n{other}  {name}\n");
+        assert!(parse_sha256sums(&conflict, &name).is_err());
+    }
+
+    #[test]
+    fn streaming_hash_matches_a_known_digest() {
+        // 用工作目录而不是系统 temp：某些受限环境下 temp_dir 不可写。
+        let path = std::env::current_dir().unwrap().join(format!(
+            "fastpin-hash-test-{}-{}.tmp",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, b"abc").unwrap();
+        let got = hash_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let expected = parse_sha256sums(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  a.txt\n",
+            "a.txt",
+        )
+        .unwrap();
+        assert_eq!(got, expected);
     }
 
     #[test]
@@ -926,7 +1095,7 @@ mod tests {
 
     #[test]
     fn redirects_are_limited_to_https_github_hosts() {
-        let base = asset_download_url("0.3.0");
+        let base = release_asset_url("0.3.0", &asset_file_name("0.3.0"));
         assert_eq!(
             resolve_redirect(&base, "https://objects.githubusercontent.com/x?y=1"),
             Some("https://objects.githubusercontent.com/x?y=1".to_string())

@@ -98,9 +98,6 @@ pub const CUSTOMIZABLE: &[&str] = &[
     LINE_CLOUD,
 ];
 
-#[allow(dead_code)]
-pub const DEFAULT_HIDDEN: &[&str] = &[ELLIPSE, TEXT, REDO];
-
 pub const PHASE1_ITEMS: &[&str] = &[
     SELECT,
     SHAPE,
@@ -746,6 +743,10 @@ pub fn place_second_row(
 mod tests {
     use super::*;
 
+    /// The old C# hidden set is only a test fixture; shipping defaults hide
+    /// nothing, so no production code needs this constant.
+    const DEFAULT_HIDDEN: &[&str] = &[ELLIPSE, TEXT, REDO];
+
     fn hidden(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|s| (*s).to_string()).collect()
     }
@@ -764,8 +765,7 @@ mod tests {
         assert!(!is_visible(COPY, &[]));
     }
 
-    /// An empty list is the shipped default: nothing hidden. `DEFAULT_HIDDEN`
-    /// is the C# set, kept for when the settings page offers a reset.
+    /// An empty list is the shipped default: nothing hidden.
     #[test]
     fn an_empty_list_hides_nothing() {
         for id in PHASE1_ITEMS {

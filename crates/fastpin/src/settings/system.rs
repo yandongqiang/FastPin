@@ -298,7 +298,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
+        // 受限环境里系统 temp 根目录可能不可写；工作目录始终可写且同样唯一。
+        let path = std::env::current_dir().expect("scratch base").join(format!(
             "fastpin-dir-size-{tag}-{}-{stamp}",
             std::process::id()
         ));

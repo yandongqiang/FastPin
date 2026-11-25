@@ -89,9 +89,9 @@ pub(crate) fn migrate_dir(old: &Path, new: &Path) -> Result<Vec<String>, String>
         ));
         return Ok(notes);
     }
-    // Windows 的 rename 即 MoveFileExW(REPLACE_EXISTING)，它无法覆盖一个
-    // 已存在的目录。安装器或上次崩溃留下的空目录必须先移除，否则 rename 与
-    // 回退复制都会失败，旧配置/历史会被遗弃。
+    // Windows 的 rename 即 MoveFileExW(REPLACE_EXISTING)：可以覆盖已存在的
+    // 文件，但不能覆盖已存在的目录。安装器或上次崩溃留下的空目录必须先移除，
+    // 否则 rename 与回退复制都会失败，旧配置/历史会被遗弃。
     if new.is_dir() {
         if let Err(e) = fs::remove_dir(new) {
             return Err(format!(

@@ -1,0 +1,6 @@
+[toolchain]
+# Keep local builds on the same compiler as ci.yml and release.yml. A
+# contributor on a newer stable would otherwise see failures only in CI.
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

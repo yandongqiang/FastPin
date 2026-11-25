@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
+use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
@@ -25,7 +27,10 @@ pub const EMERGENCY_QUIT_ID: i32 = 9;
 static TARGET: AtomicIsize = AtomicIsize::new(0);
 static HOOK: AtomicIsize = AtomicIsize::new(0);
 static RECORD_HOOK: AtomicIsize = AtomicIsize::new(0);
-static BINDINGS: std::sync::Mutex<Option<HotkeyBindings>> = std::sync::Mutex::new(None);
+/// Published as an immutable snapshot. The WH_KEYBOARD_LL callback runs on the
+/// message hook thread and must never wait on a lock held by the settings UI;
+/// ArcSwap keeps readers wait-free while retiring old snapshots safely.
+static BINDINGS: ArcSwapOption<HotkeyBindings> = ArcSwapOption::const_empty();
 
 /// PrtSc 的修饰键锁存：keydown 写入，keyup 用 swap 读走并清零。用户常常先松
 /// 修饰键再松 PrtSc，抬键现场读不到修饰键；同一时刻只有一个 PrtSc 动作在途，
@@ -34,7 +39,7 @@ static PRTSC_MODS: AtomicU8 = AtomicU8::new(0);
 
 pub fn set_hook_target(hwnd: HWND, bindings: HotkeyBindings) {
     TARGET.store(hwnd.0 as isize, Ordering::SeqCst);
-    *BINDINGS.lock().unwrap() = Some(bindings);
+    BINDINGS.store(Some(Arc::new(bindings)));
 }
 
 /// The hidden message window, so a rebind can re-apply itself without threading
@@ -106,9 +111,9 @@ pub fn stop_recording() {
 /// `set_hook_target` 在启动时写入，settings 的 apply_bindings 也会更新。
 fn register_fallback_for_target() {
     let hwnd = hook_target();
-    let bindings = BINDINGS.lock().ok().and_then(|g| *g);
-    match bindings {
-        Some(bindings) => register_fallback_hotkeys(hwnd, &bindings),
+    let bindings = BINDINGS.load_full();
+    match bindings.as_deref() {
+        Some(bindings) => register_fallback_hotkeys(hwnd, bindings),
         None => eprintln!("hotkey fallback unavailable: no target/bindings set"),
     }
 }
@@ -265,7 +270,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     key_up,
                 }
             };
-            if let Some(bindings) = BINDINGS.lock().ok().and_then(|g| *g) {
+            // load_full() hands this callback an immutable Arc: no mutex, no
+            // priority-inversion risk while the UI thread rebinds a hotkey.
+            if let Some(bindings) = BINDINGS.load_full() {
                 let d = decide(&bindings, ev);
                 if d.swallow {
                     if let Some(action) = d.action {

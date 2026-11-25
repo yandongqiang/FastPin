@@ -49,9 +49,10 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
     STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Atomically moves `from` over `to`. `std::fs::rename` cannot replace an
-/// existing file on Windows, so use the Win32 API that can; on other platforms
-/// rename already has replace semantics.
+/// Atomically moves `from` over `to`. Modern std uses `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING` on Windows, so a plain `rename` could replace
+/// the file too; this path additionally requests `MOVEFILE_WRITE_THROUGH`,
+/// which flushes the rename before the history index is considered committed.
 #[cfg(windows)]
 fn replace_file(from: &Path, to: &Path) -> Result<()> {
     use windows::core::HSTRING;

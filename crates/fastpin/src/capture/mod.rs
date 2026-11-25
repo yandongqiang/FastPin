@@ -25,6 +25,18 @@ use crate::perf::PerfSession;
 /// hotkey-to-overlay path, so it is a user-visible stall, not a background wait.
 pub(super) const FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// One monitor whose frame could not be captured. The composite has a hole in
+/// this region, so callers must be able to tell the user instead of silently
+/// delivering an incomplete "full desktop" screenshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingRegion {
+    pub monitor: usize,
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
 pub struct CapturedDesktop {
     pub gpu: Gpu,
     /// Device generation this capture was taken on. A capture from an older
@@ -39,6 +51,8 @@ pub struct CapturedDesktop {
     pub sdr_white_nits: f32,
     pub hdr: bool,
     pub used_dxgi_dup: bool,
+    /// 多显示器采集中失败的屏幕区域；为空表示整张桌面都拿到了。
+    pub missing_regions: Vec<MissingRegion>,
 }
 
 enum WgcOutcome {
@@ -202,6 +216,7 @@ pub fn capture_for_action(
     let mut used_dxgi = false;
     // 每块 piece 带上自己显示器的 SDR 白点，合成时各自 white-lift。
     let mut pieces: Vec<(i32, i32, ID3D11Texture2D, bool, f32)> = Vec::new();
+    let mut missing: Vec<MissingRegion> = Vec::new();
 
     for (slot, &idx) in target_indices.iter().enumerate() {
         let mon = &monitors[idx];
@@ -228,22 +243,40 @@ pub fn capture_for_action(
         // takes effect on the WGC path above; a DXGI-fallback frame is always
         // cursor-free. This is a platform limitation, not a missed setting.
         if got.is_none() {
-            if dxgi_allowed(mon, overlay_luid) {
+            let failure = if dxgi_allowed(mon, overlay_luid) {
                 match dxgi_dup::capture_monitor(&gpu, ctx, mon, want_hdr, overlay_luid) {
                     Ok((tex, hdr)) => {
                         used_dxgi = true;
                         got = Some((tex, hdr));
+                        None
                     }
-                    Err(e) => {
-                        if target_indices.len() == 1 {
-                            return Err(e);
-                        }
-                    }
+                    Err(e) => Some((e.to_string(), e)),
                 }
-            } else if target_indices.len() == 1 {
-                return Err(Error::new(
-                    "capture unsupported: no WGC frame and DXGI blocked by adapter LUID mismatch",
+            } else {
+                Some((
+                    "DXGI blocked by adapter LUID mismatch".to_string(),
+                    Error::new(
+                        "capture unsupported: no WGC frame and DXGI blocked by adapter LUID mismatch",
+                    ),
+                ))
+            };
+            if let Some((reason, err)) = failure {
+                // 单屏没有「缺一块」可言：保留原来的硬失败，让上层给出可操作提示。
+                // 多屏时不能悄悄跳过——记日志并把缺失区域交回调用方展示。
+                if target_indices.len() == 1 {
+                    return Err(err);
+                }
+                crate::perf::log_app(&format!(
+                    "capture: monitor {idx} ({}, {}, {}x{}) unavailable: {reason}",
+                    mon.x, mon.y, mon.w, mon.h
                 ));
+                missing.push(MissingRegion {
+                    monitor: idx,
+                    x: mon.x,
+                    y: mon.y,
+                    w: mon.w.max(0) as u32,
+                    h: mon.h.max(0) as u32,
+                });
             }
         }
 
@@ -312,6 +345,7 @@ pub fn capture_for_action(
         sdr_white_nits: sdr_white,
         hdr: any_hdr,
         used_dxgi_dup: used_dxgi,
+        missing_regions: missing,
     })
 }
 

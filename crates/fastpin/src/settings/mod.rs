@@ -1341,14 +1341,26 @@ impl SettingsView {
 
     fn reset_page(&mut self, cx: &mut Context<Self>) {
         if self.page == Page::General {
-            // Autostart lives in the registry, not settings.json.
+            // Autostart lives in the registry / Task Scheduler, not settings.json.
+            // `run_as_admin` is the one General field that does live in
+            // settings.json: reset it through the same model path as every other
+            // page so the "reset value == default" edge case is handled by
+            // force_page_fields.
             if self.autostart {
-                if let Err(e) = system::set_autostart(false) {
+                if let Err(e) = system::set_autostart(false, self.settings.run_as_admin) {
                     self.fail(format!("开机启动设置失败：{e}"));
                     cx.notify();
                     return;
                 }
                 self.autostart = system::autostart_enabled();
+            }
+            let before_reset = self.settings.clone();
+            model::reset_page(&mut self.settings, Page::General);
+            model::copy_page_fields(&mut self.baseline, &before_reset, Page::General);
+            self.force_page = Some(Page::General);
+            if !self.persist(cx) {
+                cx.notify();
+                return;
             }
             self.ok("已重置「常规」");
             cx.notify();
@@ -1445,7 +1457,7 @@ impl SettingsView {
             } else {
                 None
             };
-            let autostart_error = system::set_autostart(false).err();
+            let autostart_error = system::set_autostart(false, self.settings.run_as_admin).err();
             self.autostart = system::autostart_enabled();
             if let Some(text) = input_text {
                 // 缓存清空后输入框也必须清空，否则失焦会把旧 key 写回。
@@ -2486,15 +2498,38 @@ impl SettingsView {
 
     fn set_autostart(&mut self, cx: &mut Context<Self>) {
         let want = !self.autostart;
-        match system::set_autostart(want) {
+        match system::set_autostart(want, self.settings.run_as_admin) {
             Ok(()) => {
                 self.status = SharedString::default();
                 self.status_error = false;
             }
             Err(e) => self.fail(format!("开机启动设置失败：{e}")),
         }
-        // Re-read rather than assume: the registry is the truth.
+        // Re-read rather than assume: the registry / task scheduler is the truth.
         self.autostart = system::autostart_enabled();
+        cx.notify();
+    }
+
+    fn set_run_as_admin(&mut self, cx: &mut Context<Self>) {
+        let want = !self.settings.run_as_admin;
+        // 若开机启动已开启，必须按新模式重建注册项：普通 Run 键无法提权，
+        // 管理员模式要用最高权限计划任务，两者不能同时存在。
+        if self.autostart {
+            if let Err(e) = system::set_autostart(true, want) {
+                self.fail(format!("开机启动权限设置失败：{e}"));
+                cx.notify();
+                return;
+            }
+            self.autostart = system::autostart_enabled();
+        }
+        self.settings.run_as_admin = want;
+        if self.persist(cx) {
+            self.ok(if want {
+                "已开启以管理员启动，下次启动生效"
+            } else {
+                "已关闭以管理员启动，下次启动生效"
+            });
+        }
         cx.notify();
     }
 
@@ -2993,6 +3028,16 @@ impl SettingsView {
                 widgets::toggle("autostart", self.autostart).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| this.set_autostart(cx)),
+                ),
+            )),
+            widgets::row(
+                "以管理员启动",
+                "勾选后，手动启动会弹出 UAC 提示并以管理员权限运行；开机启动改用最高权限计划任务。重启程序后生效。",
+            )
+            .child(widgets::control(
+                widgets::toggle("run-as-admin", self.settings.run_as_admin).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.set_run_as_admin(cx)),
                 ),
             )),
             widgets::unsupported_row("界面语言", "当前版本仅提供简体中文界面。"),
@@ -5889,6 +5934,13 @@ fn settings_persist_merge(
         &mut merged.appearance,
         &snapshot.appearance,
         &baseline.appearance,
+        force,
+    );
+    // 「以管理员启动」是常规页独占的顶层字段，与 appearance 同构。
+    keep_edited(
+        &mut merged.run_as_admin,
+        &snapshot.run_as_admin,
+        &baseline.run_as_admin,
         force,
     );
     // 单页重置：默认值可能恰好等于基线，差异判断识别不出「已重置」，常规

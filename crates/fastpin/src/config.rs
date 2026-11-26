@@ -29,6 +29,10 @@ pub struct Settings {
     /// `"Default Light"`。纯字符串保持配置文件可手改；未知值在启动时回退到
     /// 默认浅色主题，不会让整个配置文件失效。
     pub appearance: String,
+    /// 「常规」页的「以管理员启动」。勾选后：手动启动走 UAC 自提升，开机启动
+    /// 改用最高权限计划任务（Run 注册表项无法提权）。只影响下一次启动，运行
+    /// 中切换不会立刻提权当前进程。默认关闭。
+    pub run_as_admin: bool,
 }
 
 /// gpui-kit 默认浅色变体在 `ThemeRegistry` 里的注册名，也是 `appearance` 的默认值。
@@ -58,6 +62,7 @@ impl Default for Settings {
             history: History::default(),
             hotkeys: Hotkeys::default(),
             appearance: DEFAULT_APPEARANCE.into(),
+            run_as_admin: false,
         }
     }
 }

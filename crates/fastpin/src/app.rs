@@ -298,6 +298,12 @@ fn install_panic_hook() {
 
 pub fn run() -> Result<()> {
     install_panic_hook();
+    // 「以管理员启动」在单实例 acquire 之前处理：当前未提升时通过 UAC
+    // 重启自身并直接退出，避免抢到实例锁让提权后的新进程误判为第二实例。
+    // 用户拒绝 UAC 时 relaunch_elevated 返回 Ok，同样静默退出。
+    if crate::config::get().run_as_admin && !crate::settings::system::is_elevated() {
+        return crate::settings::system::relaunch_elevated();
+    }
     // 迁移与下载清理会跨进程改目录/删文件，必须在参数解析之后、GUI 路径的
     // 单实例 acquire 之后执行（见 run_tray）；CLI 子命令不应碰真实用户目录。
     let args: Vec<String> = std::env::args().collect();

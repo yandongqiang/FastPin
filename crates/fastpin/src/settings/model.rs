@@ -116,7 +116,8 @@ impl Page {
     pub fn has_config(self) -> bool {
         matches!(
             self,
-            Page::Screenshot
+            Page::General
+                | Page::Screenshot
                 | Page::Pin
                 | Page::Output
                 | Page::Appearance
@@ -149,6 +150,11 @@ pub const ROWS: &[RowMeta] = &[
         page: Page::General,
         title: "开机启动",
         desc: "登录 Windows 后自动在托盘中运行 FastPin。",
+    },
+    RowMeta {
+        page: Page::General,
+        title: "以管理员启动",
+        desc: "手动启动与开机启动均使用管理员权限；重启程序后生效。",
     },
     RowMeta {
         page: Page::General,
@@ -640,6 +646,12 @@ pub fn search(query: &str) -> Vec<&'static RowMeta> {
 pub fn reset_page(settings: &mut Settings, page: Page) -> bool {
     let default = Settings::default();
     match page {
+        Page::General => {
+            // Autostart is registry / Task Scheduler state, not settings.json;
+            // only this config flag is reset here (the view handles autostart).
+            settings.run_as_admin = default.run_as_admin;
+            true
+        }
         Page::Screenshot => {
             settings.screenshot.hidden_toolbar_items =
                 default.screenshot.hidden_toolbar_items.clone();
@@ -712,6 +724,7 @@ pub fn reset_page(settings: &mut Settings, page: Page) -> bool {
 /// 共享的字段仍保留 latest，不会被开窗快照整份回滚。
 pub fn copy_page_fields(dst: &mut Settings, src: &Settings, page: Page) {
     match page {
+        Page::General => dst.run_as_admin = src.run_as_admin,
         Page::Screenshot => {
             let d = &mut dst.screenshot;
             let s = &src.screenshot;
@@ -789,7 +802,10 @@ mod tests {
     use super::*;
 
     fn all_non_default() -> Settings {
-        let mut s = Settings::default();
+        let mut s = Settings {
+            run_as_admin: true,
+            ..Settings::default()
+        };
         s.ocr.models_dir = Some("D:/models/custom".into());
         s.translation.base_url = "https://api.example.com/v1".into();
         s.translation.model = "qwen-plus".into();
@@ -1140,6 +1156,7 @@ mod tests {
         let default = Settings::default();
         let mut expected = original.clone();
         match page {
+            Page::General => expected.run_as_admin = default.run_as_admin,
             Page::Screenshot => {
                 let d = &default.screenshot;
                 expected.screenshot.hidden_toolbar_items = d.hidden_toolbar_items.clone();

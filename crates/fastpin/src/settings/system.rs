@@ -1,7 +1,9 @@
 //! The bits of the general page that touch Windows rather than settings.json.
 
 use std::ffi::c_void;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::ERROR_CANCELLED;
@@ -22,6 +24,13 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "FastPin";
 /// Pre-rebrand value name; `migrate_legacy_run_value` moves it over.
 const LEGACY_RUN_VALUE: &str = "Zshot";
+/// Scheduled task used instead of the Run key when "run as admin" is on. A Run
+/// entry always starts unelevated; only a task with `/RL HIGHEST` can start
+/// elevated at logon.
+const TASK_NAME: &str = "FastPin";
+/// CREATE_NO_WINDOW: keep `schtasks.exe` from flashing a console during a
+/// settings toggle.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -33,9 +42,7 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(base).join("FastPin"))
 }
 
-/// The registry is the source of truth: the user can drop the entry from Task
-/// Manager's startup tab, and a cached copy in settings.json would then lie.
-pub fn autostart_enabled() -> bool {
+fn run_key_enabled() -> bool {
     let mut buf = [0u16; 1024];
     let mut len = (buf.len() * 2) as u32;
     let status = unsafe {
@@ -52,7 +59,66 @@ pub fn autostart_enabled() -> bool {
     status.is_ok()
 }
 
-pub fn set_autostart(enabled: bool) -> Result<()> {
+/// Autostart is on when either mechanism is present: the plain Run key or the
+/// elevated scheduled task. Both are external state (Task Manager / Task
+/// Scheduler), so a cached copy in settings.json would lie.
+pub fn autostart_enabled() -> bool {
+    run_key_enabled() || task_exists()
+}
+
+/// Whether the current process already has a high-integrity token. Checked at
+/// startup in `app::run` before deciding to re-launch through UAC.
+pub fn is_elevated() -> bool {
+    unsafe { windows::Win32::UI::Shell::IsUserAnAdmin().as_bool() }
+}
+
+/// Re-launches this exe through the `runas` verb so UAC grants it a
+/// high-integrity token. The new process sees `is_elevated() == true` and does
+/// not re-launch, so this never loops. A UAC denial reports `ERROR_CANCELLED`
+/// through ShellExecuteW's `<= 32` error range; that is treated as "user
+/// declined", which the caller turns into a silent exit rather than an error
+/// dialog.
+pub fn relaunch_elevated() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    // Re-pass CLI args verbatim; quote any that contain spaces so e.g.
+    // `--once-capture "C:\my shots\a.png"` survives the elevated relaunch.
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .map(|a| {
+            if a.contains(' ') {
+                format!("\"{a}\"")
+            } else {
+                a
+            }
+        })
+        .collect();
+    let args_wide = wide(&args.join(" "));
+    let verb = wide("runas");
+    let target = wide(&exe.display().to_string());
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR(args_wide.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = result.0 as usize;
+    // ERROR_CANCELLED (1223) is > 32 yet means the user declined UAC; the
+    // classic `runas` decline also shows up as SE_ERR_ACCESSDENIED (5). Both
+    // are silent exits, not error dialogs.
+    if code == ERROR_CANCELLED.0 as usize || code == 5 {
+        return Ok(());
+    }
+    if code > 32 {
+        return Ok(());
+    }
+    Err(Error::new(format!("请求管理员权限失败（{code}）")))
+}
+
+fn set_run_key(enabled: bool) -> Result<()> {
     let key = wide(RUN_KEY);
     let name = wide(RUN_VALUE);
     if !enabled {
@@ -93,6 +159,76 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
             bytes as u32,
         )
         .ok()?;
+    }
+    Ok(())
+}
+
+/// `schtasks /Query` exit status is the source of truth for whether the task
+/// exists (the user can remove it from Task Scheduler behind our back).
+fn task_exists() -> bool {
+    Command::new("schtasks.exe")
+        .args(["/Query", "/TN", TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn task_create(exe: &Path) -> Result<()> {
+    // `/TR` must be the quoted exe path: Program Files paths contain spaces.
+    let tr = format!("\"{}\"", exe.display());
+    let output = Command::new("schtasks.exe")
+        .args([
+            "/Create", "/TN", TASK_NAME, "/SC", "ONLOGON", "/RL", "HIGHEST", "/TR", &tr, "/F",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| Error::new(format!("创建计划任务失败：{e}")))?;
+    if !output.status.success() {
+        return Err(Error::new(format!(
+            "创建计划任务失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn task_delete() -> Result<()> {
+    if !task_exists() {
+        return Ok(());
+    }
+    let output = Command::new("schtasks.exe")
+        .args(["/Delete", "/TN", TASK_NAME, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| Error::new(format!("删除计划任务失败：{e}")))?;
+    if !output.status.success() {
+        return Err(Error::new(format!(
+            "删除计划任务失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Configures autostart for the requested mode. `elevated` picks the highest-
+/// privilege scheduled task; otherwise the plain Run key is used. When turning
+/// autostart off both mechanisms are removed so switching the admin toggle
+/// cannot leave an orphan entry behind.
+pub fn set_autostart(enabled: bool, elevated: bool) -> Result<()> {
+    if !enabled {
+        let run = set_run_key(false);
+        let task = task_delete();
+        return run.and(task);
+    }
+    if elevated {
+        task_create(&std::env::current_exe()?)?;
+        // Do not leave a lower-privilege Run entry alongside the task: it would
+        // start a second, unelevated instance at logon.
+        set_run_key(false)?;
+    } else {
+        task_delete()?;
+        set_run_key(true)?;
     }
     Ok(())
 }

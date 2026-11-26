@@ -37,12 +37,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CallWindowProcW, CreatePopupMenu, DefWindowProcW, DeferWindowPos,
     DestroyMenu, EndDeferWindowPos, GetClientRect, GetCursorPos, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowRect, InsertMenuW, MessageBoxW, PostMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, GWL_STYLE, GWL_WNDPROC,
-    HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_OKCANCEL,
-    MB_SETFOREGROUND, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, SM_CXDRAG, SM_CYDRAG,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SW_HIDE, SW_SHOW, SYSTEM_METRICS_INDEX, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    WM_NCHITTEST, WNDPROC, WS_THICKFRAME,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, GWL_EXSTYLE, GWL_STYLE,
+    GWL_WNDPROC, HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK,
+    MB_OKCANCEL, MB_SETFOREGROUND, MF_BYPOSITION, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, SM_CXDRAG, SM_CYDRAG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SYSTEM_METRICS_INDEX, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NCHITTEST, WNDPROC, WS_EX_TRANSPARENT, WS_THICKFRAME,
 };
 
 use crate::geom::{Point, Rect};
@@ -1220,6 +1220,12 @@ pub struct PinView {
     edit_down: Option<Point>,
     /// True while the pin is showing the zoomed-out thumbnail instead of 1:1.
     thumbnail: bool,
+    /// 每张贴图自己的显示开关，来自配置但可由右键菜单单独切换。
+    topmost: bool,
+    shadow: bool,
+    magnifier_enabled: bool,
+    /// 最近一次 attach 使用的屏幕原点，供菜单切换置顶/阴影后重定位。
+    screen_origin: (i32, i32),
     /// Cached magnifier image and the client point it samples (logical px).
     magnifier: Option<Arc<RenderImage>>,
     magnifier_pos: Option<(f32, f32)>,
@@ -1249,6 +1255,10 @@ impl PinView {
             pending: None,
             edit_down: None,
             thumbnail: false,
+            topmost: crate::config::get().pin.topmost,
+            shadow: crate::config::get().pin.shadow,
+            magnifier_enabled: crate::config::get().pin.show_magnifier,
+            screen_origin: (0, 0),
             magnifier: None,
             magnifier_pos: None,
             focus_handle: cx.focus_handle(),
@@ -1259,7 +1269,7 @@ impl PinView {
     /// The preview is small and is only recomputed when the pointer moves, so
     /// leaving the setting off costs neither pixels nor a readback.
     fn update_magnifier(&mut self, window: &Window, pos: GpuiPoint<Pixels>) {
-        if !crate::config::get().pin.show_magnifier || self.editing() {
+        if !self.magnifier_enabled || self.editing() {
             self.magnifier = None;
             self.magnifier_pos = None;
             return;
@@ -1384,7 +1394,7 @@ impl PinView {
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
             // 0 表示取样式失败，不能据此把窗口样式清成 0。
             if style != 0 {
-                let shadow = crate::config::get().pin.shadow;
+                let shadow = self.shadow;
                 let wanted = if shadow {
                     style | WS_THICKFRAME.0 as isize
                 } else {
@@ -1407,6 +1417,7 @@ impl PinView {
                 }
             }
         }
+        self.screen_origin = (screen_x, screen_y);
         let desired = IRect::from_origin_size(
             screen_x,
             screen_y,
@@ -1417,7 +1428,11 @@ impl PinView {
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
-                Some(topmost_insert_after()),
+                Some(if self.topmost {
+                    HWND_TOPMOST
+                } else {
+                    HWND_NOTOPMOST
+                }),
                 outer.left,
                 outer.top,
                 outer.width(),
@@ -2768,6 +2783,91 @@ fn round_button(
         .child(label)
 }
 
+impl PinView {
+    /// 右键「识别文字」：与自动识别共用同一入口，结果用一次性弹窗显示。
+    fn recognize(&self, cx: &mut Context<Self>) {
+        let px = self.image.as_bytes(0).unwrap_or(&[]).to_vec();
+        let (w, h) = self.pixel_size;
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::ocr::recognize(&px, w, h, w * 4) });
+        cx.spawn(async move |_, _| match task.await {
+            Ok(text) if !text.trim().is_empty() => show_text_dialog("文字识别", &text),
+            Ok(_) => {}
+            Err(e) => crate::perf::log_app(&format!("pin OCR failed: {e}")),
+        })
+        .detach();
+    }
+
+    fn zoom_step(&mut self, upward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if pin_lock() == crate::config::PinLock::Size {
+            return;
+        }
+        self.thumbnail = false;
+        let factor = if upward {
+            wheel_factor(crate::config::get().pin.wheel_step)
+        } else {
+            1.0 / wheel_factor(crate::config::get().pin.wheel_step)
+        };
+        self.zoom_group(factor, self.zoom_anchor(window), window, cx);
+    }
+
+    fn toggle_topmost(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.topmost = !self.topmost;
+        let (x, y) = self.screen_origin;
+        self.attach_to_screen(window, x, y);
+        cx.notify();
+    }
+
+    fn toggle_shadow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shadow = !self.shadow;
+        let (x, y) = self.screen_origin;
+        self.attach_to_screen(window, x, y);
+        cx.notify();
+    }
+
+    fn toggle_magnifier(&mut self, cx: &mut Context<Self>) {
+        self.magnifier_enabled = !self.magnifier_enabled;
+        self.magnifier = None;
+        self.magnifier_pos = None;
+        cx.notify();
+    }
+
+    fn toggle_click_through(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hwnd = crate::platform::hwnd_of(window);
+        unsafe {
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let transparent = ex & WS_EX_TRANSPARENT.0 as isize != 0;
+            let wanted = if transparent {
+                ex & !(WS_EX_TRANSPARENT.0 as isize)
+            } else {
+                ex | WS_EX_TRANSPARENT.0 as isize
+            };
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted);
+        }
+        cx.notify();
+    }
+
+    /// 销毁贴图：关闭后不进入关闭历史，也不保留恢复记录。
+    fn destroy_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let group = self.group();
+        if self.editing() {
+            pin_edit::finish(cx, group, false, Vec::new());
+        }
+        let members = group_members(self.id);
+        let mut ids = vec![self.id];
+        for m in &members {
+            ids.push(m.id);
+            let _ = m.handle.update(cx, |_, window, _| window.remove_window());
+        }
+        CLOSED_PINS.with(|slot| slot.borrow_mut().retain(|rec| !ids.contains(&rec.id)));
+        restore_hidden_for(&ids);
+        forget(&ids);
+        clear_pendings_targeting(cx, &ids, self.id);
+        window.remove_window();
+    }
+}
+
 // ---- context menu -------------------------------------------------------------
 
 const CMD_COPY: u32 = 1;
@@ -2781,9 +2881,21 @@ const CMD_ACTUAL_SIZE: u32 = 8;
 const CMD_CLOSE: u32 = 9;
 const CMD_CLOSE_ALL: u32 = 10;
 const CMD_THUMB: u32 = 11;
+const CMD_RECOGNIZE: u32 = 12;
+const CMD_ZOOM_IN: u32 = 13;
+const CMD_ZOOM_OUT: u32 = 14;
+const CMD_TOGGLE_TOPMOST: u32 = 15;
+const CMD_TOGGLE_SHADOW: u32 = 16;
+const CMD_TOGGLE_MAGNIFIER: u32 = 17;
+const CMD_TOGGLE_CLICK_THROUGH: u32 = 18;
+const CMD_DESTROY: u32 = 19;
 
 pub(crate) enum MenuEntry {
-    Item { cmd: u32, label: &'static str },
+    Item {
+        cmd: u32,
+        label: &'static str,
+        checked: bool,
+    },
     Separator,
 }
 
@@ -2791,76 +2903,136 @@ pub(crate) enum MenuEntry {
 /// is gone.
 pub(crate) fn menu_items(cx: &mut App, id: u64) -> Option<Vec<MenuEntry>> {
     let e = entry(id)?;
-    let (pending, zoomed, thumbnail) = e
+    let (pending, zoomed, thumbnail, topmost, shadow, magnifier_enabled) = e
         .handle
         .read(cx)
-        .map(|v| (v.pending.is_some(), v.zoom != 1.0, v.thumbnail))
+        .map(|v| {
+            (
+                v.pending.is_some(),
+                v.zoom != 1.0,
+                v.thumbnail,
+                v.topmost,
+                v.shadow,
+                v.magnifier_enabled,
+            )
+        })
         .ok()?;
+    let click_through =
+        unsafe { GetWindowLongPtrW(e.hwnd, GWL_EXSTYLE) } & WS_EX_TRANSPARENT.0 as isize != 0;
     let editing = pin_edit::is_editing(e.group);
     let grouped = group_entries(e.group).len() > 1;
     use MenuEntry::*;
-    let mut items = vec![
-        Item {
-            cmd: CMD_COPY,
-            label: "复制\tCtrl+C",
-        },
-        Item {
-            cmd: CMD_SAVE,
-            label: "保存\tCtrl+S",
-        },
-        Separator,
-    ];
+    let mut items = Vec::new();
     if editing {
         items.push(Item {
             cmd: CMD_FINISH_EDIT,
             label: "完成标注\tEnter",
+            checked: false,
         });
         items.push(Item {
             cmd: CMD_CANCEL_EDIT,
             label: "取消标注\tEsc",
+            checked: false,
         });
     } else {
         items.push(Item {
             cmd: CMD_ANNOTATE,
-            label: "标注\tCtrl+E",
+            label: "启用编辑\tE",
+            checked: false,
         });
-        if pending {
-            items.push(Item {
-                cmd: CMD_STITCH,
-                label: "确认拼接\tEnter",
-            });
-        }
-        if grouped {
-            items.push(Item {
-                cmd: CMD_DETACH,
-                label: "从组中拆开\tCtrl+D",
-            });
-        }
-        if zoomed {
-            items.push(Item {
-                cmd: CMD_ACTUAL_SIZE,
-                label: "实际大小",
-            });
-        }
-        if crate::config::get().pin.thumb_toggle && pin_lock() != crate::config::PinLock::Size {
-            items.push(Item {
-                cmd: CMD_THUMB,
-                label: if thumbnail {
-                    "恢复原图"
-                } else {
-                    "显示缩略图"
-                },
-            });
-        }
+    }
+    items.push(Item {
+        cmd: CMD_COPY,
+        label: "复制到剪贴板\tCtrl+C",
+        checked: false,
+    });
+    items.push(Item {
+        cmd: CMD_SAVE,
+        label: "将图片另存为\tCtrl+S",
+        checked: false,
+    });
+    items.push(Separator);
+    items.push(Item {
+        cmd: CMD_RECOGNIZE,
+        label: "识别文字",
+        checked: false,
+    });
+    if pending {
+        items.push(Item {
+            cmd: CMD_STITCH,
+            label: "确认拼接\tEnter",
+            checked: false,
+        });
+    }
+    items.push(Separator);
+    items.push(Item {
+        cmd: CMD_TOGGLE_MAGNIFIER,
+        label: "放大镜\tM",
+        checked: magnifier_enabled,
+    });
+    if crate::config::get().pin.thumb_toggle && pin_lock() != crate::config::PinLock::Size {
+        items.push(Item {
+            cmd: CMD_THUMB,
+            label: "缩略图模式\tTab",
+            checked: thumbnail,
+        });
+    }
+    if zoomed {
+        items.push(Item {
+            cmd: CMD_ACTUAL_SIZE,
+            label: "实际大小",
+            checked: false,
+        });
+    }
+    items.push(Item {
+        cmd: CMD_ZOOM_IN,
+        label: "放大",
+        checked: false,
+    });
+    items.push(Item {
+        cmd: CMD_ZOOM_OUT,
+        label: "缩小",
+        checked: false,
+    });
+    items.push(Separator);
+    items.push(Item {
+        cmd: CMD_TOGGLE_TOPMOST,
+        label: "窗口置顶\tA",
+        checked: topmost,
+    });
+    items.push(Item {
+        cmd: CMD_TOGGLE_SHADOW,
+        label: "窗口阴影\tD",
+        checked: shadow,
+    });
+    items.push(Item {
+        cmd: CMD_TOGGLE_CLICK_THROUGH,
+        label: "鼠标穿透\tI",
+        checked: click_through,
+    });
+    if grouped {
+        items.push(Separator);
+        items.push(Item {
+            cmd: CMD_DETACH,
+            label: "从组中拆开\tCtrl+D",
+            checked: false,
+        });
     }
     items.push(Separator);
     items.push(Item {
         cmd: CMD_CLOSE,
-        label: "关闭\tEsc",
+        label: "关闭贴图\tEsc",
+        checked: false,
+    });
+    items.push(Item {
+        cmd: CMD_DESTROY,
+        label: "销毁贴图",
+        checked: false,
     });
     items.push(Item {
         cmd: CMD_CLOSE_ALL,
         label: "关闭所有贴图",
+        checked: false,
     });
     Some(items)
 }
@@ -2881,16 +3053,18 @@ pub(crate) fn track_menu(owner: HWND, items: &[MenuEntry]) -> Option<u32> {
                         PCWSTR::null(),
                     );
                 }
-                MenuEntry::Item { cmd, label } => {
+                MenuEntry::Item {
+                    cmd,
+                    label,
+                    checked,
+                } => {
                     // The menu copies the string on insert.
                     let text: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-                    let _ = InsertMenuW(
-                        menu,
-                        i as u32,
-                        MF_BYPOSITION | MF_STRING,
-                        *cmd as usize,
-                        PCWSTR(text.as_ptr()),
-                    );
+                    let flags = MF_BYPOSITION
+                        | MF_STRING
+                        | if *checked { MF_CHECKED } else { MF_UNCHECKED };
+                    let _ =
+                        InsertMenuW(menu, i as u32, flags, *cmd as usize, PCWSTR(text.as_ptr()));
                 }
             }
         }
@@ -2962,7 +3136,15 @@ pub(crate) fn run_menu_command(cx: &mut App, id: u64, cmd: u32) {
             CMD_DETACH => view.detach(&DetachPin, window, cx),
             CMD_ACTUAL_SIZE => view.actual_size(window, cx),
             CMD_THUMB => view.toggle_thumbnail(window, cx),
+            CMD_RECOGNIZE => view.recognize(cx),
+            CMD_ZOOM_IN => view.zoom_step(true, window, cx),
+            CMD_ZOOM_OUT => view.zoom_step(false, window, cx),
+            CMD_TOGGLE_TOPMOST => view.toggle_topmost(window, cx),
+            CMD_TOGGLE_SHADOW => view.toggle_shadow(window, cx),
+            CMD_TOGGLE_MAGNIFIER => view.toggle_magnifier(cx),
+            CMD_TOGGLE_CLICK_THROUGH => view.toggle_click_through(window, cx),
             CMD_CLOSE => view.close_group(window, cx),
+            CMD_DESTROY => view.destroy_group(window, cx),
             _ => {}
         }
     });

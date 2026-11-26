@@ -243,6 +243,14 @@ pub fn bar_size(n: usize) -> (f64, f64) {
     (w, H)
 }
 
+/// 矩形/椭圆合并成一个弹出条后的尺寸：比两个按钮多一个 `|` 分隔符和两侧间距。
+pub const SHAPE_SEPARATOR_W: f64 = 6.0;
+
+pub fn shape_popup_size() -> (f64, f64) {
+    let (w, h) = bar_size(2);
+    (w + SHAPE_SEPARATOR_W + ITEM_GAP, h)
+}
+
 /// Every svg the toolbar can request, including sub-tool icons that are not
 /// themselves entries in `PHASE1_ITEMS` (the two shape sub-options). Keeping
 /// this explicit means `AssetSource::list` stays complete even when a button is
@@ -774,6 +782,16 @@ mod tests {
         for id in PHASE1_ITEMS {
             assert!(is_visible(id, &[]), "{id}");
         }
+    }
+
+    #[test]
+    fn shape_popup_reserves_room_for_the_separator() {
+        let (plain, _) = bar_size(2);
+        let (merged, _) = shape_popup_size();
+        assert!(
+            merged > plain,
+            "合并后的弹出条要比两个按钮更宽，才能放下 | 分隔符"
+        );
     }
 
     #[test]

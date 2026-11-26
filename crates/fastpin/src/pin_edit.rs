@@ -380,7 +380,7 @@ fn toolbar_layout(n: usize) -> (f64, f64, f64, f64, f64) {
     let (sw, sh) = toolbar::swatches_size(theme::SWATCHES.len());
     // The shape picker is a two-button bar (44 px tall); reserve room above
     // the toolbar for whichever popup is taller.
-    let (pw, ph) = toolbar::bar_size(2);
+    let (pw, ph) = toolbar::shape_popup_size();
     // Every second row must fit inside the fixed window frame. Each arrow row
     // now carries three variants plus ends, heads and the slider, so it is the
     // widest; measuring with `props_size` keeps the padding and gaps exact.
@@ -610,7 +610,7 @@ impl Render for PinToolbar {
                 }
             });
             let shape_popup = e.session.shape_open.then(|| {
-                let (pw, _) = toolbar::bar_size(2);
+                let (pw, _) = toolbar::shape_popup_size();
                 let idx = items
                     .iter()
                     .position(|id| *id == toolbar::SHAPE)

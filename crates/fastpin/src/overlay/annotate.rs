@@ -1345,15 +1345,32 @@ pub fn shape_popup_element<V: 'static>(
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
-        .children(
-            [toolbar::SHAPE_RECT, toolbar::SHAPE_ELLIPSE]
-                .into_iter()
-                .map(|id| {
-                    let active = (id == toolbar::SHAPE_RECT && current == Tool::Rect)
-                        || (id == toolbar::SHAPE_ELLIPSE && current == Tool::Ellipse);
-                    toolbar_button(id, active, false, None, on_item.clone(), cx)
-                }),
+        // 两个形状按钮合成一条工具栏，中间用竖线分隔。
+        .child(toolbar_button(
+            toolbar::SHAPE_RECT,
+            current == Tool::Rect,
+            false,
+            None,
+            on_item.clone(),
+            cx,
+        ))
+        .child(
+            div()
+                .w(px(toolbar::SHAPE_SEPARATOR_W as f32))
+                .flex_none()
+                .justify_center()
+                .text_size(px(14.))
+                .text_color(theme::secondary_fg())
+                .child("|"),
         )
+        .child(toolbar_button(
+            toolbar::SHAPE_ELLIPSE,
+            current == Tool::Ellipse,
+            false,
+            None,
+            on_item,
+            cx,
+        ))
 }
 
 /// Hover label for a toolbar button. gpui owns the show delay and placement; this

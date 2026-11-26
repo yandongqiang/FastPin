@@ -4088,7 +4088,7 @@ impl OverlayView {
         let bar = geom?;
         let bar = Rect::new(bar.x / s, bar.y / s, bar.width / s, bar.height / s);
         let mon = Rect::new(mon.x / s, mon.y / s, mon.width / s, mon.height / s);
-        let (w, h) = toolbar::bar_size(2);
+        let (w, h) = toolbar::shape_popup_size();
         let pos = toolbar::place_swatches(
             toolbar::item_center_x(bar, index),
             bar,

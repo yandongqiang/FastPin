@@ -1921,9 +1921,15 @@ impl PinView {
         self.layout_rect = Some(out.rect);
         apply_client_rect(window, cx, out.rect);
         for (handle, rect0, zoom0) in &drag.members {
-            let rect = zoom_rect(*rect0, out.anchor, out.factor);
-            let zoom = *zoom0 * out.factor as f32;
             let _ = handle.update(cx, |view, window, cx| {
+                // A group member must stay inside its own zoom range even
+                // when the leader's resize factor is larger (P3-04). Derive
+                // the member's rect from its *clamped* factor so the shared
+                // anchor stays fixed and the clamp cannot push it past the
+                // grabbable minimum or the ceiling.
+                let (zoom, factor) =
+                    PinView::clamp_member_resize(*zoom0, out.factor, view.pixel_size);
+                let rect = zoom_rect(*rect0, out.anchor, factor);
                 view.zoom = zoom;
                 view.layout_rect = Some(rect);
                 apply_client_rect(window, cx, rect);
@@ -2170,6 +2176,23 @@ impl PinView {
         self.zoom = new_zoom;
         self.layout_rect = Some(rect);
         apply_client_rect(window, cx, rect);
+    }
+
+    /// Per-member zoom clamp for a group resize (P3-04).
+    ///
+    /// `resize_rect` already clamps the leader's factor against the leader's
+    /// own size limits, but a member of a different native size can slip below
+    /// its grabbable minimum or past the ceiling when that same factor is
+    /// applied to it. Returns the member's clamped zoom together with the
+    /// factor that actually applies to its rect, so the shared anchor stays
+    /// fixed even when the member's factor differs from the leader's.
+    fn clamp_member_resize(zoom0: f32, factor: f64, pixel_size: (u32, u32)) -> (f32, f64) {
+        let min_dim = pixel_size.0.min(pixel_size.1) as f32;
+        let floor = MIN_ZOOM.max(24.0 / min_dim.max(1.0));
+        let new_zoom = ((zoom0 as f64) * factor) as f32;
+        let new_zoom = new_zoom.clamp(floor, MAX_ZOOM);
+        let effective = (new_zoom / zoom0.max(0.001)) as f64;
+        (new_zoom, effective)
     }
 
     /// Back to 100%, anchored with the same `zoom_mode` as wheel zoom.
@@ -3452,6 +3475,46 @@ mod tests {
         let out = resize_rect(thin, edge(false, true, false, false), -10000.0, 0.0, 1.0);
         assert!((out.zoom - MAX_RESIZE_ZOOM).abs() < 1e-6);
         assert_eq!(out.rect.height, 10.0 * MAX_RESIZE_ZOOM as f64);
+    }
+
+    /// A group resize applies the leader's factor to every member, but a
+    /// member at a different native size must still respect its own zoom
+    /// range (P3-04). The clamped factor drives the rect so the shared
+    /// anchor does not drift when the member is clamped.
+    #[test]
+    fn resize_clamps_each_member_to_its_own_zoom_range() {
+        // Within range: the effective factor is the leader's unchanged, so
+        // a seam that was flush before the drag stays flush.
+        let (zoom, factor) = PinView::clamp_member_resize(0.5, 2.0, (1000, 1000));
+        assert!((zoom - 1.0).abs() < 1e-6);
+        assert!((factor - 2.0).abs() < 1e-6);
+
+        // Ceiling: a small member cannot be zoomed past MAX_ZOOM even when
+        // the leader's factor is much larger.
+        let (zoom, factor) = PinView::clamp_member_resize(1.0, 10.0, (400, 400));
+        assert!((zoom - MAX_ZOOM).abs() < 1e-6);
+        assert!((factor - MAX_ZOOM as f64).abs() < 1e-6);
+        assert!(zoom <= MAX_ZOOM);
+
+        // Floor: a tiny member stays grabbable (24 physical px on the short
+        // side) instead of shrinking below MIN_ZOOM.
+        let (zoom, factor) = PinView::clamp_member_resize(1.0, 0.001, (40, 40));
+        let floor = MIN_ZOOM.max(24.0 / 40.0);
+        assert!((zoom - floor).abs() < 1e-6);
+        assert!((factor - floor as f64).abs() < 1e-6);
+        assert!(zoom >= MIN_ZOOM);
+        assert!(zoom * 40.0 >= 24.0 - 1e-6);
+
+        // The clamped factor keeps the shared anchor: scaling about the
+        // right edge leaves that edge at the anchor even when clamped.
+        let anchor = (300, 100);
+        let rect0 = Rect::new(200.0, 100.0, 100.0, 50.0);
+        let (_, factor) = PinView::clamp_member_resize(1.0, 10.0, (400, 400));
+        let rect = zoom_rect(rect0, anchor, factor);
+        assert!(
+            (rect.right() - anchor.0 as f64).abs() < 1e-6,
+            "anchor stays fixed when a member is clamped"
+        );
     }
 
     /// `zoom` is the frame width over the image width, so the wheel zoom's

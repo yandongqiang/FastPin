@@ -17,7 +17,7 @@
 //! which shows a native popup menu and calls back with the chosen command.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -31,14 +31,18 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
 };
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, CreatePopupMenu, DeferWindowPos, DestroyMenu, EndDeferWindowPos,
-    GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowRect, InsertMenuW, PostMessageW,
-    SetForegroundWindow, SetWindowPos, TrackPopupMenu, HWND_TOPMOST, MF_BYPOSITION, MF_SEPARATOR,
-    MF_STRING, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SYSTEM_METRICS_INDEX, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    BeginDeferWindowPos, CallWindowProcW, CreatePopupMenu, DefWindowProcW, DeferWindowPos,
+    DestroyMenu, EndDeferWindowPos, GetClientRect, GetCursorPos, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowRect, InsertMenuW, MessageBoxW, PostMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, GWL_STYLE, GWL_WNDPROC,
+    HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_OKCANCEL,
+    MB_SETFOREGROUND, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, SM_CXDRAG, SM_CYDRAG,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SW_HIDE, SW_SHOW, SYSTEM_METRICS_INDEX, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WM_NCHITTEST, WNDPROC, WS_THICKFRAME,
 };
 
 use crate::geom::{Point, Rect};
@@ -76,6 +80,178 @@ struct PinEntry {
     handle: WindowHandle<PinView>,
 }
 
+/// A closed pin kept by `close_history_limit`. The thumbnail is a small BGRA
+/// copy; reopening restores it at the original screen position.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct ClosedPinRecord {
+    pub id: u64,
+    pub group: u64,
+    pub rect: IRect,
+    pub size: (u32, u32),
+    pub zoom: f32,
+    pub thumb: Vec<u8>,
+    pub thumb_size: (u32, u32),
+}
+
+/// Nearest-neighbour thumbnail of a pin's tight BGRA buffer. Bounded by
+/// `CLOSED_THUMB_MAX` on the long side so 16k stitches cannot inflate history.
+fn closed_thumbnail(px: &[u8], (sw, sh): (u32, u32)) -> (Vec<u8>, u32, u32) {
+    if sw == 0 || sh == 0 {
+        return (Vec::new(), 0, 0);
+    }
+    let k = CLOSED_THUMB_MAX as f64 / sw.max(sh) as f64;
+    let tw = ((sw as f64 * k).round() as u32).max(1);
+    let th = ((sh as f64 * k).round() as u32).max(1);
+    let mut out = Vec::with_capacity(tw as usize * th as usize * 4);
+    for y in 0..th {
+        let sy = (y as u64 * sh as u64 / th as u64) as usize;
+        for x in 0..tw {
+            let sx = (x as u64 * sw as u64 / tw as u64) as usize;
+            let src = (sy * sw as usize + sx) * 4;
+            if src + 4 <= px.len() {
+                out.extend_from_slice(&px[src..src + 4]);
+            } else {
+                out.extend_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    (out, tw, th)
+}
+
+/// Records closed pins and trims the ledger to `close_history_limit` (0 clears
+/// it). Called on every group close, close-all and system close path.
+fn note_closed_pins(cx: &mut App, ids: &[u64]) {
+    let limit = crate::config::get().pin.close_history_limit as usize;
+    if limit == 0 {
+        CLOSED_PINS.with(|slot| slot.borrow_mut().clear());
+        return;
+    }
+    for &id in ids {
+        let Some(e) = entry(id) else {
+            continue;
+        };
+        let (Some(rect), Ok(view)) = (client_rect(e.hwnd), e.handle.read(cx)) else {
+            continue;
+        };
+        let (thumb, tw, th) =
+            closed_thumbnail(view.image.as_bytes(0).unwrap_or(&[]), view.pixel_size);
+        CLOSED_PINS.with(|slot| {
+            let mut pins = slot.borrow_mut();
+            pins.push_back(ClosedPinRecord {
+                id,
+                group: e.group,
+                rect,
+                size: view.pixel_size,
+                zoom: view.zoom,
+                thumb,
+                thumb_size: (tw, th),
+            });
+            while pins.len() > limit {
+                pins.pop_front();
+            }
+        });
+    }
+}
+
+/// Snapshot of the retained closed pins, oldest first. The history window
+/// renders these thumbnails; this module owns the retention policy.
+#[allow(dead_code)]
+pub(crate) fn closed_pin_records() -> Vec<ClosedPinRecord> {
+    CLOSED_PINS.with(|slot| slot.borrow().iter().cloned().collect())
+}
+
+/// Reopens a retained pin from its thumbnail at the original position. Only
+/// the thumbnail is retained, so this is a low-resolution restore.
+#[allow(dead_code)]
+pub(crate) fn restore_closed_pin(cx: &mut App, id: u64) -> crate::error::Result<()> {
+    // 恢复即消费：否则同一条缩略图能被无限次恢复，关闭后又以新 id 入账。
+    let rec = CLOSED_PINS.with(|slot| {
+        let mut pins = slot.borrow_mut();
+        let pos = pins.iter().position(|r| r.id == id)?;
+        let rec = pins[pos].clone();
+        pins.remove(pos);
+        Some(rec)
+    });
+    let Some(rec) = rec else {
+        return Err(crate::error::Error::new("该贴图已不在关闭记录中"));
+    };
+    let (tw, th) = rec.thumb_size;
+    show_pin(cx, rec.thumb, tw, th, tw * 4, rec.rect.left, rec.rect.top)
+}
+
+/// 供历史窗口展示的轻量快照：只带 id 与尺寸，不复制缩略图像素。
+pub(crate) fn closed_pin_summaries() -> Vec<(u64, (u32, u32))> {
+    CLOSED_PINS.with(|slot| {
+        slot.borrow()
+            .iter()
+            .map(|rec| (rec.id, rec.thumb_size))
+            .collect()
+    })
+}
+
+/// Hides every other pin when `group_switch = HideOthers`, remembering which
+/// windows to show again when the pin that hid them closes.
+fn apply_group_switch(new_id: u64) {
+    if crate::config::get().pin.group_switch != crate::config::PinGroupSwitch::HideOthers {
+        return;
+    }
+    let others: Vec<PinEntry> = entries().into_iter().filter(|e| e.id != new_id).collect();
+    // A newer pin may have hidden the previous owner too; drop stale owners so
+    // closing one of them cannot show windows that must stay hidden.
+    HIDDEN_OTHERS.with(|slot| slot.borrow_mut().clear());
+    if others.is_empty() {
+        return;
+    }
+    HIDDEN_OTHERS.with(|slot| {
+        slot.borrow_mut()
+            .insert(new_id, others.iter().map(|e| e.hwnd).collect());
+    });
+    unsafe {
+        for e in &others {
+            let _ = ShowWindow(e.hwnd, SW_HIDE);
+        }
+    }
+}
+
+fn restore_hidden_for(ids: &[u64]) {
+    let restore: Vec<HWND> = HIDDEN_OTHERS.with(|slot| {
+        let mut hidden = slot.borrow_mut();
+        ids.iter()
+            .filter_map(|id| hidden.remove(id))
+            .flatten()
+            .collect()
+    });
+    unsafe {
+        for hwnd in restore {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+    }
+}
+
+/// 把 `HideOthers` 隐藏过的窗口全部恢复。设置页切回其它分组策略时调用。
+pub fn restore_all_hidden() {
+    let ids: Vec<u64> = HIDDEN_OTHERS.with(|slot| slot.borrow().keys().copied().collect());
+    restore_hidden_for(&ids);
+}
+
+/// Joins a freshly created pin to the current group when configured; the
+/// current group is the one owned by the last created or clicked pin.
+fn apply_auto_join(cx: &mut App, id: u64) {
+    if crate::config::get().pin.auto_join_group != crate::config::PinAutoJoin::Current {
+        return;
+    }
+    let current = CURRENT_GROUP.load(Ordering::Relaxed);
+    if current == 0 || current == id || entry(current).is_none() {
+        return;
+    }
+    if group_of(current) == group_of(id) {
+        return;
+    }
+    link(id, current);
+    refresh(cx, &group_members(id));
+}
+
 /// 异步标注写回的一项：(tile id, BGRA, w, h, zoom)。
 type PendingWrite = (u64, Vec<u8>, u32, u32, f32);
 
@@ -94,12 +270,23 @@ thread_local! {
     /// group -> 仍在后台 flatten 的完成次数。大于 0 时新的完成必须等它归零
     /// 再抓 tiles，否则 tiles 里还没有前一笔标注，仍会互相覆盖。
     static INFLIGHT_FINISHES: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
+    /// Recently closed pins, oldest first. Only small thumbnails are kept: the
+    /// full-size pixel buffer belongs to the live window's memory budget.
+    static CLOSED_PINS: RefCell<VecDeque<ClosedPinRecord>> =
+        const { RefCell::new(VecDeque::new()) };
+    /// Pin windows hidden by `group_switch = HideOthers`, keyed by the pin that
+    /// caused the hide, so they come back when that pin closes.
+    static HIDDEN_OTHERS: RefCell<HashMap<u64, Vec<HWND>>> = RefCell::new(HashMap::new());
+    /// 带阴影的贴图窗原窗口过程：WS_THICKFRAME 会给 DWM 提供标准阴影，但
+    /// 系统也会把外框识别成缩放手柄，这里拦截 WM_NCHITTEST 修掉副作用。
+    static SHADOW_WNDPROCS: RefCell<HashMap<isize, WNDPROC>> = RefCell::new(HashMap::new());
 }
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Group of the most recently created or clicked pin, for `auto_join_group`.
+static CURRENT_GROUP: AtomicU64 = AtomicU64::new(0);
 
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 10.0;
-const ZOOM_STEP: f32 = 1.1;
 
 /// Snap engages inside this gap and lets go only past `SNAP_EXIT`, so the
 /// window does not flicker on the boundary.
@@ -117,6 +304,169 @@ const RESIZE_BAND: f32 = 7.0;
 const MIN_RESIZE_SIDE: f64 = 64.0;
 /// Largest zoom a resize drag may reach: 4x the image's native size.
 const MAX_RESIZE_ZOOM: f32 = 4.0;
+/// `wheel_step == 10` is the familiar one-notch zoom. Other values map
+/// geometrically so 1..=50 stays monotonic and the ceiling stays reasonable.
+const WHEEL_STEP_BASE: u32 = 10;
+/// Size of one side of the in-view magnifier preview, logical px.
+const MAGNIFIER_SIDE: f32 = 96.0;
+/// Physical image pixels sampled on each side of the cursor by the magnifier.
+const MAGNIFIER_SAMPLES: i32 = 8;
+/// Zoom-out factor used by the thumbnail toggle.
+const THUMBNAIL_ZOOM: f32 = 0.5;
+/// Longest side of a closed pin's retained thumbnail.
+const CLOSED_THUMB_MAX: u32 = 160;
+
+/// One notch of wheel zoom for a configured `wheel_step` (clamped to 1..=50).
+/// 10 maps to 1.15x; 1 and 50 map to ~1.014x and ~2.01x.
+pub(crate) fn wheel_factor(step: u32) -> f32 {
+    1.1_f32.powf(step.clamp(1, 50) as f32 / WHEEL_STEP_BASE as f32)
+}
+
+/// Win32 insertion point behind which pin windows are stacked. The toolbar
+/// uses the same policy so it never ends up below a non-topmost pin.
+pub(crate) fn topmost_insert_after() -> HWND {
+    if crate::config::get().pin.topmost {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    }
+}
+
+fn pin_lock() -> crate::config::PinLock {
+    crate::config::get().pin.lock
+}
+
+/// Gates for the three universal-pin creation entries (text / file / image).
+/// The screenshot path calls `show_pin` directly and is not gated by these.
+pub fn universal_text_enabled() -> bool {
+    crate::config::get().pin.universal_text
+}
+
+pub fn universal_file_enabled() -> bool {
+    crate::config::get().pin.universal_file
+}
+
+pub fn universal_image_enabled() -> bool {
+    crate::config::get().pin.universal_image
+}
+
+fn cursor_pos() -> (i32, i32) {
+    let mut pt = POINT::default();
+    if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+        (pt.x, pt.y)
+    } else {
+        (0, 0)
+    }
+}
+
+/// `text_raster` 产出 premultiplied BGRA，透明背景是 (0,0,0,0)。`show_pin`
+/// 会把 alpha 强制写成 255，直接送进去会得到黑底白字；先按白底合成。
+fn flatten_premultiplied_on_white(px: &mut [u8]) {
+    for p in px.as_chunks_mut::<4>().0 {
+        let a = p[3];
+        for channel in &mut p[..3] {
+            *channel = channel.saturating_add(255 - a);
+        }
+        p[3] = 255;
+    }
+}
+
+fn create_text_pin(cx: &mut App, text: &str) -> crate::error::Result<()> {
+    let (mut px, w, h) = crate::overlay::text_raster::rasterize(text, 18.0, 0xFFFFFFFF)
+        .map_err(|e| crate::error::Error::new(format!("文本贴图生成失败：{e}")))?;
+    flatten_premultiplied_on_white(&mut px);
+    let (x, y) = cursor_pos();
+    show_pin(cx, px, w, h, w * 4, x, y)
+}
+
+/// 万能贴图入口：按剪贴板内容创建文件/图片/文本贴图，各自受「万能贴图类型」
+/// 设置控制。优先级为文件 > 图片 > 文本，与 C# 的通用粘贴行为一致。
+pub fn create_universal_pin(cx: &mut App) -> crate::error::Result<()> {
+    let mut rejected = None;
+    // 剪贴板可能同时提供多种格式；被禁用的类型不应挡住已启用的类型。
+    if let Some(files) = crate::codec::clipboard_files() {
+        if universal_file_enabled() {
+            let text = files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return create_text_pin(cx, &text);
+        }
+        rejected = Some("文件贴图已在设置中关闭");
+    }
+    if let Some((px, w, h, stride)) = crate::codec::clipboard_bgra() {
+        if universal_image_enabled() {
+            let (x, y) = cursor_pos();
+            return show_pin(cx, px, w, h, stride, x, y);
+        }
+        rejected = rejected.or(Some("图片贴图已在设置中关闭"));
+    }
+    if let Some(text) = crate::codec::clipboard_text() {
+        if universal_text_enabled() {
+            return create_text_pin(cx, &text);
+        }
+        rejected = rejected.or(Some("文本贴图已在设置中关闭"));
+    }
+    Err(crate::error::Error::new(
+        rejected.unwrap_or("剪贴板中没有可贴图的内容"),
+    ))
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Yes/No-style confirmation for group close and close-all. Modal like the
+/// app's error box, with a reentrancy guard: a declined system close re-enters
+/// the same handler on some Windows builds.
+struct ActiveCloseGuard<'a>(&'a AtomicBool);
+
+impl Drop for ActiveCloseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+fn confirm_close(owner: Option<HWND>) -> bool {
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    if ACTIVE.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let _guard = ActiveCloseGuard(&ACTIVE);
+    let text = wide("确定关闭贴图吗？\0");
+    let caption = wide("关闭贴图\0");
+    let answer = unsafe {
+        MessageBoxW(
+            owner,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND,
+        )
+    };
+    answer.0 == 1 // IDOK
+}
+
+/// Visible notice for automatic OCR results. The capture overlay owns its
+/// panel and is already closed by the time a pin is created, so there is no
+/// public panel entry to reuse here.
+fn show_text_dialog(title: &str, body: &str) {
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    if ACTIVE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let text = wide(&format!("{body}\0"));
+    let caption = wide(&format!("{title}\0"));
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+        );
+    }
+    ACTIVE.store(false, Ordering::SeqCst);
+}
 
 fn snap_rules(tolerance: i32) -> SnapRules {
     SnapRules {
@@ -335,7 +685,10 @@ pub fn show_pin(
     screen_x: i32,
     screen_y: i32,
 ) -> crate::error::Result<()> {
+    let pin_cfg = crate::config::get().pin;
     let buf = repack_opaque(&pixels, w, h, stride);
+    // Only clone the crop when an automatic export needs a background copy.
+    let bg_pixels = (pin_cfg.auto_copy || pin_cfg.auto_recognize).then(|| buf.clone());
     let Some(image) = render_image(buf, w, h) else {
         crate::perf::log_app("pin: pixel buffer size mismatch");
         return Err(crate::error::Error::new("像素缓冲区尺寸不匹配"));
@@ -362,14 +715,15 @@ pub fn show_pin(
     let handle = match cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: None,
+            // With the system titlebar on, `attach_to_screen` re-reads the
+            // non-client insets so the image still covers exactly the crop.
+            titlebar: pin_cfg.titlebar.then(Default::default),
             focus: true,
             show: true,
             kind: gpui::WindowKind::Normal,
             is_movable: false,
-            // Borderless: `titlebar: None` makes the client cover the whole
-            // window, so there is no system frame to grab. The view draws and
-            // handles its own eight resize hot zones instead.
+            // Borderless by default (`titlebar: None`): the client covers the
+            // whole window, so the view owns the eight resize hot zones.
             is_resizable: false,
             is_minimizable: false,
             window_background: WindowBackgroundAppearance::Transparent,
@@ -387,13 +741,25 @@ pub fn show_pin(
     let hwnd = handle.update(cx, |view, window, cx| {
         view.attach_to_screen(window, screen_x, screen_y);
         window.focus(&view.focus_handle, cx);
-        window.on_window_should_close(cx, move |_, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
+            // Our own close paths remove the window directly; do not prompt
+            // twice when the platform re-enters should_close afterwards.
+            if entry(id).is_none() {
+                return true;
+            }
+            if crate::config::get().pin.close_confirm
+                && !confirm_close(Some(crate::platform::hwnd_of(window)))
+            {
+                return false;
+            }
             let group = group_of(id).unwrap_or(id);
             // 系统级关闭（Alt+F4 / 任务栏）不走 Esc、双击那条 finish 路径。
             // 先按 group 撤销编辑：否则 EDITS 里的 backdrop 和工具栏窗口会
             // 一直留着。写回账本由 abort_group 收尾，但有在途 finish 时它会
             // 保留 INFLIGHT 等 worker 自己归零，避免丢掉还没写回的标注。
             pin_edit::abort_group(cx, group);
+            note_closed_pins(cx, &[id]);
+            restore_hidden_for(&[id]);
             forget(&[id]);
             cx.refresh_windows();
             true
@@ -411,6 +777,26 @@ pub fn show_pin(
             handle,
         })
     });
+    apply_auto_join(cx, id);
+    apply_group_switch(id);
+    CURRENT_GROUP.store(group_of(id).unwrap_or(id), Ordering::Relaxed);
+
+    if let Some(px) = bg_pixels {
+        if pin_cfg.auto_copy {
+            crate::app::export_pin_pixels(px.clone(), w, h, false, true);
+        }
+        if pin_cfg.auto_recognize {
+            let task = cx
+                .background_executor()
+                .spawn(async move { crate::ocr::recognize(&px, w, h, w * 4) });
+            cx.spawn(async move |_: &mut AsyncApp| match task.await {
+                Ok(text) if !text.trim().is_empty() => show_text_dialog("文字识别", &text),
+                Ok(_) => {}
+                Err(e) => crate::perf::log_app(&format!("pin auto OCR failed: {e}")),
+            })
+            .detach();
+        }
+    }
     Ok(())
 }
 
@@ -832,6 +1218,11 @@ pub struct PinView {
     pending: Option<Pending>,
     /// A stroke in progress started on this tile (edit mode).
     edit_down: Option<Point>,
+    /// True while the pin is showing the zoomed-out thumbnail instead of 1:1.
+    thumbnail: bool,
+    /// Cached magnifier image and the client point it samples (logical px).
+    magnifier: Option<Arc<RenderImage>>,
+    magnifier_pos: Option<(f32, f32)>,
     focus_handle: FocusHandle,
 }
 
@@ -857,15 +1248,165 @@ impl PinView {
             hover_edge: None,
             pending: None,
             edit_down: None,
+            thumbnail: false,
+            magnifier: None,
+            magnifier_pos: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Rebuilds the nearest-neighbour magnifier around a logical client point.
+    /// The preview is small and is only recomputed when the pointer moves, so
+    /// leaving the setting off costs neither pixels nor a readback.
+    fn update_magnifier(&mut self, window: &Window, pos: GpuiPoint<Pixels>) {
+        if !crate::config::get().pin.show_magnifier || self.editing() {
+            self.magnifier = None;
+            self.magnifier_pos = None;
+            return;
+        }
+        let point = (f32::from(pos.x), f32::from(pos.y));
+        if self.magnifier_pos == Some(point) && self.magnifier.is_some() {
+            return;
+        }
+        let scale = window.scale_factor().max(0.01);
+        // The preview samples native pixels, so undo the display zoom before
+        // looking up the pixel under the cursor.
+        let cx = (f32::from(pos.x) * scale / self.zoom).round() as i32;
+        let cy = (f32::from(pos.y) * scale / self.zoom).round() as i32;
+        let (iw, ih) = self.pixel_size;
+        let src = self.image.as_bytes(0).unwrap_or(&[]);
+        let n = MAGNIFIER_SAMPLES;
+        let zoom = (MAGNIFIER_SIDE / n as f32).round().max(1.0) as i32;
+        let side = (n * zoom) as u32;
+        let mut out = vec![0u8; side as usize * side as usize * 4];
+        for y in 0..n {
+            let sy = (cy + y - n / 2).clamp(0, ih as i32 - 1) as usize;
+            for x in 0..n {
+                let sx = (cx + x - n / 2).clamp(0, iw as i32 - 1) as usize;
+                let from = (sy * iw as usize + sx) * 4;
+                let to = ((y * zoom * side as i32 + x * zoom) as usize) * 4;
+                for k in 0..zoom {
+                    let row = to + (k as usize) * (side as usize * 4);
+                    for j in 0..zoom {
+                        let dst = row + (j as usize) * 4;
+                        if dst + 4 <= out.len() && from + 4 <= src.len() {
+                            out[dst..dst + 4].copy_from_slice(&src[from..from + 4]);
+                        }
+                    }
+                }
+            }
+        }
+        self.magnifier = render_image(out, side, side);
+        self.magnifier_pos = Some(point);
+    }
+
+    /// Anchor for wheel / thumbnail scaling, following `zoom_mode`. Group
+    /// members share it so their seams stay closed after the zoom.
+    fn zoom_anchor(&self, window: &Window) -> (i32, i32) {
+        let mut bbox =
+            client_rect(crate::platform::hwnd_of(window)).unwrap_or_else(|| IRect::new(0, 0, 0, 0));
+        for m in group_members(self.id) {
+            if let Some(r) = client_rect(m.hwnd) {
+                bbox = bbox.union(&r);
+            }
+        }
+        match crate::config::get().pin.zoom_mode {
+            crate::config::PinZoomMode::TopLeft => (bbox.left, bbox.top),
+            crate::config::PinZoomMode::Center => {
+                ((bbox.left + bbox.right) / 2, (bbox.top + bbox.bottom) / 2)
+            }
+        }
+    }
+
+    /// Right-click / context-menu entry for `thumb_toggle`. Zooming the window
+    /// is the thumbnail: the frame always hugs the pixels it displays.
+    fn toggle_thumbnail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::config::get().pin.thumb_toggle || pin_lock() == crate::config::PinLock::Size {
+            return;
+        }
+        let target = if self.thumbnail { 1.0 } else { THUMBNAIL_ZOOM };
+        let factor = target / self.zoom;
+        let anchor = self.zoom_anchor(window);
+        self.thumbnail = !self.thumbnail;
+        self.zoom_group(factor, anchor, window, cx);
     }
 
     /// Exact placement: GPUI's window_bounds are logical pixels, and the
     /// caption-free window still carries non-client insets, so set the outer
     /// rect whose client area matches the crop at its original screen position.
+    /// WS_THICKFRAME 只用于让 DWM 画阴影；所有命中都当作客户区，避免系统把
+    /// 4px 外框变成缩放手柄（应用自己有八向缩放热区与 lock=Size 设置）。
+    unsafe extern "system" fn shadow_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_NCHITTEST {
+            return LRESULT(1); // HTCLIENT
+        }
+        let previous =
+            SHADOW_WNDPROCS.with(|slot| slot.borrow().get(&(hwnd.0 as isize)).copied().flatten());
+        match previous {
+            Some(proc) => unsafe { CallWindowProcW(Some(proc), hwnd, msg, wparam, lparam) },
+            None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        }
+    }
+
+    fn install_shadow_subclass(hwnd: HWND) {
+        let installed = SHADOW_WNDPROCS.with(|slot| slot.borrow().contains_key(&(hwnd.0 as isize)));
+        if installed {
+            return;
+        }
+        unsafe {
+            let previous = GetWindowLongPtrW(hwnd, GWL_WNDPROC);
+            if previous == 0 {
+                return;
+            }
+            let previous: WNDPROC = std::mem::transmute(previous);
+            SHADOW_WNDPROCS.with(|slot| {
+                slot.borrow_mut().insert(hwnd.0 as isize, previous);
+            });
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_WNDPROC,
+                Self::shadow_wndproc as *const () as isize,
+            );
+        }
+    }
+
     fn attach_to_screen(&mut self, window: &mut Window, screen_x: i32, screen_y: i32) {
         let hwnd = crate::platform::hwnd_of(window);
+        // GPUI 0.3.9 的 WindowOptions 没有 shadow 字段；WS_THICKFRAME 让 DWM
+        // 给这扇无边框窗绘制标准阴影。必须在测量非客户区之前应用，否则
+        // window_rect_for_client_area 算出的外框会把阴影边框算漏。
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            // 0 表示取样式失败，不能据此把窗口样式清成 0。
+            if style != 0 {
+                let shadow = crate::config::get().pin.shadow;
+                let wanted = if shadow {
+                    style | WS_THICKFRAME.0 as isize
+                } else {
+                    style & !(WS_THICKFRAME.0 as isize)
+                };
+                if wanted != style {
+                    SetWindowLongPtrW(hwnd, GWL_STYLE, wanted);
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                if shadow {
+                    Self::install_shadow_subclass(hwnd);
+                }
+            }
+        }
         let desired = IRect::from_origin_size(
             screen_x,
             screen_y,
@@ -876,7 +1417,7 @@ impl PinView {
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
+                Some(topmost_insert_after()),
                 outer.left,
                 outer.top,
                 outer.width(),
@@ -921,6 +1462,8 @@ impl PinView {
         self.image = image;
         self.pixel_size = (w.max(1), h.max(1));
         self.zoom = zoom;
+        self.magnifier = None;
+        self.magnifier_pos = None;
         if let Some(rect) = self.layout_rect.as_mut() {
             rect.width = w as f64 * zoom as f64;
             rect.height = h as f64 * zoom as f64;
@@ -967,6 +1510,11 @@ impl PinView {
     }
 
     fn close_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::config::get().pin.close_confirm
+            && !confirm_close(Some(crate::platform::hwnd_of(window)))
+        {
+            return;
+        }
         let group = self.group();
         if self.editing() {
             pin_edit::finish(cx, group, false, Vec::new());
@@ -977,6 +1525,8 @@ impl PinView {
             ids.push(m.id);
             let _ = m.handle.update(cx, |_, window, _| window.remove_window());
         }
+        note_closed_pins(cx, &ids);
+        restore_hidden_for(&ids);
         forget(&ids);
         clear_pendings_targeting(cx, &ids, self.id);
         window.remove_window();
@@ -1235,6 +1785,7 @@ impl PinView {
         if event.button != MouseButton::Left {
             return;
         }
+        CURRENT_GROUP.store(self.group(), Ordering::Relaxed);
         if self.editing() {
             if let Some(pt) = self.edit_point(window, event.position) {
                 self.edit_press(pt, cx);
@@ -1242,7 +1793,10 @@ impl PinView {
             return;
         }
         if event.click_count >= 2 {
-            self.close_group(window, cx);
+            if crate::config::get().pin.double_click_close {
+                self.close_group(window, cx);
+            }
+            // A disabled double-click must not also arm a drag / export.
             return;
         }
         // Ctrl+press arms a drag-export gesture (upstream snow-shot): the pin
@@ -1256,17 +1810,22 @@ impl PinView {
             return;
         }
         // Edge hot zones beat the move drag: pressing the border resizes,
-        // pressing inside moves.
-        if let Some(edge) = self.resize_edge_under(window, event.position) {
-            self.begin_resize(edge, event.position, window, cx);
-            return;
+        // pressing inside moves. `lock` gates both gestures independently.
+        let lock = pin_lock();
+        if lock != crate::config::PinLock::Size {
+            if let Some(edge) = self.resize_edge_under(window, event.position) {
+                self.begin_resize(edge, event.position, window, cx);
+                return;
+            }
         }
-        let hwnd = crate::platform::hwnd_of(window);
-        let mut cursor = POINT::default();
-        let mut rect = RECT::default();
-        unsafe {
-            if GetCursorPos(&mut cursor).is_ok() && GetWindowRect(hwnd, &mut rect).is_ok() {
-                self.drag_offset = Some((cursor.x - rect.left, cursor.y - rect.top));
+        if lock != crate::config::PinLock::Position {
+            let hwnd = crate::platform::hwnd_of(window);
+            let mut cursor = POINT::default();
+            let mut rect = RECT::default();
+            unsafe {
+                if GetCursorPos(&mut cursor).is_ok() && GetWindowRect(hwnd, &mut rect).is_ok() {
+                    self.drag_offset = Some((cursor.x - rect.left, cursor.y - rect.top));
+                }
             }
         }
         // Whoever was snapped against this pin loses its ✓: the seam is
@@ -1368,14 +1927,23 @@ impl PinView {
         if !event.dragging() {
             // Idle hover: show the resize cursor over the border hot zones.
             if !self.editing() && self.resize.is_none() {
-                let edge = self.resize_edge_under(window, event.position);
+                let size_locked = pin_lock() == crate::config::PinLock::Size;
+                let edge = (!size_locked)
+                    .then(|| self.resize_edge_under(window, event.position))
+                    .flatten();
                 if edge != self.hover_edge {
                     self.hover_edge = edge;
                     cx.notify();
                 }
+                self.update_magnifier(window, event.position);
+            } else {
+                self.magnifier = None;
+                self.magnifier_pos = None;
             }
             return;
         }
+        self.magnifier = None;
+        self.magnifier_pos = None;
         if self.editing() {
             if let Some(pt) = self.edit_point(window, event.position) {
                 self.edit_drag(pt, cx);
@@ -1448,7 +2016,7 @@ impl PinView {
         }
     }
 
-    fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.button {
             MouseButton::Left => {
                 if self.editing() {
@@ -1466,7 +2034,16 @@ impl PinView {
                     cx.notify();
                 }
             }
-            MouseButton::Right => self.open_menu(cx),
+            MouseButton::Right => {
+                // With a thumbnail showing, right-click restores the original;
+                // in the original state the context menu (which also carries
+                // the toggle) keeps its existing behaviour.
+                if self.thumbnail && crate::config::get().pin.thumb_toggle {
+                    self.toggle_thumbnail(window, cx);
+                } else {
+                    self.open_menu(cx);
+                }
+            }
             _ => {}
         }
     }
@@ -1494,9 +2071,9 @@ impl PinView {
     }
 
     /// Wheel zoom resizes the window with the image -- the frame hugs the
-    /// pixels at every zoom level -- anchored on the cursor, so the image
-    /// point under it stays put (the PixPin zoom feel). A group scales every
-    /// tile about the same anchor, edge by edge, so seams stay closed.
+    /// pixels at every zoom level -- about the configured `zoom_mode` anchor
+    /// (group top-left or centre). A group scales every tile about the same
+    /// anchor, edge by edge, so seams stay closed.
     fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
@@ -1504,7 +2081,7 @@ impl PinView {
         cx: &mut Context<Self>,
     ) {
         // Marks are laid out in screen pixels for the duration of an edit.
-        if self.editing() {
+        if self.editing() || pin_lock() == crate::config::PinLock::Size {
             return;
         }
         let dy = match event.delta {
@@ -1514,17 +2091,17 @@ impl PinView {
         if dy == 0.0 {
             return;
         }
-        let factor = if dy > 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
-        let hwnd = crate::platform::hwnd_of(window);
-        let scale = window.scale_factor().max(0.01);
-        let Some(client) = client_rect(hwnd) else {
-            return;
+        let step = wheel_factor(crate::config::get().pin.wheel_step);
+        let factor = if dy > 0.0 { step } else { 1.0 / step };
+        // 滚轮始终围绕光标，保持原来的 PixPin 手感；zoom_mode 只影响
+        // 实际大小/缩略图等按钮的锚点。
+        let mut pt = POINT::default();
+        let anchor = if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+            (pt.x, pt.y)
+        } else {
+            self.zoom_anchor(window)
         };
-        // Cursor in screen pixels; event.position is logical, client-relative.
-        let anchor = (
-            (client.left as f32 + f32::from(event.position.x) * scale).round() as i32,
-            (client.top as f32 + f32::from(event.position.y) * scale).round() as i32,
-        );
+        self.thumbnail = false;
         self.zoom_group(factor, anchor, window, cx);
     }
 
@@ -1580,20 +2157,15 @@ impl PinView {
         apply_client_rect(window, cx, rect);
     }
 
-    /// Back to 100%, the group anchored on its top-left corner.
+    /// Back to 100%, anchored with the same `zoom_mode` as wheel zoom.
     fn actual_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing() || self.zoom == 1.0 {
+        if self.editing() || self.zoom == 1.0 || pin_lock() == crate::config::PinLock::Size {
             return;
         }
-        let Some(me) = client_rect(crate::platform::hwnd_of(window)) else {
-            return;
-        };
-        let bbox = group_members(self.id)
-            .iter()
-            .filter_map(|m| client_rect(m.hwnd))
-            .fold(me, |acc, r| acc.union(&r));
+        let anchor = self.zoom_anchor(window);
         let factor = 1.0 / self.zoom;
-        self.zoom_group(factor, (bbox.left, bbox.top), window, cx);
+        self.thumbnail = false;
+        self.zoom_group(factor, anchor, window, cx);
     }
 
     // ---- export ---------------------------------------------------------------
@@ -2096,6 +2668,32 @@ impl Render for PinView {
                     .child(mouse_layer)
                     .children(text_layer),
             )
+            // Pixel magnifier: a bounded preview of the 8x8 source pixels
+            // under the cursor. Cached in `on_mouse_move`, absent by default.
+            .children(
+                self.magnifier
+                    .as_ref()
+                    .zip(self.magnifier_pos)
+                    .map(|(preview, (mx, my))| {
+                        let x = (mx + 16.0).clamp(0.0, (w - MAGNIFIER_SIDE).max(0.0));
+                        let y =
+                            (my - MAGNIFIER_SIDE - 16.0).clamp(0.0, (h - MAGNIFIER_SIDE).max(0.0));
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(y))
+                            .w(px(MAGNIFIER_SIDE))
+                            .h(px(MAGNIFIER_SIDE))
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(theme::elevated_surface().opacity(0.9))
+                            .child(
+                                img(ImageSource::Render(preview.clone()))
+                                    .w(px(MAGNIFIER_SIDE))
+                                    .h(px(MAGNIFIER_SIDE)),
+                            )
+                    }),
+            )
             // The backdrop is composed on a worker. Show a visible state while
             // it is not ready instead of silently accepting strokes that cannot
             // yet sample the image for mosaic effects.
@@ -2182,6 +2780,7 @@ const CMD_DETACH: u32 = 7;
 const CMD_ACTUAL_SIZE: u32 = 8;
 const CMD_CLOSE: u32 = 9;
 const CMD_CLOSE_ALL: u32 = 10;
+const CMD_THUMB: u32 = 11;
 
 pub(crate) enum MenuEntry {
     Item { cmd: u32, label: &'static str },
@@ -2192,10 +2791,10 @@ pub(crate) enum MenuEntry {
 /// is gone.
 pub(crate) fn menu_items(cx: &mut App, id: u64) -> Option<Vec<MenuEntry>> {
     let e = entry(id)?;
-    let (pending, zoomed) = e
+    let (pending, zoomed, thumbnail) = e
         .handle
         .read(cx)
-        .map(|v| (v.pending.is_some(), v.zoom != 1.0))
+        .map(|v| (v.pending.is_some(), v.zoom != 1.0, v.thumbnail))
         .ok()?;
     let editing = pin_edit::is_editing(e.group);
     let grouped = group_entries(e.group).len() > 1;
@@ -2241,6 +2840,16 @@ pub(crate) fn menu_items(cx: &mut App, id: u64) -> Option<Vec<MenuEntry>> {
             items.push(Item {
                 cmd: CMD_ACTUAL_SIZE,
                 label: "实际大小",
+            });
+        }
+        if crate::config::get().pin.thumb_toggle && pin_lock() != crate::config::PinLock::Size {
+            items.push(Item {
+                cmd: CMD_THUMB,
+                label: if thumbnail {
+                    "恢复原图"
+                } else {
+                    "显示缩略图"
+                },
             });
         }
     }
@@ -2311,7 +2920,19 @@ pub fn count() -> usize {
 /// Close every pinned image. Shared by the tray's 关闭所有贴图 command and the
 /// per-pin context menu's 关闭全部钉图 command.
 pub fn close_all(cx: &mut App) {
-    for e in entries() {
+    let all = entries();
+    if all.is_empty() {
+        return;
+    }
+    if crate::config::get().pin.close_confirm && !confirm_close(None) {
+        return;
+    }
+    let ids: Vec<u64> = all.iter().map(|e| e.id).collect();
+    note_closed_pins(cx, &ids);
+    HIDDEN_OTHERS.with(|slot| slot.borrow_mut().clear());
+    // A group can be recorded twice by `ids`; `finish` is idempotent, and a
+    // window already removed simply fails the update.
+    for e in all {
         if pin_edit::is_editing(e.group) {
             pin_edit::finish(cx, e.group, false, Vec::new());
         }
@@ -2340,6 +2961,7 @@ pub(crate) fn run_menu_command(cx: &mut App, id: u64, cmd: u32) {
             CMD_STITCH => view.confirm_stitch(window, cx),
             CMD_DETACH => view.detach(&DetachPin, window, cx),
             CMD_ACTUAL_SIZE => view.actual_size(window, cx),
+            CMD_THUMB => view.toggle_thumbnail(window, cx),
             CMD_CLOSE => view.close_group(window, cx),
             _ => {}
         }
@@ -2417,6 +3039,23 @@ mod tests {
             top,
             bottom,
         }
+    }
+
+    #[test]
+    fn premultiplied_text_is_flattened_on_white() {
+        let mut px = [0u8, 0, 0, 0, 255, 255, 255, 255];
+        flatten_premultiplied_on_white(&mut px);
+        assert_eq!(px, [255, 255, 255, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn wheel_step_maps_ten_to_the_traditional_zoom() {
+        assert!((wheel_factor(10) - 1.1).abs() < 1e-6);
+        assert!(wheel_factor(1) > 1.0 && wheel_factor(1) < wheel_factor(10));
+        assert!(wheel_factor(50) > wheel_factor(10) && wheel_factor(50) < 2.0);
+        // Out-of-range values are clamped rather than producing a runaway zoom.
+        assert_eq!(wheel_factor(0), wheel_factor(1));
+        assert_eq!(wheel_factor(51), wheel_factor(50));
     }
 
     /// 同一 group 的重开必须等所有在途 flatten 结束：计数要成对、互不串组。

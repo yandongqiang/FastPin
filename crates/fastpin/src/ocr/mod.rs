@@ -156,8 +156,9 @@ enum ModelOrigin {
     /// A user-chosen directory, `FASTPIN_MODELS`, or `models\v6` next to the
     /// executable — a real installation.
     Installed,
-    /// Only `<CARGO_MANIFEST_DIR>/../../models/v6` exists. OCR works here,
-    /// but the machine itself has nothing installed.
+    /// Only `<CARGO_MANIFEST_DIR>/../../models/v6` exists. Debug builds only;
+    /// release builds never present a source-tree path as the default.
+    #[allow(dead_code)]
     DevFallback,
 }
 
@@ -257,10 +258,19 @@ fn build() -> Result<OAROCR> {
     .map_err(|e| Error::new(format!("识别引擎初始化失败：{e}")))
 }
 
+/// 默认模型目录永远是程序安装位置旁的 `models\v6`，与设置页展示的默认值
+/// 一致；只有调试构建才额外允许仓库内的开发副本。
+pub fn default_models_dir() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let base = exe
+        .parent()
+        .ok_or_else(|| Error::new("executable has no parent directory"))?;
+    Ok(base.join("models").join("v6"))
+}
+
 /// `settings.json` wins, then `FASTPIN_MODELS`, then the install layout the C#
-/// build already uses, then the in-repo copy a `cargo run` build sits beside.
-/// The origin travels with the path so the UI can tell an install from a
-/// developer-only fallback.
+/// build already uses. A debug-only in-repo fallback keeps `cargo run` usable,
+/// but a release build never reports a source-tree path as its default.
 fn resolve_models_dir() -> Result<(PathBuf, ModelOrigin)> {
     if let Some(dir) = crate::config::get().ocr.models_dir {
         return Ok((dir, ModelOrigin::Installed));
@@ -268,26 +278,26 @@ fn resolve_models_dir() -> Result<(PathBuf, ModelOrigin)> {
     if let Some(dir) = std::env::var_os("FASTPIN_MODELS") {
         return Ok((PathBuf::from(dir), ModelOrigin::Installed));
     }
-    let exe = std::env::current_exe()?;
-    let base = exe
-        .parent()
-        .ok_or_else(|| Error::new("executable has no parent directory"))?;
-    let shipped = base.join("models").join("v6");
+    let shipped = default_models_dir()?;
     if shipped.is_dir() {
         return Ok((shipped, ModelOrigin::Installed));
     }
-    // ponytail: a `cargo run` build sits in `target\`, where the packaged
-    // `models\v6` is not. The repo copy is the same three files, so fall back
-    // to it rather than making every developer set FASTPIN_MODELS.
-    Ok((PathBuf::from(REPO_MODELS), ModelOrigin::DevFallback))
+    #[cfg(debug_assertions)]
+    {
+        let repo = PathBuf::from(REPO_MODELS);
+        if repo.is_dir() {
+            return Ok((repo, ModelOrigin::DevFallback));
+        }
+    }
+    Ok((shipped, ModelOrigin::Installed))
 }
 
 fn models_dir() -> Result<PathBuf> {
     resolve_models_dir().map(|(dir, _)| dir)
 }
 
-/// The in-repo copy, resolved at compile time. Absent on a user machine, which
-/// is why the directory next to the exe is checked first.
+/// 仅调试构建使用的仓库内副本；发布版不引用源码路径。
+#[cfg(debug_assertions)]
 const REPO_MODELS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/v6");
 
 /// Pure form of the idle policy, split out so the 60 s rule is testable
@@ -400,6 +410,12 @@ mod tests {
         assert!(models_present_in(&dir), "all three pass the sniff");
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_models_dir_is_next_to_the_executable() {
+        let dir = default_models_dir().expect("current exe has a parent");
+        assert!(dir.ends_with("models/v6"), "{}", dir.display());
     }
 
     #[test]

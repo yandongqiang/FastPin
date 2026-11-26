@@ -18,7 +18,7 @@ use gpui::{
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE,
+    GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_NOACTIVATE,
     SWP_SHOWWINDOW, WS_EX_NOACTIVATE,
 };
 
@@ -394,6 +394,33 @@ fn toolbar_layout(n: usize) -> (f64, f64, f64, f64, f64) {
     (w, bar_y + bh + props_h, (w - bw) / 2.0, bar_y, bw)
 }
 
+/// 编辑窗口同时承载工具栏与参数行：参数行存在时按 panel_position 放到
+/// 屏幕左/右侧，否则按 toolbar_position 摆放，默认两者都是跟随贴图。
+fn place_pin_edit_window(
+    sel: Rect,
+    w: f64,
+    h: f64,
+    mon: Rect,
+    gap: f64,
+    tool: crate::config::ToolbarPosition,
+    panel: crate::config::PanelPosition,
+) -> crate::geom::Point {
+    use crate::config::PanelPosition;
+    match panel {
+        PanelPosition::Left => crate::geom::Point {
+            x: mon.x + gap,
+            y: sel.y.clamp(mon.y, (mon.bottom() - h - gap).max(mon.y)),
+        },
+        PanelPosition::Right => crate::geom::Point {
+            x: mon.right() - w - gap,
+            y: sel.y.clamp(mon.y, (mon.bottom() - h - gap).max(mon.y)),
+        },
+        PanelPosition::FollowSelection | PanelPosition::Remember => {
+            toolbar::place_toolbar_with_policy(sel, w, h, mon, gap, tool, None)
+        }
+    }
+}
+
 fn open_toolbar(cx: &mut App, group: u64, bbox: IRect) -> Option<WindowHandle<PinToolbar>> {
     // The window keeps its full width for the whole edit: line-style buttons
     // come and go with the active shape tool, but the frame must not resize
@@ -444,12 +471,23 @@ fn open_toolbar(cx: &mut App, group: u64, bbox: IRect) -> Option<WindowHandle<Pi
             bbox.width() as f64,
             bbox.height() as f64,
         );
-        let pos = toolbar::place_toolbar(
+        // Pins own their toolbar policy; the capture overlay's screenshot
+        // setting no longer controls this window.
+        let pin_cfg = &crate::config::get().pin;
+        let has_props = edit_for_group(group)
+            .is_some_and(|edit| !annotate::prop_cells(edit.borrow().session.tool).is_empty());
+        let pos = place_pin_edit_window(
             sel,
             w * scale,
             h * scale,
             monitor_rect_for(bbox),
             toolbar::ANCHOR_GAP * scale,
+            pin_cfg.toolbar_position,
+            if has_props {
+                pin_cfg.panel_position
+            } else {
+                crate::config::PanelPosition::FollowSelection
+            },
         );
         place_window(
             hwnd,
@@ -489,7 +527,7 @@ fn place_window(hwnd: HWND, client: IRect) {
     unsafe {
         let _ = SetWindowPos(
             hwnd,
-            Some(HWND_TOPMOST),
+            Some(crate::pin::topmost_insert_after()),
             outer.left,
             outer.top,
             outer.width(),

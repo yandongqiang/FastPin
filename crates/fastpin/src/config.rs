@@ -20,6 +20,8 @@ pub struct Settings {
     pub ocr: Ocr,
     pub translation: Translation,
     pub screenshot: Screenshot,
+    /// 「贴图」页的默认行为；与截屏工具栏设置分开保存。
+    pub pin: Pin,
     pub history: History,
     pub hotkeys: Hotkeys,
     /// UI 外观：gpui-kit 主题注册名（themes 目录里各 `themes` 条目的 `name`，
@@ -52,6 +54,7 @@ impl Default for Settings {
             ocr: Ocr::default(),
             translation: Translation::default(),
             screenshot: Screenshot::default(),
+            pin: Pin::default(),
             history: History::default(),
             hotkeys: Hotkeys::default(),
             appearance: DEFAULT_APPEARANCE.into(),
@@ -220,6 +223,141 @@ impl Default for Screenshot {
             show_magnifier: true,
             show_info_bar: true,
             show_shortcut_hints: true,
+        }
+    }
+}
+
+/// 贴图窗口的默认锁定方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PinLock {
+    #[default]
+    None,
+    /// 锁定位置，仍可缩放。
+    Position,
+    /// 锁定大小，仍可移动。
+    Size,
+}
+
+impl PinLock {
+    pub const ALL: [Self; 3] = [Self::None, Self::Position, Self::Size];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "无",
+            Self::Position => "锁定位置",
+            Self::Size => "锁定大小",
+        }
+    }
+}
+
+/// 切换分组时其它分组的处理方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PinGroupSwitch {
+    #[default]
+    KeepOthers,
+    HideOthers,
+}
+
+impl PinGroupSwitch {
+    pub const ALL: [Self; 2] = [Self::KeepOthers, Self::HideOthers];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::KeepOthers => "保留其他分组",
+            Self::HideOthers => "隐藏其他分组",
+        }
+    }
+}
+
+/// 新贴图是否自动加入当前分组。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PinAutoJoin {
+    #[default]
+    None,
+    Current,
+}
+
+impl PinAutoJoin {
+    pub const ALL: [Self; 2] = [Self::None, Self::Current];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "不自动加入",
+            Self::Current => "加入当前分组",
+        }
+    }
+}
+
+/// 贴图缩放锚点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PinZoomMode {
+    #[default]
+    TopLeft,
+    Center,
+}
+
+impl PinZoomMode {
+    pub const ALL: [Self; 2] = [Self::TopLeft, Self::Center];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TopLeft => "左上角缩放",
+            Self::Center => "中心缩放",
+        }
+    }
+}
+
+/// 「设置 → 贴图」页拥有的默认行为；键名与 C# AppConfig 对齐，便于手改配置。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Pin {
+    pub show_magnifier: bool,
+    pub topmost: bool,
+    pub shadow: bool,
+    pub titlebar: bool,
+    pub lock: PinLock,
+    pub double_click_close: bool,
+    pub thumb_toggle: bool,
+    /// 滚轮每格缩放步长，使用时钳到 1..=50。
+    pub wheel_step: u32,
+    pub close_confirm: bool,
+    /// 保留的最近关闭贴图数量，0 表示不记录。
+    pub close_history_limit: u32,
+    pub universal_text: bool,
+    pub universal_file: bool,
+    pub universal_image: bool,
+    pub auto_recognize: bool,
+    pub auto_copy: bool,
+    pub group_switch: PinGroupSwitch,
+    pub auto_join_group: PinAutoJoin,
+    pub toolbar_position: ToolbarPosition,
+    pub panel_position: PanelPosition,
+    pub zoom_mode: PinZoomMode,
+}
+
+impl Default for Pin {
+    fn default() -> Self {
+        Self {
+            show_magnifier: false,
+            topmost: true,
+            shadow: true,
+            titlebar: false,
+            lock: PinLock::None,
+            double_click_close: true,
+            thumb_toggle: true,
+            wheel_step: 10,
+            close_confirm: true,
+            close_history_limit: 25,
+            universal_text: true,
+            universal_file: true,
+            universal_image: true,
+            auto_recognize: false,
+            auto_copy: false,
+            group_switch: PinGroupSwitch::KeepOthers,
+            auto_join_group: PinAutoJoin::None,
+            toolbar_position: ToolbarPosition::FollowSelection,
+            panel_position: PanelPosition::FollowSelection,
+            zoom_mode: PinZoomMode::TopLeft,
         }
     }
 }
@@ -1662,6 +1800,9 @@ fn parse(text: &str) -> Settings {
     };
     // 直接反序列化也会把超大数组完整收进缓存，这里与恢复路径一样截断。
     cap_settings_vecs(&mut settings);
+    // 数字输入可由手改配置写入越界值，读取时就钳到设置页声明的范围。
+    settings.pin.wheel_step = settings.pin.wheel_step.clamp(1, 50);
+    settings.pin.close_history_limit = settings.pin.close_history_limit.min(200);
     settings
 }
 
@@ -1711,6 +1852,12 @@ fn cap_settings_vecs(settings: &mut Settings) {
         &mut settings.screenshot.hidden_toolbar_items,
         "screenshot.hiddenToolbarItems",
     );
+    // 矩形/圆形改为常驻工具：旧配置里残留的隐藏值也要在读取时清掉，
+    // 否则升级后仍会缺按钮，而设置页已无法再把它加回来。
+    settings
+        .screenshot
+        .hidden_toolbar_items
+        .retain(|id| id != crate::overlay::toolbar::RECT && id != crate::overlay::toolbar::ELLIPSE);
     cap_string_vec(
         &mut settings.screenshot.record_history_sources,
         "screenshot.recordHistorySources",
@@ -1735,11 +1882,44 @@ fn recover_settings(input: &serde_json::Value) -> Settings {
     out.ocr = recover_ocr(input.get("ocr"));
     out.translation = recover_translation(input.get("translation"));
     out.screenshot = recover_screenshot(input.get("screenshot"));
+    out.pin = recover_pin(input.get("pin"));
     out.history = recover_history(input.get("history"));
     out.hotkeys = recover_hotkeys(input.get("hotkeys"));
     if let Some(value) = recover_field(input, "appearance", "appearance") {
         out.appearance = value;
     }
+    out
+}
+
+fn recover_pin(input: Option<&serde_json::Value>) -> Pin {
+    let mut out = Pin::default();
+    let Some(input) = input else { return out };
+    if !input.is_object() {
+        eprintln!("settings.json: 字段 pin 不是对象，已回退默认值");
+        return out;
+    }
+    recover_fields!(input, out, "pin",
+        "showMagnifier" => show_magnifier,
+        "topmost" => topmost,
+        "shadow" => shadow,
+        "titlebar" => titlebar,
+        "lock" => lock,
+        "doubleClickClose" => double_click_close,
+        "thumbToggle" => thumb_toggle,
+        "wheelStep" => wheel_step,
+        "closeConfirm" => close_confirm,
+        "closeHistoryLimit" => close_history_limit,
+        "universalText" => universal_text,
+        "universalFile" => universal_file,
+        "universalImage" => universal_image,
+        "autoRecognize" => auto_recognize,
+        "autoCopy" => auto_copy,
+        "groupSwitch" => group_switch,
+        "autoJoinGroup" => auto_join_group,
+        "toolbarPosition" => toolbar_position,
+        "panelPosition" => panel_position,
+        "zoomMode" => zoom_mode,
+    );
     out
 }
 
@@ -1991,6 +2171,15 @@ fn recover_split(input: Option<&serde_json::Value>) -> crate::imagesplit::SplitS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_hidden_rect_and_ellipse_are_ignored() {
+        let mut settings = Settings::default();
+        settings.screenshot.hidden_toolbar_items =
+            vec!["rect".into(), "ellipse".into(), "text".into()];
+        cap_settings_vecs(&mut settings);
+        assert_eq!(settings.screenshot.hidden_toolbar_items, ["text"]);
+    }
 
     #[test]
     fn save_stays_blocked_until_the_file_is_valid_again() {

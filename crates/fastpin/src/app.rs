@@ -1039,6 +1039,11 @@ unsafe extern "system" fn hidden_proc(
                 TrayCommand::Region => post_action(hwnd, HotkeyAction::Region),
                 TrayCommand::Fullscreen => post_action(hwnd, HotkeyAction::Fullscreen),
                 TrayCommand::CopyOnly => post_action(hwnd, HotkeyAction::CopyOnly),
+                TrayCommand::UniversalPin => {
+                    if let Some(Err(e)) = with_gpui_app(crate::pin::create_universal_pin) {
+                        crate::perf::log_app(&format!("universal pin failed: {e}"));
+                    }
+                }
                 TrayCommand::CloseAllPins => {
                     let _ = with_gpui_app(crate::pin::close_all);
                 }

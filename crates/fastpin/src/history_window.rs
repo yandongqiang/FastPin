@@ -12,7 +12,7 @@
 //! full-size decode happens only on Copy.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +36,8 @@ actions!(
         CloseHistory,
         CopySelectedHistory,
         DeleteSelectedHistory,
-        RefreshHistory
+        RefreshHistory,
+        SelectAllHistory
     ]
 );
 
@@ -212,6 +213,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", CloseHistory, context),
         KeyBinding::new("ctrl-c", CopySelectedHistory, context),
         KeyBinding::new("delete", DeleteSelectedHistory, context),
+        KeyBinding::new("ctrl-a", SelectAllHistory, context),
         KeyBinding::new("f5", RefreshHistory, context),
     ]);
 }
@@ -302,6 +304,66 @@ fn total_size(records: &[HistoryRecord]) -> SharedString {
     crate::settings::model::human_size(bytes).into()
 }
 
+/// Contiguous slice of `ids` between the anchor and the clicked row, inclusive.
+/// Works in both directions; an unknown anchor degrades to the clicked row.
+fn range_ids(ids: &[String], anchor: Option<&str>, clicked: &str) -> Vec<String> {
+    let Some(anchor) = anchor else {
+        return vec![clicked.to_string()];
+    };
+    let (Some(start), Some(end)) = (
+        ids.iter().position(|id| id == anchor),
+        ids.iter().position(|id| id == clicked),
+    ) else {
+        return vec![clicked.to_string()];
+    };
+    let (lo, hi) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    ids[lo..=hi].to_vec()
+}
+
+/// Pure selection transition for one left-click. Plain click replaces the
+/// selection, Ctrl+click toggles one item, Shift+click extends from the anchor.
+/// Anchors are ids (not indices) so a refresh that inserts newer records at the
+/// top does not silently move the range.
+fn apply_pick(
+    ids: &[String],
+    clicked: &str,
+    anchor: Option<&str>,
+    ctrl: bool,
+    shift: bool,
+    current: &HashSet<String>,
+) -> (HashSet<String>, Option<String>) {
+    if shift && anchor.is_some() {
+        return (
+            range_ids(ids, anchor, clicked).into_iter().collect(),
+            anchor.map(str::to_string),
+        );
+    }
+    if ctrl {
+        let mut next = current.clone();
+        if !next.remove(clicked) {
+            next.insert(clicked.to_string());
+        }
+        return (next, Some(clicked.to_string()));
+    }
+    let mut next = HashSet::new();
+    next.insert(clicked.to_string());
+    (next, Some(clicked.to_string()))
+}
+
+/// Status text always reports the multi-selection count, then any operation
+/// result ("已复制到剪贴板", "删除失败：…") so feedback never hides the count.
+fn selection_status_text(count: usize, status: &str) -> SharedString {
+    match (count, status.is_empty()) {
+        (0, _) => status.into(),
+        (_, true) => format!("已选 {count} 张").into(),
+        (_, false) => format!("已选 {count} 张 · {status}").into(),
+    }
+}
+
 pub struct HistoryWindowView {
     focus_handle: FocusHandle,
     store: HistoryStore,
@@ -315,7 +377,16 @@ pub struct HistoryWindowView {
     /// Bumped on every decode request so a slow, stale batch cannot overwrite
     /// the thumbnails of a newer refresh when it finally finishes.
     thumb_seq: u64,
-    selected: Option<String>,
+    /// All currently selected record ids, in no particular order. Display
+    /// order always comes from `records`, so range selection is deterministic.
+    selected: HashSet<String>,
+    /// Id the last plain/Ctrl/Shift pick started from, used as the fixed end of
+    /// a Shift+click range.
+    selection_anchor: Option<String>,
+    /// Re-entrancy guard: a copy is still running in a background thread, or a
+    /// batch delete is committing index changes. Both actions are ignored
+    /// while true so Ctrl+C / Delete cannot race each other.
+    busy: bool,
     status: SharedString,
     /// index.json 读取失败的原因。非空表示历史可能仍在磁盘上，UI 不能把它
     /// 显示成「还没有截图历史」，复制 / 删除 / 清空也因此不可用。
@@ -349,7 +420,9 @@ impl HistoryWindowView {
             thumbs: HashMap::new(),
             thumbs_mtime: HashMap::new(),
             thumb_seq: 0,
-            selected: None,
+            selected: HashSet::new(),
+            selection_anchor: None,
+            busy: false,
             status,
             index_error,
             revision_seen: crate::history::history_revision(),
@@ -442,12 +515,18 @@ impl HistoryWindowView {
                 self.status = format!("历史索引损坏，图片仍在磁盘：{e}").into();
             }
         }
+        // Records may have been removed (or a corrupt index replaced) while
+        // the window was open: drop stale ids from both the selection and the
+        // Shift anchor so subsequent picks never reference a vanished row.
+        self.selected
+            .retain(|id| self.records.iter().any(|r| &r.id == id));
+        // Shift 锚点只需还存在于列表里；Ctrl 反选掉锚点后它仍可作为范围端点。
         if self
-            .selected
+            .selection_anchor
             .as_ref()
             .is_some_and(|id| !self.records.iter().any(|r| &r.id == id))
         {
-            self.selected = None;
+            self.selection_anchor = None;
         }
         self.load_thumbs_async(cx);
         cx.notify();
@@ -479,9 +558,40 @@ impl HistoryWindowView {
         .detach();
     }
 
-    fn selected_record(&self) -> Option<&HistoryRecord> {
-        let id = self.selected.as_ref()?;
-        self.records.iter().find(|r| &r.id == id)
+    /// Selected records in display order (newest first), never in click order.
+    fn selected_records(&self) -> Vec<&HistoryRecord> {
+        self.records
+            .iter()
+            .filter(|r| self.selected.contains(&r.id))
+            .collect()
+    }
+
+    /// First selected row, used by "打开文件夹" where only one folder makes sense.
+    fn first_selected_record(&self) -> Option<&HistoryRecord> {
+        self.records.iter().find(|r| self.selected.contains(&r.id))
+    }
+
+    fn on_pick(&mut self, clicked: &str, ctrl: bool, shift: bool, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self.records.iter().map(|r| r.id.clone()).collect();
+        let (selected, anchor) = apply_pick(
+            &ids,
+            clicked,
+            self.selection_anchor.as_deref(),
+            ctrl,
+            shift,
+            &self.selected,
+        );
+        self.selected = selected;
+        self.selection_anchor = anchor;
+        self.status = SharedString::default();
+        cx.notify();
+    }
+
+    fn on_select_all(&mut self, _: &SelectAllHistory, _: &mut Window, cx: &mut Context<Self>) {
+        self.selected = self.records.iter().map(|r| r.id.clone()).collect();
+        self.selection_anchor = self.records.first().map(|r| r.id.clone());
+        self.status = SharedString::default();
+        cx.notify();
     }
 
     fn on_refresh(&mut self, _: &RefreshHistory, _: &mut Window, cx: &mut Context<Self>) {
@@ -493,12 +603,85 @@ impl HistoryWindowView {
     }
 
     fn on_copy(&mut self, _: &CopySelectedHistory, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(record) = self.selected_record() else {
+        // A copy keeps a worker thread alive; ignore repeats until it reports.
+        if self.busy {
+            return;
+        }
+        if self.selected.is_empty() {
+            self.status = "请先选择一张图片".into();
+            cx.notify();
+            return;
+        }
+
+        // 多选：复制图片文件本身（CF_HDROP），像资源管理器复制多文件一样，
+        // 粘贴到聊天/文档时会成为多张图片而不是一张扁平位图。
+        if self.selected.len() > 1 {
+            let paths: Vec<PathBuf> = self
+                .selected_records()
+                .into_iter()
+                .map(|r| self.store.image_path(r))
+                .filter(|p| p.is_file())
+                .collect();
+            let wanted = self.selected.len();
+            if paths.is_empty() {
+                self.status = "选中的图片文件不存在".into();
+                cx.notify();
+                return;
+            }
+            let count = paths.len();
+            let missing = wanted.saturating_sub(count);
+            self.busy = true;
+            self.status = "正在复制…".into();
+            cx.notify();
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                unsafe {
+                    let _ = windows::Win32::System::Com::CoInitializeEx(
+                        None,
+                        windows::Win32::System::Com::COINIT_MULTITHREADED,
+                    );
+                }
+                let status = match crate::codec::set_clipboard_files(&paths) {
+                    Ok(()) if missing == 0 => format!("已复制 {count} 张图片到剪贴板"),
+                    Ok(()) => format!("已复制 {count} 张图片到剪贴板（{missing} 张文件已不存在）"),
+                    Err(e) => format!("复制失败：{e}"),
+                };
+                let _ = tx.send(status);
+            });
+            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                let status = loop {
+                    match rx.try_recv() {
+                        Ok(status) => break status,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            break "复制失败：后台任务中断".to_string()
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(50))
+                                .await;
+                        }
+                    }
+                };
+                // `this.update` fails once the window/entity is gone, so a
+                // late callback after close is simply dropped.
+                let _ = this.update(cx, |this, cx| {
+                    this.busy = false;
+                    this.status = status.into();
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
+
+        // 单张保留原行为：解码为 DIB 后复制图片内容。
+        let Some(record) = self.selected_records().into_iter().next() else {
             self.status = "请先选择一张图片".into();
             cx.notify();
             return;
         };
         let path = self.store.image_path(record);
+        self.busy = true;
         self.status = "正在复制…".into();
         cx.notify();
 
@@ -521,42 +704,80 @@ impl HistoryWindowView {
             };
             let _ = tx.send(status);
         });
-        let task = cx.background_executor().spawn(async move { rx.recv() });
-        cx.spawn(async move |this, cx| {
-            if let Ok(status) = task.await {
-                let _ = this.update(cx, |this, cx| {
-                    this.status = status.into();
-                    cx.notify();
-                });
-            }
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let status = loop {
+                match rx.try_recv() {
+                    Ok(status) => break status,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break "复制失败：后台任务中断".to_string()
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(50))
+                            .await;
+                    }
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.busy = false;
+                this.status = status.into();
+                cx.notify();
+            });
         })
         .detach();
     }
 
     fn on_delete(&mut self, _: &DeleteSelectedHistory, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected.clone() else {
+        if self.busy {
+            return;
+        }
+        if self.selected.is_empty() {
             self.status = "请先选择一张图片".into();
             cx.notify();
             return;
-        };
-        match self.store.remove(&id) {
-            Ok(()) => {
-                self.status = "已删除".into();
-                self.selected = None;
-                self.reload(cx);
-            }
-            Err(e) => {
-                self.status = format!("删除失败：{e}").into();
-                cx.notify();
+        }
+        self.busy = true;
+        let ids: Vec<String> = self
+            .selected_records()
+            .into_iter()
+            .map(|r| r.id.clone())
+            .collect();
+        let mut removed = Vec::new();
+        let mut failures = Vec::new();
+        // Reuse the store's two-phase delete for every id: commit the index
+        // first, then unlink the record directory. One bad row must not hide
+        // the others, so failures are collected and reported together.
+        for id in &ids {
+            match self.store.remove(id) {
+                Ok(()) => removed.push(id.clone()),
+                Err(e) => failures.push(format!("{id}：{e}")),
             }
         }
+        for id in &removed {
+            self.selected.remove(id);
+        }
+        self.busy = false;
+        self.reload(cx);
+        self.status = if failures.is_empty() {
+            format!("已删除 {} 张", removed.len()).into()
+        } else {
+            format!(
+                "已删除 {} 张，失败 {} 张：{}",
+                removed.len(),
+                failures.len(),
+                failures.join("；")
+            )
+            .into()
+        };
+        cx.notify();
     }
 
     fn on_clear(&mut self, cx: &mut Context<Self>) {
         match self.store.clear() {
             Ok(()) => {
                 self.status = "已清空历史".into();
-                self.selected = None;
+                self.selected.clear();
+                self.selection_anchor = None;
                 self.reload(cx);
             }
             Err(e) => {
@@ -567,7 +788,7 @@ impl HistoryWindowView {
     }
 
     fn on_open_folder(&mut self, cx: &mut Context<Self>) {
-        let dir = match self.selected_record() {
+        let dir = match self.first_selected_record() {
             Some(r) => self.store.image_path(r).parent().map(PathBuf::from),
             None => Some(self.store.root().to_path_buf()),
         };
@@ -696,11 +917,12 @@ impl HistoryWindowView {
         record: &HistoryRecord,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let selected = self.selected.as_ref() == Some(&record.id);
+        let selected = self.selected.contains(&record.id);
         let id = record.id.clone();
         let thumb_h = thumb_height(record.width, record.height);
-        div()
+        let mut card = div()
             .id(("history-card", index))
+            .relative()
             .flex_none()
             .w(px(CARD_W))
             .flex()
@@ -723,12 +945,31 @@ impl HistoryWindowView {
             .hover(|s| s.border_color(theme::accent_hover()))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.selected = Some(id.clone());
-                    this.status = SharedString::default();
-                    cx.notify();
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.on_pick(&id, event.modifiers.control, event.modifiers.shift, cx);
                 }),
-            )
+            );
+        if selected {
+            // 多选时每张卡片都有醒目的勾选角标，一眼可辨选中集合。
+            card = card.child(
+                div()
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(6.))
+                    .h(px(18.))
+                    .min_w(px(18.))
+                    .px(px(4.))
+                    .rounded(px(9.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme::accent())
+                    .text_color(theme::on_accent())
+                    .text_size(px(11.))
+                    .child("✓"),
+            );
+        }
+        card
             // 缩略图宽度固定，高度按原图比例（record.width/height）计算。
             .child(
                 div()
@@ -773,7 +1014,7 @@ impl HistoryWindowView {
         record: &HistoryRecord,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let selected = self.selected.as_ref() == Some(&record.id);
+        let selected = self.selected.contains(&record.id);
         let id = record.id.clone();
         const ROW_THUMB_W: f32 = 80.0;
         let thumb_h = if record.width == 0 {
@@ -781,8 +1022,9 @@ impl HistoryWindowView {
         } else {
             (ROW_THUMB_W * record.height as f32 / record.width as f32).clamp(30.0, 120.0)
         };
-        div()
+        let mut row = div()
             .id(("history-row", index))
+            .relative()
             .w_full()
             .flex()
             .flex_row()
@@ -805,76 +1047,93 @@ impl HistoryWindowView {
             .hover(|s| s.border_color(theme::accent_hover()))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.selected = Some(id.clone());
-                    this.status = SharedString::default();
-                    cx.notify();
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.on_pick(&id, event.modifiers.control, event.modifiers.shift, cx);
                 }),
-            )
-            .child(
+            );
+        if selected {
+            row = row.child(
                 div()
-                    .w(px(ROW_THUMB_W))
-                    .h(px(thumb_h))
-                    .rounded(px(4.))
-                    .bg(theme::muted())
+                    .absolute()
+                    .top(px(4.))
+                    .right(px(4.))
+                    .h(px(18.))
+                    .min_w(px(18.))
+                    .px(px(4.))
+                    .rounded(px(9.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(match self.thumbs.get(&record.id).and_then(|t| t.clone()) {
-                        Some(image) => img(ImageSource::Render(image))
-                            .w(px(ROW_THUMB_W))
-                            .h(px(thumb_h))
-                            .object_fit(gpui::ObjectFit::Contain)
-                            .rounded(px(4.))
-                            .into_any_element(),
-                        None => div()
-                            .w(px(ROW_THUMB_W))
-                            .h(px(thumb_h))
-                            .rounded(px(4.))
-                            .bg(theme::muted())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(theme::secondary_fg())
-                                    .child("无预览"),
-                            )
-                            .into_any_element(),
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::primary_fg())
-                            .child(crate::history::format_utc(record.created_ms)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(theme::secondary_fg())
-                            .child(format!("{} × {}", record.width, record.height)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(theme::secondary_fg())
-                            .child(crate::settings::model::human_size(record.bytes)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(theme::secondary_fg())
-                            .child(crate::history::source_label(&record.source)),
-                    ),
-            )
+                    .bg(theme::accent())
+                    .text_color(theme::on_accent())
+                    .text_size(px(11.))
+                    .child("✓"),
+            );
+        }
+        row.child(
+            div()
+                .w(px(ROW_THUMB_W))
+                .h(px(thumb_h))
+                .rounded(px(4.))
+                .bg(theme::muted())
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(match self.thumbs.get(&record.id).and_then(|t| t.clone()) {
+                    Some(image) => img(ImageSource::Render(image))
+                        .w(px(ROW_THUMB_W))
+                        .h(px(thumb_h))
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .rounded(px(4.))
+                        .into_any_element(),
+                    None => div()
+                        .w(px(ROW_THUMB_W))
+                        .h(px(thumb_h))
+                        .rounded(px(4.))
+                        .bg(theme::muted())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme::secondary_fg())
+                                .child("无预览"),
+                        )
+                        .into_any_element(),
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::primary_fg())
+                        .child(crate::history::format_utc(record.created_ms)),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(theme::secondary_fg())
+                        .child(format!("{} × {}", record.width, record.height)),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(theme::secondary_fg())
+                        .child(crate::settings::model::human_size(record.bytes)),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(theme::secondary_fg())
+                        .child(crate::history::source_label(&record.source)),
+                ),
+        )
     }
 
     /// 浏览区：顶部一条不可见的 canvas 测量容器宽度（宽度变化时 notify 重排），
@@ -970,6 +1229,17 @@ impl HistoryWindowView {
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.selected.len();
+        let copy_label = if count > 1 {
+            format!("复制 {count} 张")
+        } else {
+            "复制".to_string()
+        };
+        let delete_label = if count > 1 {
+            format!("删除 {count} 张")
+        } else {
+            "删除".to_string()
+        };
         div()
             .flex_none()
             .h(px(52.))
@@ -986,7 +1256,7 @@ impl HistoryWindowView {
                 div()
                     .text_size(px(11.))
                     .text_color(theme::secondary_fg())
-                    .child(self.status.clone()),
+                    .child(selection_status_text(count, self.status.as_ref())),
             )
             .child(
                 div()
@@ -1006,18 +1276,22 @@ impl HistoryWindowView {
                             cx.listener(|this, _, _, cx| this.on_open_folder(cx)),
                         ),
                     )
-                    .child(hist_button("history-copy", "复制", false).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.on_copy(&CopySelectedHistory, window, cx)
-                        }),
-                    ))
-                    .child(hist_button("history-delete", "删除", false).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.on_delete(&DeleteSelectedHistory, window, cx)
-                        }),
-                    ))
+                    .child(
+                        hist_button("history-copy", copy_label, false).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.on_copy(&CopySelectedHistory, window, cx)
+                            }),
+                        ),
+                    )
+                    .child(
+                        hist_button("history-delete", delete_label, false).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.on_delete(&DeleteSelectedHistory, window, cx)
+                            }),
+                        ),
+                    )
                     .child(hist_button("history-clear", "清空", true).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.on_clear(cx)),
@@ -1036,6 +1310,63 @@ impl Focusable for HistoryWindowView {
     }
 }
 
+impl HistoryWindowView {
+    /// 「关闭历史保留数量」对应的恢复入口：列出最近关闭的贴图，点击即恢复。
+    fn closed_pins_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // 轻量快照：避免每次 render 深拷贝最多 200 条、每条约 100KB 的缩略图。
+        let records = crate::pin::closed_pin_summaries();
+        if records.is_empty() {
+            return div();
+        }
+        let buttons: Vec<gpui::Stateful<gpui::Div>> = records
+            .iter()
+            .rev()
+            .take(8)
+            .map(|(id, size)| {
+                let id = *id;
+                let label: SharedString = format!("恢复 {}×{}", size.0, size.1).into();
+                div()
+                    .id(("restore-closed-pin", id))
+                    .flex_none()
+                    .h(px(26.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.))
+                    .bg(theme::elevated_surface())
+                    .border_1()
+                    .border_color(theme::border())
+                    .text_size(px(12.))
+                    .cursor(CursorStyle::PointingHand)
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            match crate::pin::restore_closed_pin(cx, id) {
+                                Ok(()) => this.status = "已恢复关闭的贴图".into(),
+                                Err(e) => this.status = format!("恢复贴图失败：{e}").into(),
+                            }
+                            cx.notify();
+                        }),
+                    )
+            })
+            .collect();
+        div()
+            .px(px(12.))
+            .py(px(6.))
+            .flex()
+            .flex_row()
+            .gap(px(6.))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme::secondary_fg())
+                    .child("最近关闭的贴图"),
+            )
+            .children(buttons)
+    }
+}
+
 impl Render for HistoryWindowView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -1049,15 +1380,21 @@ impl Render for HistoryWindowView {
             .on_action(cx.listener(Self::on_refresh))
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_delete))
+            .on_action(cx.listener(Self::on_select_all))
             .on_action(cx.listener(Self::on_close))
             .child(self.titlebar())
             .child(self.info_bar(cx))
+            .child(self.closed_pins_section(cx))
             .child(self.list(cx))
             .child(self.footer(cx))
     }
 }
 
-fn hist_button(id: &'static str, label: &'static str, danger: bool) -> gpui::Stateful<gpui::Div> {
+fn hist_button(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    danger: bool,
+) -> gpui::Stateful<gpui::Div> {
     let base = div()
         .id(id)
         .flex_none()
@@ -1069,7 +1406,7 @@ fn hist_button(id: &'static str, label: &'static str, danger: bool) -> gpui::Sta
         .rounded(px(6.))
         .text_size(px(12.))
         .cursor(CursorStyle::PointingHand)
-        .child(label);
+        .child(label.into());
     if danger {
         base.bg(theme::danger())
             .text_color(theme::on_danger())
@@ -1207,5 +1544,72 @@ mod tests {
 
         assert!(BUDGET.checked_dims(20_000, 1).is_err());
         assert!(load_thumb(&path).is_none());
+    }
+
+    fn ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("id-{i}")).collect()
+    }
+
+    #[test]
+    fn plain_click_replaces_selection_and_moves_anchor() {
+        let ids = ids(4);
+        let initial: HashSet<String> = ["id-0", "id-1"].into_iter().map(str::to_string).collect();
+        let (next, anchor) = apply_pick(&ids, "id-3", Some("id-0"), false, false, &initial);
+        assert_eq!(next, HashSet::from(["id-3".to_string()]));
+        assert_eq!(anchor.as_deref(), Some("id-3"));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_one_item_and_keeps_the_rest() {
+        let ids = ids(4);
+        let initial: HashSet<String> = ["id-0", "id-1"].into_iter().map(str::to_string).collect();
+        let (off, anchor) = apply_pick(&ids, "id-0", Some("id-1"), true, false, &initial);
+        assert_eq!(off, HashSet::from(["id-1".to_string()]));
+        assert_eq!(anchor.as_deref(), Some("id-0"));
+        let (on, _) = apply_pick(&ids, "id-2", anchor.as_deref(), true, false, &off);
+        assert_eq!(on, HashSet::from(["id-1".to_string(), "id-2".to_string()]));
+    }
+
+    #[test]
+    fn shift_click_selects_inclusive_range_in_either_direction() {
+        let ids = ids(5);
+        assert_eq!(
+            range_ids(&ids, Some("id-1"), "id-3"),
+            vec!["id-1".to_string(), "id-2".to_string(), "id-3".to_string()]
+        );
+        // Either direction yields the same contiguous slice in display order.
+        assert_eq!(
+            range_ids(&ids, Some("id-3"), "id-1"),
+            vec!["id-1".to_string(), "id-2".to_string(), "id-3".to_string()]
+        );
+        // Ctrl+Shift keeps the range semantics: the anchor stays put.
+        let (selected, anchor) =
+            apply_pick(&ids, "id-3", Some("id-1"), true, true, &HashSet::new());
+        assert_eq!(selected.len(), 3);
+        assert_eq!(anchor.as_deref(), Some("id-1"));
+    }
+
+    #[test]
+    fn shift_click_without_a_live_anchor_acts_like_a_plain_click() {
+        let ids = ids(3);
+        assert_eq!(range_ids(&ids, None, "id-2"), vec!["id-2".to_string()]);
+        assert_eq!(
+            range_ids(&ids, Some("gone"), "id-1"),
+            vec!["id-1".to_string()]
+        );
+        let (selected, anchor) = apply_pick(&ids, "id-2", None, false, true, &HashSet::new());
+        assert_eq!(selected, HashSet::from(["id-2".to_string()]));
+        assert_eq!(anchor.as_deref(), Some("id-2"));
+    }
+
+    #[test]
+    fn status_always_shows_selection_count() {
+        assert_eq!(selection_status_text(0, ""), "");
+        assert_eq!(selection_status_text(0, "已删除 1 张"), "已删除 1 张");
+        assert_eq!(selection_status_text(3, ""), "已选 3 张");
+        assert_eq!(
+            selection_status_text(2, "复制失败：x"),
+            "已选 2 张 · 复制失败：x"
+        );
     }
 }

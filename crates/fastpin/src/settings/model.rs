@@ -117,6 +117,7 @@ impl Page {
         matches!(
             self,
             Page::Screenshot
+                | Page::Pin
                 | Page::Output
                 | Page::Appearance
                 | Page::Hotkey
@@ -448,7 +449,7 @@ pub const ROWS: &[RowMeta] = &[
     RowMeta {
         page: Page::Pin,
         title: "贴图默认行为",
-        desc: "当前版本暂不支持配置贴图的默认缩放、透明度或关闭方式。",
+        desc: "贴图默认缩放锚点、关闭确认与关闭历史可配置；透明度暂不支持。",
     },
     // 外观
     RowMeta {
@@ -663,6 +664,10 @@ pub fn reset_page(settings: &mut Settings, page: Page) -> bool {
             settings.screenshot.show_shortcut_hints = default.screenshot.show_shortcut_hints;
             true
         }
+        Page::Pin => {
+            settings.pin = default.pin.clone();
+            true
+        }
         Page::Output => {
             settings.screenshot.save_dir = default.screenshot.save_dir.clone();
             settings.screenshot.watermark = default.screenshot.watermark.clone();
@@ -728,6 +733,7 @@ pub fn copy_page_fields(dst: &mut Settings, src: &Settings, page: Page) {
             d.show_info_bar = s.show_info_bar;
             d.show_shortcut_hints = s.show_shortcut_hints;
         }
+        Page::Pin => dst.pin = src.pin.clone(),
         Page::Output => {
             let d = &mut dst.screenshot;
             let s = &src.screenshot;
@@ -808,6 +814,27 @@ mod tests {
         s.screenshot.show_magnifier = false;
         s.screenshot.show_info_bar = false;
         s.screenshot.show_shortcut_hints = false;
+        // 贴图页字段也要全部偏离默认值，否则重置测试是假阳性。
+        s.pin.show_magnifier = true;
+        s.pin.topmost = false;
+        s.pin.shadow = false;
+        s.pin.titlebar = true;
+        s.pin.lock = crate::config::PinLock::Size;
+        s.pin.double_click_close = false;
+        s.pin.thumb_toggle = false;
+        s.pin.wheel_step = 20;
+        s.pin.close_confirm = false;
+        s.pin.close_history_limit = 100;
+        s.pin.universal_text = false;
+        s.pin.universal_file = false;
+        s.pin.universal_image = false;
+        s.pin.auto_recognize = true;
+        s.pin.auto_copy = true;
+        s.pin.group_switch = crate::config::PinGroupSwitch::HideOthers;
+        s.pin.auto_join_group = crate::config::PinAutoJoin::Current;
+        s.pin.toolbar_position = crate::config::ToolbarPosition::Bottom;
+        s.pin.panel_position = crate::config::PanelPosition::Right;
+        s.pin.zoom_mode = crate::config::PinZoomMode::Center;
         s.screenshot.export.auto_save = true;
         s.screenshot.export.auto_copy = false;
         s.screenshot.export.format = crate::config::ImageFormat::Jpeg;
@@ -1133,6 +1160,7 @@ mod tests {
                 expected.screenshot.show_info_bar = d.show_info_bar;
                 expected.screenshot.show_shortcut_hints = d.show_shortcut_hints;
             }
+            Page::Pin => expected.pin = default.pin.clone(),
             Page::Output => {
                 let d = &default.screenshot;
                 expected.screenshot.save_dir = d.save_dir.clone();

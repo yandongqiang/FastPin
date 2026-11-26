@@ -71,8 +71,6 @@ pub const CUSTOMIZABLE: &[&str] = &[
     COLOR,
     SELECT,
     SHAPE,
-    RECT,
-    ELLIPSE,
     LINE,
     ARROW_GROUP,
     ARROW,
@@ -416,7 +414,9 @@ pub fn is_visible(id: &str, hidden: &[String]) -> bool {
     if id == COPY {
         return false;
     }
-    if id == COMPLETE || id == CANCEL {
+    // 矩形/圆形属于常驻形状工具：设置页不再提供开关，旧配置里的隐藏值也
+    // 必须忽略，避免升级后工具栏少一块。
+    if id == RECT || id == ELLIPSE || id == COMPLETE || id == CANCEL {
         return true;
     }
     !CUSTOMIZABLE.contains(&id) || !hidden.iter().any(|h| h == id)
@@ -436,6 +436,9 @@ pub fn separator_x(index: usize) -> f64 {
 }
 
 /// Prefer below the selection; flip above if it would leave `monitor`; clamp inside.
+/// 旧版固定「跟随选区」定位，现由 `place_toolbar_with_policy` 取代；保留
+/// 供外部脚本/测试对照，暂不参与运行时布局。
+#[allow(dead_code)]
 pub fn place_toolbar(
     selection: Rect,
     toolbar_width: f64,
@@ -774,9 +777,19 @@ mod tests {
     }
 
     #[test]
+    fn shape_subbuttons_are_not_customizable() {
+        // 真正渲染矩形/圆形的是形状选择器的两个子按钮；它们从不经过显隐列表。
+        for id in [RECT, ELLIPSE, SHAPE_RECT, SHAPE_ELLIPSE] {
+            assert!(!CUSTOMIZABLE.contains(&id), "{id} 不应出现在设置页");
+            assert!(!PHASE1_ITEMS.contains(&id), "{id} 不应出现在截屏工具栏");
+        }
+    }
+
+    #[test]
     fn default_hidden_matches_csharp() {
         let hidden = hidden(DEFAULT_HIDDEN);
-        assert!(!is_visible(ELLIPSE, &hidden));
+        assert!(is_visible(ELLIPSE, &hidden), "矩形/圆形常驻显示");
+        assert!(is_visible(RECT, &hidden), "矩形/圆形常驻显示");
         assert!(!is_visible(TEXT, &hidden));
         assert!(!is_visible(REDO, &hidden));
         assert!(is_visible(COLOR, &hidden));

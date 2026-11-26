@@ -261,6 +261,30 @@ enum SelectId {
     ElementDetection,
     ToolbarPosition,
     PanelPosition,
+    // 贴图页下拉。
+    PinLock,
+    PinGroupSwitch,
+    PinAutoJoin,
+    PinToolbarPosition,
+    PinPanelPosition,
+    PinZoomMode,
+}
+
+/// 贴图页的布尔开关，共用一套「取反后写回」逻辑。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PinToggle {
+    ShowMagnifier,
+    Topmost,
+    Shadow,
+    Titlebar,
+    DoubleClickClose,
+    ThumbToggle,
+    CloseConfirm,
+    UniversalText,
+    UniversalFile,
+    UniversalImage,
+    AutoRecognize,
+    AutoCopy,
 }
 
 /// 截屏页的布尔开关，共用一套「取反后写回」逻辑。
@@ -443,8 +467,11 @@ fn pdf_orientation_label(v: crate::config::Orientation) -> &'static str {
 /// across frames instead of paying that cost on every render.
 struct EngineStatusSnapshot {
     available: bool,
-    /// Resolved model directory, already formatted for display.
+    /// 实际生效的目录（与页面上的“默认安装位置”可能不同，例如调试回退或
+    /// 自定义目录）。
     dir: SharedString,
+    /// 采样一次的默认安装位置，避免每帧调用 current_exe()。
+    default_dir: SharedString,
     label: &'static str,
 }
 
@@ -463,6 +490,10 @@ impl From<crate::ocr::EngineStatus> for EngineStatusSnapshot {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "未找到".into())
+                .into(),
+            default_dir: crate::ocr::default_models_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "程序目录\\models\\v6".into())
                 .into(),
             label: engine.label,
         }
@@ -535,6 +566,8 @@ pub struct SettingsView {
     pdf_margin_left: Entity<TextInput>,
     pdf_margin_right: Entity<TextInput>,
     pdf_quality: Entity<TextInput>,
+    pin_wheel_step: Entity<TextInput>,
+    pin_close_history: Entity<TextInput>,
     search: Entity<TextInput>,
     /// The global reset asks for a second click; a single stray press must not
     /// wipe every setting.
@@ -634,6 +667,7 @@ impl SettingsView {
         let settings = crate::config::get();
         let theme_options = theme::available_themes();
         let t = settings.translation.clone();
+        let pin_defaults = settings.pin.clone();
         let saved_api_key = crate::translate::api_key().unwrap_or_default();
 
         let base_url =
@@ -903,6 +937,41 @@ impl SettingsView {
             },
         );
 
+        let pin_wheel_step = Self::number_field(
+            cx,
+            &mut subscriptions,
+            pin_defaults.wheel_step.to_string(),
+            "10",
+            |s, raw| {
+                let Some(v) = parse_u32_clamped(raw, 1, 50) else {
+                    return false;
+                };
+                if s.pin.wheel_step != v {
+                    s.pin.wheel_step = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let pin_close_history = Self::number_field(
+            cx,
+            &mut subscriptions,
+            pin_defaults.close_history_limit.to_string(),
+            "25",
+            |s, raw| {
+                let Some(v) = parse_u32_clamped(raw, 0, 200) else {
+                    return false;
+                };
+                if s.pin.close_history_limit != v {
+                    s.pin.close_history_limit = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
         // Every field compares before storing: the inputs notify on cursor moves
         // too, and writing the file on a click would be pure churn.
         subscriptions.push(cx.observe(&base_url, |this, input, cx| {
@@ -1018,6 +1087,8 @@ impl SettingsView {
             pdf_margin_left,
             pdf_margin_right,
             pdf_quality,
+            pin_wheel_step,
+            pin_close_history,
             search,
             confirm_reset_all: false,
             http_warn_confirm: false,
@@ -1213,6 +1284,12 @@ impl SettingsView {
         self.pdf_quality.update(cx, |input, cx| {
             input.set_text(p.image_quality.to_string(), cx)
         });
+        let wheel = self.settings.pin.wheel_step.to_string();
+        let history = self.settings.pin.close_history_limit.to_string();
+        self.pin_wheel_step
+            .update(cx, |input, cx| input.set_text(wheel, cx));
+        self.pin_close_history
+            .update(cx, |input, cx| input.set_text(history, cx));
         self.http_warn_confirm = false;
     }
 
@@ -2052,6 +2129,10 @@ impl SettingsView {
     }
 
     fn toggle_toolbar_item(&mut self, id: &str, cx: &mut Context<Self>) {
+        // 矩形/圆形常驻显示，任何调用入口都不允许再隐藏它们。
+        if id == toolbar::RECT || id == toolbar::ELLIPSE {
+            return;
+        }
         let hidden = &mut self.settings.screenshot.hidden_toolbar_items;
         match hidden.iter().position(|h| h == id) {
             Some(i) => {
@@ -2074,6 +2155,54 @@ impl SettingsView {
         };
         *slot = !*slot;
         self.persist(cx);
+    }
+
+    fn toggle_pin_bool(&mut self, which: PinToggle, cx: &mut Context<Self>) {
+        let slot = match which {
+            PinToggle::ShowMagnifier => &mut self.settings.pin.show_magnifier,
+            PinToggle::Topmost => &mut self.settings.pin.topmost,
+            PinToggle::Shadow => &mut self.settings.pin.shadow,
+            PinToggle::Titlebar => &mut self.settings.pin.titlebar,
+            PinToggle::DoubleClickClose => &mut self.settings.pin.double_click_close,
+            PinToggle::ThumbToggle => &mut self.settings.pin.thumb_toggle,
+            PinToggle::CloseConfirm => &mut self.settings.pin.close_confirm,
+            PinToggle::UniversalText => &mut self.settings.pin.universal_text,
+            PinToggle::UniversalFile => &mut self.settings.pin.universal_file,
+            PinToggle::UniversalImage => &mut self.settings.pin.universal_image,
+            PinToggle::AutoRecognize => &mut self.settings.pin.auto_recognize,
+            PinToggle::AutoCopy => &mut self.settings.pin.auto_copy,
+        };
+        *slot = !*slot;
+        self.persist(cx);
+    }
+
+    fn pin_toggle_row(
+        &self,
+        cx: &mut Context<Self>,
+        id: &'static str,
+        title: &'static str,
+        desc: &'static str,
+        value: bool,
+        which: PinToggle,
+    ) -> gpui::Div {
+        widgets::row(title, desc).child(widgets::control(widgets::toggle(id, value).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| this.toggle_pin_bool(which, cx)),
+        )))
+    }
+
+    fn pin_check_box(
+        &self,
+        cx: &mut Context<Self>,
+        id: &'static str,
+        label: &'static str,
+        value: bool,
+        which: PinToggle,
+    ) -> gpui::Stateful<gpui::Div> {
+        widgets::checkbox(id, label, value).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| this.toggle_pin_bool(which, cx)),
+        )
     }
 
     /// 「记录截屏历史」的四类截屏复选框；配置里的 vec 就是唯一存储。
@@ -4248,7 +4377,201 @@ impl SettingsView {
     }
 
     fn page_pin(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        widgets::rows(vec![
+        use crate::config::{PinAutoJoin, PinGroupSwitch, PinLock, PinZoomMode, ToolbarPosition};
+
+        let p = &self.settings.pin;
+        let mut rows: Vec<gpui::Div> = vec![
+            self.pin_toggle_row(
+                cx,
+                "pin-magnifier",
+                "默认放大镜",
+                "新建贴图时默认开启像素放大镜。",
+                p.show_magnifier,
+                PinToggle::ShowMagnifier,
+            ),
+            self.pin_toggle_row(
+                cx,
+                "pin-topmost",
+                "默认窗口置顶",
+                "新建贴图时默认保持窗口置顶。",
+                p.topmost,
+                PinToggle::Topmost,
+            ),
+            self.pin_toggle_row(
+                cx,
+                "pin-shadow",
+                "默认窗口阴影",
+                "新建贴图时默认显示窗口阴影。",
+                p.shadow,
+                PinToggle::Shadow,
+            ),
+            self.pin_toggle_row(
+                cx,
+                "pin-titlebar",
+                "默认显示标题栏",
+                "新建贴图时默认显示独立标题栏。",
+                p.titlebar,
+                PinToggle::Titlebar,
+            ),
+            self.enum_select_row(
+                cx,
+                SelectId::PinLock,
+                "默认锁定",
+                "限制贴图窗口的拖动或缩放。",
+                p.lock,
+                &PinLock::ALL,
+                |v| match v {
+                    PinLock::None => "none",
+                    PinLock::Position => "position",
+                    PinLock::Size => "size",
+                },
+                PinLock::label,
+                |s: &mut Settings, v: PinLock| {
+                    if s.pin.lock != v {
+                        s.pin.lock = v;
+                        true
+                    } else {
+                        false
+                    }
+                },
+            ),
+            self.pin_toggle_row(
+                cx,
+                "pin-double-close",
+                "双击关闭贴图",
+                "在贴图窗口空白区域双击时关闭当前贴图。",
+                p.double_click_close,
+                PinToggle::DoubleClickClose,
+            ),
+            self.pin_toggle_row(
+                cx,
+                "pin-thumb-toggle",
+                "鼠标切换缩略图",
+                "按住左键时点击右键，可在原图与缩略图之间切换。",
+                p.thumb_toggle,
+                PinToggle::ThumbToggle,
+            ),
+            widgets::row("滚轮缩放步长", "每次滚轮缩放调整的百分比，范围 1-50。").child(
+                widgets::control(div().w(px(90.)).child(self.pin_wheel_step.clone())),
+            ),
+            self.pin_toggle_row(
+                cx,
+                "pin-close-confirm",
+                "关闭时确认",
+                "关闭贴图前弹出确认提示，避免误关。",
+                p.close_confirm,
+                PinToggle::CloseConfirm,
+            ),
+            widgets::row(
+                "关闭历史保留数量",
+                "关闭的贴图可通过快捷键逐张恢复，最多保留 200 张，0 表示不记录。",
+            )
+            .child(widgets::control(
+                div().w(px(90.)).child(self.pin_close_history.clone()),
+            )),
+        ];
+
+        rows.push(
+            widgets::row("万能贴图类型", "控制万能贴图快捷键可创建的内容类型。").child(
+                widgets::control(div().flex().flex_row().gap(px(8.)).children([
+                    self.pin_check_box(
+                        cx,
+                        "pin-universal-text",
+                        "文本贴图",
+                        p.universal_text,
+                        PinToggle::UniversalText,
+                    ),
+                    self.pin_check_box(
+                        cx,
+                        "pin-universal-file",
+                        "文件贴图",
+                        p.universal_file,
+                        PinToggle::UniversalFile,
+                    ),
+                    self.pin_check_box(
+                        cx,
+                        "pin-universal-image",
+                        "图片贴图",
+                        p.universal_image,
+                        PinToggle::UniversalImage,
+                    ),
+                ])),
+            ),
+        );
+        rows.push(self.pin_toggle_row(
+            cx,
+            "pin-auto-recognize",
+            "自动识别文字",
+            "新建图片贴图后自动识别文字。",
+            p.auto_recognize,
+            PinToggle::AutoRecognize,
+        ));
+        rows.push(self.pin_toggle_row(
+            cx,
+            "pin-auto-copy",
+            "自动复制到剪贴板",
+            "贴图创建成功后，自动把贴图图片复制到剪贴板。",
+            p.auto_copy,
+            PinToggle::AutoCopy,
+        ));
+        rows.push(self.enum_select_row(
+            cx,
+            SelectId::PinGroupSwitch,
+            "切换分组时",
+            "切换一个分组时，其他已显示分组的处理方式。",
+            p.group_switch,
+            &PinGroupSwitch::ALL,
+            |v| match v {
+                PinGroupSwitch::KeepOthers => "keepOthers",
+                PinGroupSwitch::HideOthers => "hideOthers",
+            },
+            PinGroupSwitch::label,
+            |s: &mut Settings, v: PinGroupSwitch| {
+                if s.pin.group_switch != v {
+                    s.pin.group_switch = v;
+                    // 切回「保留其他分组」时，之前被隐藏的窗口必须立刻恢复。
+                    if v != PinGroupSwitch::HideOthers {
+                        crate::pin::restore_all_hidden();
+                    }
+                    true
+                } else {
+                    false
+                }
+            },
+        ));
+        rows.push(self.enum_select_row(
+            cx,
+            SelectId::PinAutoJoin,
+            "新贴图自动加入分组",
+            "新建贴图时是否自动加入当前分组。",
+            p.auto_join_group,
+            &PinAutoJoin::ALL,
+            |v| match v {
+                PinAutoJoin::None => "none",
+                PinAutoJoin::Current => "current",
+            },
+            PinAutoJoin::label,
+            |s: &mut Settings, v: PinAutoJoin| {
+                if s.pin.auto_join_group != v {
+                    s.pin.auto_join_group = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        ));
+        rows.push(
+            widgets::row("贴图分组管理", "创建和管理贴图分组。").child(widgets::control(
+                widgets::button("pin-manage-groups", "管理分组...").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.ok("把一张贴图拖到另一张贴图上即可成组；无需单独管理窗口");
+                        cx.notify();
+                    }),
+                ),
+            )),
+        );
+        rows.push(
             widgets::row(
                 "自定义工具栏",
                 "贴图编辑沿用「截屏 → 工具栏按钮」的显隐设置。",
@@ -4259,11 +4582,65 @@ impl SettingsView {
                     cx.listener(|this, _, _, cx| this.go_page(Page::Screenshot, cx)),
                 ),
             )),
-            widgets::unsupported_row(
-                "贴图默认行为",
-                "当前版本暂不支持配置贴图的默认缩放、透明度或关闭方式。",
-            ),
-        ])
+        );
+        rows.push(self.enum_select_row(
+            cx,
+            SelectId::PinToolbarPosition,
+            "工具栏位置",
+            "选择跟随贴图、记住位置，或固定在贴图所在屏幕的顶部/底部。",
+            p.toolbar_position,
+            &ToolbarPosition::ALL,
+            ToolbarPosition::id,
+            ToolbarPosition::label,
+            |s: &mut Settings, v: ToolbarPosition| {
+                if s.pin.toolbar_position != v {
+                    s.pin.toolbar_position = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        ));
+        rows.push(self.enum_select_row(
+            cx,
+            SelectId::PinPanelPosition,
+            "参数面板位置",
+            "选择跟随贴图、记住位置，或固定在贴图所在屏幕的左侧/右侧。",
+            p.panel_position,
+            &crate::config::PanelPosition::ALL,
+            crate::config::PanelPosition::id,
+            crate::config::PanelPosition::label,
+            |s: &mut Settings, v: crate::config::PanelPosition| {
+                if s.pin.panel_position != v {
+                    s.pin.panel_position = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        ));
+        rows.push(self.enum_select_row(
+            cx,
+            SelectId::PinZoomMode,
+            "缩放模式",
+            "选择贴图缩放时保持左上角或中心位置不变。",
+            p.zoom_mode,
+            &PinZoomMode::ALL,
+            |v| match v {
+                PinZoomMode::TopLeft => "topLeft",
+                PinZoomMode::Center => "center",
+            },
+            PinZoomMode::label,
+            |s: &mut Settings, v: PinZoomMode| {
+                if s.pin.zoom_mode != v {
+                    s.pin.zoom_mode = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        ));
+        widgets::rows(rows)
     }
 
     fn page_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4467,7 +4844,7 @@ impl SettingsView {
         let engine = &self.engine_status;
         let models: SharedString = match &self.settings.ocr.models_dir {
             Some(p) => p.display().to_string().into(),
-            None => format!("默认：{}", engine.dir).into(),
+            None => format!("默认：{}", engine.default_dir).into(),
         };
         div()
             .flex()
@@ -4501,7 +4878,11 @@ impl SettingsView {
                             )),
                     ),
                 ),
-                widgets::stack("模型目录", "覆盖内置的 models\\v6 目录，留空使用默认位置。").child(
+                widgets::stack(
+                    "模型目录",
+                    "默认使用程序安装位置的 models\\v6；这里可覆盖为其它目录。",
+                )
+                .child(
                     div()
                         .flex()
                         .flex_row()
@@ -4521,9 +4902,10 @@ impl SettingsView {
                         ),
                 ),
             ]))
-            .child(widgets::hint(
-                "需要检测、识别与字典三个模型文件同时存在且非空，取字与翻译才可用。",
-            ))
+            .child(widgets::hint(format!(
+                "当前生效目录：{}；需要检测、识别与字典三个模型文件同时存在且非空，取字与翻译才可用。",
+                engine.dir
+            )))
     }
 
     fn page_data(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5317,6 +5699,8 @@ fn settings_persist_merge(
     merged.translation = snapshot.translation.clone();
     merged.history = snapshot.history.clone();
     merged.hotkeys = snapshot.hotkeys.clone();
+    // 贴图设置只有本页写入；贴图行为读取的是持久化后的配置。
+    merged.pin = snapshot.pin.clone();
 
     // 从 latest 出发：共享字段未编辑时自然保留其它窗口的写入。本页独占的
     // 显示类字段整份用快照覆盖；共享字段再用 keep_edited 逐字段判断。

@@ -3,7 +3,8 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
 
@@ -20,13 +21,15 @@ use windows::Win32::System::Com::StructuredStorage::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, IStream, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+    SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
 };
-use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT, PROPBAG2_TYPE_DATA};
+use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT, PROPBAG2_TYPE_DATA};
 use windows::Win32::System::Variant::{VARIANT, VT_R4};
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
 use crate::config::ImageFormat;
 use crate::error::{Error, Result};
@@ -555,6 +558,235 @@ pub fn set_clipboard_text(text: &str) -> Result<()> {
     }
 }
 
+/// Builds the payload that `SetClipboardData(CF_HDROP)` expects:
+///
+/// ```text
+/// DROPFILES | path1 UTF-16 NUL | ... | pathN UTF-16 NUL | NUL
+/// ```
+///
+/// `pFiles` is the byte offset to the file list, `fWide` is TRUE so the names
+/// are UTF-16, and the list ends with *two* NULs (the last path's own NUL plus
+/// the list terminator). Kept pure — no clipboard, no global memory — so the
+/// layout can be verified by a unit test.
+fn dropfiles_payload(paths: &[PathBuf]) -> Option<Vec<u8>> {
+    use windows::Win32::UI::Shell::DROPFILES;
+
+    // An empty CF_HDROP has no meaningful file list; refuse it up front.
+    if paths.is_empty() {
+        return None;
+    }
+    // DROPFILES is repr(C, packed(1)): DWORD + POINT(2 x LONG) + BOOL + BOOL.
+    let header = std::mem::size_of::<DROPFILES>();
+    debug_assert_eq!(header, 20);
+    let mut bytes: Vec<u8> = Vec::new();
+
+    // pFiles: offset from the start of DROPFILES to the first path.
+    bytes.extend_from_slice(&(header as u32).to_le_bytes());
+    // pt: POINT { x, y } — meaningful for drag/drop, ignored on the clipboard.
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    // fNC: FALSE — the point is not in the non-client area.
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    // fWide: TRUE — paths are UTF-16, not ANSI.
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    debug_assert_eq!(bytes.len(), header);
+
+    for path in paths {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0); // per-path terminator
+        let len = wide.len().checked_mul(2)?;
+        BUDGET.checked_len(len as u64).ok()?;
+        bytes.try_reserve_exact(len).ok()?;
+        for unit in wide {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    // Extra NUL terminating the list itself (the "double NUL").
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    BUDGET.checked_len(bytes.len() as u64).ok()?;
+    Some(bytes)
+}
+
+/// Puts several files on the clipboard as `CF_HDROP`, exactly like Explorer's
+/// "Copy": chat apps and documents paste them as separate image files instead
+/// of a single flattened bitmap. The HGLOBAL must be created, filled and handed
+/// to `SetClipboardData` while the clipboard is open, so all of it happens in
+/// one critical section and `CloseClipboard` runs before any early return.
+pub fn set_clipboard_files(paths: &[PathBuf]) -> Result<()> {
+    let bytes = dropfiles_payload(paths).ok_or_else(|| Error::new("没有可复制的文件"))?;
+    unsafe {
+        let hg = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len())?;
+        let ptr = GlobalLock(hg) as *mut u8;
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hg));
+            return Err(Error::new("GlobalLock failed for CF_HDROP"));
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+        let _ = GlobalUnlock(hg);
+
+        if let Err(e) = open_clipboard_with_retry() {
+            let _ = GlobalFree(Some(hg));
+            return Err(e.into());
+        }
+        let _ = EmptyClipboard();
+        let handed_over = SetClipboardData(CF_HDROP.0 as u32, Some(HANDLE(hg.0)));
+        // Close before reporting, or an early return would leave the system
+        // clipboard locked by this process.
+        let _ = CloseClipboard();
+        match handed_over {
+            // On success the clipboard owns the block; freeing it is a double free.
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = GlobalFree(Some(hg));
+                Err(e.into())
+            }
+        }
+    }
+}
+
+/// 从剪贴板读取文本（仅 CF_UNICODETEXT）。失败/无内容返回 None。
+pub fn clipboard_text() -> Option<String> {
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let handle = GetClipboardData(CF_UNICODETEXT.0 as u32).ok();
+        let result = handle.and_then(|h| {
+            let hg = HGLOBAL(h.0);
+            let base = GlobalLock(hg);
+            if base.is_null() {
+                return None;
+            }
+            // 剪贴板文本也设上限：文本贴图还会被 text_raster 二次截断，
+            // 这里先拒绝异常巨大的块，避免一次性扫完整个 HGLOBAL。
+            const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+            let bytes = GlobalSize(hg);
+            if bytes == 0 || bytes > MAX_CLIPBOARD_TEXT_BYTES {
+                let _ = GlobalUnlock(hg);
+                return None;
+            }
+            let max_units = bytes / 2;
+            let units = slice::from_raw_parts(base as *const u16, max_units);
+            let len = units.iter().position(|&u| u == 0).unwrap_or(max_units);
+            let text = String::from_utf16_lossy(&units[..len]);
+            let _ = GlobalUnlock(hg);
+            Some(text)
+        });
+        let _ = CloseClipboard();
+        result.filter(|text| !text.is_empty())
+    }
+}
+
+/// 从剪贴板读取 CF_HDROP 文件列表。
+pub fn clipboard_files() -> Option<Vec<PathBuf>> {
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let handle = GetClipboardData(CF_HDROP.0 as u32).ok();
+        let result = handle.and_then(|h| {
+            let drop = HDROP(h.0);
+            let count = DragQueryFileW(drop, u32::MAX, None);
+            if count == 0 {
+                return None;
+            }
+            let mut files = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let chars = DragQueryFileW(drop, i, None) as usize;
+                if chars == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u16; chars + 1];
+                DragQueryFileW(drop, i, Some(&mut buf[..]));
+                files.push(PathBuf::from(std::ffi::OsString::from_wide(&buf[..chars])));
+            }
+            (!files.is_empty()).then_some(files)
+        });
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+/// 从剪贴板读取 32bpp/24bpp CF_DIB，返回紧致 BGRA 与尺寸。
+pub fn clipboard_bgra() -> Option<(Vec<u8>, u32, u32, u32)> {
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let handle = GetClipboardData(CF_DIB.0 as u32).ok();
+        let result = handle.and_then(|h| {
+            let hg = HGLOBAL(h.0);
+            let base = GlobalLock(hg);
+            if base.is_null() {
+                return None;
+            }
+            let total = GlobalSize(hg) as u64;
+            if total < size_of::<BITMAPINFOHEADER>() as u64 {
+                let _ = GlobalUnlock(hg);
+                return None;
+            }
+            let header = ptr::read_unaligned(base as *const BITMAPINFOHEADER);
+            let header_size = header.biSize as u64;
+            // 只接受标准 40 字节头与常见 V4/V5 扩展头；未知布局不能猜像素偏移。
+            if !matches!(header_size, 40 | 108 | 124) {
+                let _ = GlobalUnlock(hg);
+                return None;
+            }
+            let w = header.biWidth.unsigned_abs() as u64;
+            let h = header.biHeight.unsigned_abs() as u64;
+            let bpp = (header.biPlanes as u64).checked_mul(header.biBitCount as u64)?;
+            if w == 0 || h == 0 || header.biCompression != BI_RGB.0 || !(bpp == 24 || bpp == 32) {
+                let _ = GlobalUnlock(hg);
+                return None;
+            }
+            // 所有尺寸先过统一预算：越界乘法与超大分配在这里一并拒绝。
+            BUDGET.checked_dims(w, h).ok()?;
+            let out_len = BUDGET.checked_bytes(w, h, 4).ok()?;
+            let palette = (header.biClrUsed as u64).checked_mul(4)?;
+            let offset = header_size.checked_add(palette)?;
+            let stride = w.checked_mul(bpp)?.div_ceil(32).checked_mul(4)?;
+            let data_len = stride.checked_mul(h)?;
+            let needed = offset.checked_add(data_len)?;
+            if needed > total
+                || usize::try_from(offset).is_err()
+                || usize::try_from(data_len).is_err()
+            {
+                let _ = GlobalUnlock(hg);
+                return None;
+            }
+            let offset = offset as usize;
+            let stride = stride as usize;
+            let src = slice::from_raw_parts((base as *const u8).add(offset), data_len as usize);
+            let top_down = header.biHeight < 0;
+            let mut out = vec![0u8; out_len];
+            let (w_usize, h_usize) = (w as usize, h as usize);
+            for y in 0..h_usize {
+                let row = if top_down { y } else { (h_usize - 1) - y };
+                let line = &src[row * stride..(row + 1) * stride];
+                for x in 0..w_usize {
+                    let s = x * (bpp as usize / 8);
+                    let d = (y * w_usize + x) * 4;
+                    // 用 get_mut 保证任何算术意外都不会写成越界索引。
+                    let Some(pixel) = out.get_mut(d..d + 4) else {
+                        let _ = GlobalUnlock(hg);
+                        return None;
+                    };
+                    pixel.copy_from_slice(&[
+                        line[s],
+                        line[s + 1],
+                        line[s + 2],
+                        if bpp == 32 { line[s + 3] } else { 255 },
+                    ]);
+                }
+            }
+            let _ = GlobalUnlock(hg);
+            Some((out, w as u32, h as u32, (w as u32).saturating_mul(4)))
+        });
+        let _ = CloseClipboard();
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,5 +944,55 @@ mod tests {
         // One pixel over a side, and a wrapped u32 product, are refused.
         assert_eq!(dib_bytes(16_385, 1), None);
         assert_eq!(dib_bytes(u32::MAX, u32::MAX), None);
+    }
+
+    /// Pure CF_HDROP layout check — no clipboard access. The header must be a
+    /// valid DROPFILES, and the file list must be UTF-16 with a double NUL.
+    #[test]
+    fn dropfiles_payload_is_unicode_and_double_nul_terminated() {
+        use windows::Win32::UI::Shell::DROPFILES;
+
+        assert!(dropfiles_payload(&[]).is_none(), "empty lists are refused");
+        let paths = vec![
+            PathBuf::from(r"C:\pics\一.png"),
+            PathBuf::from(r"D:\pics\second.jpg"),
+        ];
+        let bytes = dropfiles_payload(&paths).expect("payload");
+        let header_size = std::mem::size_of::<DROPFILES>();
+        assert_eq!(header_size, 20);
+        assert!(bytes.len() >= header_size);
+
+        let header: DROPFILES =
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const DROPFILES) };
+        assert_eq!(
+            header.pFiles as usize, header_size,
+            "wrong file-list offset"
+        );
+        // DROPFILES is packed(1): copy the packed fields out before asserting,
+        // otherwise `assert_eq!` would take an unaligned reference to them.
+        let f_nc = header.fNC.0;
+        let f_wide = header.fWide.0;
+        assert_eq!(f_nc, 0, "clipboard data is not a non-client drag");
+        assert_eq!(f_wide, 1, "paths must be UTF-16");
+
+        let list = &bytes[header_size..];
+        assert_eq!(list.len() % 2, 0, "UTF-16 payload must be word aligned");
+        let units: Vec<u16> = list
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let expected: Vec<u16> = paths
+            .iter()
+            .flat_map(|p| {
+                let mut wide: Vec<u16> = p.as_os_str().encode_wide().collect();
+                wide.push(0);
+                wide
+            })
+            .chain([0])
+            .collect();
+        assert_eq!(units, expected, "paths must be NUL separated + list NUL");
+        assert_eq!(units.iter().rev().take(2).filter(|&&u| u == 0).count(), 2);
     }
 }

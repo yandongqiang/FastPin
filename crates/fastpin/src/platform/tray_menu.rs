@@ -59,6 +59,7 @@ pub(crate) const ID_FULL: u32 = 2;
 pub(crate) const ID_COPY: u32 = 3;
 pub(crate) const ID_SETTINGS: u32 = 4;
 pub(crate) const ID_CLOSE_ALL: u32 = 5;
+pub(crate) const ID_UNIVERSAL: u32 = 6;
 pub(crate) const ID_EXIT: u32 = 9;
 
 /// Left-hand line icons. `TOOLBAR_ICONS` / `assets.rs` are SVG paths consumed
@@ -129,6 +130,7 @@ pub fn build(region: &str, fullscreen: &str, copy_only: &str, pin_count: usize) 
         action(ID_REGION, MenuIcon::Scissors, "区域截图", region),
         action(ID_FULL, MenuIcon::Monitor, "全屏截图", fullscreen),
         action(ID_COPY, MenuIcon::Copy, "仅复制", copy_only),
+        action(ID_UNIVERSAL, MenuIcon::Copy, "万能贴图", ""),
         action(
             ID_CLOSE_ALL,
             MenuIcon::Close,
@@ -924,8 +926,8 @@ mod tests {
         let items = build("Ctrl+Alt+A", "PrtSc", "Ctrl+Alt+W", 0);
         assert_eq!(
             items.len(),
-            10,
-            "4 actions + sep + settings + sep + exit + sep + version"
+            11,
+            "5 actions + sep + settings + sep + exit + sep + version"
         );
 
         let ids: Vec<u32> = items.iter().map(|i| i.id).collect();
@@ -935,6 +937,7 @@ mod tests {
                 ID_REGION,
                 ID_FULL,
                 ID_COPY,
+                ID_UNIVERSAL,
                 ID_CLOSE_ALL,
                 0,
                 ID_SETTINGS,
@@ -945,13 +948,13 @@ mod tests {
             ]
         );
 
-        // Group 1 is four working actions; three separators split the groups.
-        assert!(items[..4].iter().all(|i| i.kind == MenuKind::Action));
-        assert_eq!(items[4].kind, MenuKind::Separator);
-        assert_eq!(items[5].kind, MenuKind::Action);
-        assert_eq!(items[6].kind, MenuKind::Separator);
-        assert_eq!(items[7].kind, MenuKind::Action);
-        assert_eq!(items[8].kind, MenuKind::Separator);
+        // Group 1 is five working actions; three separators split the groups.
+        assert!(items[..5].iter().all(|i| i.kind == MenuKind::Action));
+        assert_eq!(items[5].kind, MenuKind::Separator);
+        assert_eq!(items[6].kind, MenuKind::Action);
+        assert_eq!(items[7].kind, MenuKind::Separator);
+        assert_eq!(items[8].kind, MenuKind::Action);
+        assert_eq!(items[9].kind, MenuKind::Separator);
 
         // Separators carry no label / shortcut / icon.
         assert!(items
@@ -960,7 +963,7 @@ mod tests {
             .all(|i| i.label.is_empty() && i.shortcut.is_empty() && i.icon == MenuIcon::None));
 
         // Disabled version row: FastPin branding + crate version, not CitePix.
-        let v = &items[9];
+        let v = &items[10];
         assert_eq!(v.kind, MenuKind::Disabled);
         assert_eq!(v.label, format!("FastPin v{}", env!("CARGO_PKG_VERSION")));
         assert!(!v.label.contains("CitePix"));
@@ -972,13 +975,13 @@ mod tests {
         assert_eq!(items[1].shortcut, "PrtSc");
         assert_eq!(items[2].shortcut, "Ctrl+Alt+W");
         // The close-all row shows the live pin count on the right.
-        assert_eq!(items[3].shortcut, "0");
-        assert_eq!(build("A", "B", "C", 7)[3].shortcut, "7");
+        assert_eq!(items[4].shortcut, "0");
+        assert_eq!(build("A", "B", "C", 7)[4].shortcut, "7");
 
         // Every action row has a line icon; the version row has none.
-        assert!(items[..4].iter().all(|i| i.icon != MenuIcon::None));
-        assert_eq!(items[5].icon, MenuIcon::Gear);
-        assert_eq!(items[7].icon, MenuIcon::Close);
+        assert!(items[..5].iter().all(|i| i.icon != MenuIcon::None));
+        assert_eq!(items[6].icon, MenuIcon::Gear);
+        assert_eq!(items[8].icon, MenuIcon::Close);
     }
 
     /// The card is dense: 12px text, 32px rows, 12px side padding and 9px
@@ -1013,8 +1016,8 @@ mod tests {
         let items = build("a", "b", "c", 0);
         assert_eq!(
             m.height(&items),
-            32.0 * 6.0 + 8.0 * 3.0 + 28.0 + 8.0,
-            "six action rows, three separators, version row, 4px inner padding"
+            32.0 * 7.0 + 8.0 * 3.0 + 28.0 + 8.0,
+            "seven action rows, three separators, version row, 4px inner padding"
         );
 
         // One multiplication by the DPI scale, rounded to physical pixels.

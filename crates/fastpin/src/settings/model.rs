@@ -262,6 +262,21 @@ pub const ROWS: &[RowMeta] = &[
         title: "快捷键提示",
         desc: "每次开始截屏时显示当前阶段可用的快捷键提示。",
     },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "选区边框线类型",
+        desc: "选择选区边框线使用虚线或实线。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "选区边框线粗细",
+        desc: "设置选区边框线粗细，范围为 1~10 像素，边框向选区外侧扩展。",
+    },
+    RowMeta {
+        page: Page::Screenshot,
+        title: "选区边框线颜色",
+        desc: "设置截屏选区边框线的颜色。",
+    },
     // 录屏
     RowMeta {
         page: Page::Record,
@@ -674,6 +689,10 @@ pub fn reset_page(settings: &mut Settings, page: Page) -> bool {
             settings.screenshot.show_magnifier = default.screenshot.show_magnifier;
             settings.screenshot.show_info_bar = default.screenshot.show_info_bar;
             settings.screenshot.show_shortcut_hints = default.screenshot.show_shortcut_hints;
+            settings.screenshot.selection_border_style = default.screenshot.selection_border_style;
+            settings.screenshot.selection_border_width = default.screenshot.selection_border_width;
+            settings.screenshot.selection_border_color =
+                default.screenshot.selection_border_color.clone();
             true
         }
         Page::Pin => {
@@ -745,6 +764,9 @@ pub fn copy_page_fields(dst: &mut Settings, src: &Settings, page: Page) {
             d.show_magnifier = s.show_magnifier;
             d.show_info_bar = s.show_info_bar;
             d.show_shortcut_hints = s.show_shortcut_hints;
+            d.selection_border_style = s.selection_border_style;
+            d.selection_border_width = s.selection_border_width;
+            d.selection_border_color = s.selection_border_color.clone();
         }
         Page::Pin => dst.pin = src.pin.clone(),
         Page::Output => {
@@ -830,6 +852,9 @@ mod tests {
         s.screenshot.show_magnifier = false;
         s.screenshot.show_info_bar = false;
         s.screenshot.show_shortcut_hints = false;
+        s.screenshot.selection_border_style = crate::config::SelectionBorderStyle::Solid;
+        s.screenshot.selection_border_width = 8;
+        s.screenshot.selection_border_color = "#123456".into();
         // 贴图页字段也要全部偏离默认值，否则重置测试是假阳性。
         s.pin.show_magnifier = true;
         s.pin.topmost = false;
@@ -1176,6 +1201,9 @@ mod tests {
                 expected.screenshot.show_magnifier = d.show_magnifier;
                 expected.screenshot.show_info_bar = d.show_info_bar;
                 expected.screenshot.show_shortcut_hints = d.show_shortcut_hints;
+                expected.screenshot.selection_border_style = d.selection_border_style;
+                expected.screenshot.selection_border_width = d.selection_border_width;
+                expected.screenshot.selection_border_color = d.selection_border_color.clone();
             }
             Page::Pin => expected.pin = default.pin.clone(),
             Page::Output => {

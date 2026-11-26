@@ -196,6 +196,12 @@ pub struct Screenshot {
     pub show_info_bar: bool,
     /// 是否每次开始截屏时显示当前阶段可用的快捷键提示。
     pub show_shortcut_hints: bool,
+    /// 选区边框线型（实线 / 运动虚线）。默认虚线与旧版一致。
+    pub selection_border_style: SelectionBorderStyle,
+    /// 选区边框线宽（逻辑像素），1..=10；边框向选区外侧扩展。
+    pub selection_border_width: u32,
+    /// 选区边框颜色 "#RRGGBB" / "#AARRGGBB"。默认浅灰白，比黑线更显眼。
+    pub selection_border_color: String,
 }
 
 impl Default for Screenshot {
@@ -228,6 +234,9 @@ impl Default for Screenshot {
             show_magnifier: true,
             show_info_bar: true,
             show_shortcut_hints: true,
+            selection_border_style: SelectionBorderStyle::default(),
+            selection_border_width: 1,
+            selection_border_color: "#F4F4F4".into(),
         }
     }
 }
@@ -1082,6 +1091,44 @@ pub enum SmartSelectionMode {
     Disabled,
 }
 
+/// 截屏选区边框线型。虚线保留 marching-ants 动画；实线为静止描边。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SelectionBorderStyle {
+    /// 运动虚线（默认，与旧版黑色底衬 + 白色蚂蚁线一致但颜色可配）。
+    #[default]
+    #[serde(rename = "dashed")]
+    Dashed,
+    /// 静止实线。
+    #[serde(rename = "solid")]
+    Solid,
+}
+
+impl SelectionBorderStyle {
+    pub const ALL: [Self; 2] = [Self::Dashed, Self::Solid];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Dashed => "dashed",
+            Self::Solid => "solid",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Self {
+        match id {
+            "solid" => Self::Solid,
+            _ => Self::Dashed,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dashed => "虚线",
+            Self::Solid => "实线",
+        }
+    }
+}
+
 impl SmartSelectionMode {
     pub const ALL: [Self; 3] = [Self::WindowSubElement, Self::Window, Self::Disabled];
 
@@ -1486,6 +1533,16 @@ impl Annotation {
     pub fn clamped_mosaic_block(&self) -> i32 {
         self.mosaic_block.clamp(4, 64)
     }
+}
+
+/// 选区边框线宽：设置页限制 1..=10，这里再次 clamp 防止手改配置越界。
+pub fn clamped_selection_border_width(w: u32) -> u32 {
+    w.clamp(1, 10)
+}
+
+/// 选区边框颜色解析；非法或空值回退到默认浅灰白。
+pub fn selection_border_argb(text: &str) -> u32 {
+    parse_hex_color(text).unwrap_or(0xFF_F4F4F4)
 }
 
 /// "#RRGGBB" is made opaque; "#AARRGGBB" keeps its alpha.
@@ -2176,6 +2233,37 @@ fn recover_split(input: Option<&serde_json::Value>) -> crate::imagesplit::SplitS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_border_width_is_clamped_to_one_through_ten() {
+        assert_eq!(clamped_selection_border_width(0), 1);
+        assert_eq!(clamped_selection_border_width(1), 1);
+        assert_eq!(clamped_selection_border_width(10), 10);
+        assert_eq!(clamped_selection_border_width(u32::MAX), 10);
+    }
+
+    #[test]
+    fn selection_border_color_parses_argb_and_falls_back() {
+        assert_eq!(selection_border_argb("#F4F4F4"), 0xFF_F4F4F4);
+        assert_eq!(selection_border_argb("#80FFFFFF"), 0x80_FFFFFF);
+        assert_eq!(selection_border_argb(""), 0xFF_F4F4F4);
+        assert_eq!(selection_border_argb("not-a-color"), 0xFF_F4F4F4);
+    }
+
+    #[test]
+    fn selection_border_style_round_trips() {
+        for style in SelectionBorderStyle::ALL {
+            assert_eq!(SelectionBorderStyle::from_id(style.id()), style);
+        }
+        assert_eq!(
+            SelectionBorderStyle::from_id("nonsense"),
+            SelectionBorderStyle::Dashed
+        );
+        assert_eq!(
+            SelectionBorderStyle::default(),
+            SelectionBorderStyle::Dashed
+        );
+    }
 
     #[test]
     fn legacy_hidden_rect_and_ellipse_are_ignored() {

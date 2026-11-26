@@ -17,9 +17,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    actions, black, canvas, div, fill, hsla, img, outline, point, prelude::*, px, rgb, size, white,
+    actions, canvas, div, fill, hsla, img, outline, point, prelude::*, px, rgb, rgba, size, white,
     App, BorderStyle, Bounds, BoxShadow, ContentMask, Context, CursorStyle, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, ImageSource, InteractiveElement,
+    Entity, EntityInputHandler, FocusHandle, Focusable, Hsla, ImageSource, InteractiveElement,
     KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathBuilder, Pixels, Point as GpuiPoint, RenderImage, SharedString, Subscription,
     UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
@@ -5229,8 +5229,28 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
     }
     if let Some(r) = shown {
         let dest = annotate::rect_to_bounds(r, scale);
-        window.paint_quad(outline(dest, black(), BorderStyle::Solid));
-        paint_ants(window, dest, start.elapsed().as_secs_f32());
+        let shot = crate::config::get().screenshot;
+        let width =
+            crate::config::clamped_selection_border_width(shot.selection_border_width) as f32;
+        let argb = crate::config::selection_border_argb(&shot.selection_border_color);
+        // config uses AARRGGBB, gpui::rgba takes RRGGBBAA.
+        let a = (argb >> 24) as u8;
+        let rrggbb = ((argb & 0x00FF_FFFF) << 8) | u32::from(a);
+        let color = Hsla::from(rgba(rrggbb));
+        match shot.selection_border_style {
+            crate::config::SelectionBorderStyle::Solid => {
+                paint_selection_border(window, dest, color, px(width))
+            }
+            crate::config::SelectionBorderStyle::Dashed => {
+                paint_ants(
+                    window,
+                    dest,
+                    start.elapsed().as_secs_f32(),
+                    color,
+                    px(width),
+                );
+            }
+        }
         if phase == Phase::Active && has_sel {
             paint_handles(window, dest, scale);
         }
@@ -5343,8 +5363,9 @@ fn ants_dash_array(elapsed: f32) -> Vec<Pixels> {
     }
 }
 
-fn paint_ants(window: &mut Window, dest: Bounds<Pixels>, elapsed: f32) {
-    let mut path = PathBuilder::stroke(px(1.)).dash_array(&ants_dash_array(elapsed));
+/// 运动虚线边框。线宽与颜色来自设置；虚线相位仍按 marching ants 动画推进。
+fn paint_ants(window: &mut Window, dest: Bounds<Pixels>, elapsed: f32, color: Hsla, width: Pixels) {
+    let mut path = PathBuilder::stroke(width).dash_array(&ants_dash_array(elapsed));
     let origin = dest.origin;
     let tr = point(dest.origin.x + dest.size.width, dest.origin.y);
     let br = point(
@@ -5358,7 +5379,36 @@ fn paint_ants(window: &mut Window, dest: Bounds<Pixels>, elapsed: f32) {
     path.line_to(bl);
     path.close();
     if let Ok(p) = path.build() {
-        window.paint_path(p, white());
+        window.paint_path(p, color);
+    }
+}
+
+/// 实线边框：四条向选区外侧扩展的描边，宽度可配（1~10 逻辑像素）。
+fn paint_selection_border(window: &mut Window, dest: Bounds<Pixels>, color: Hsla, width: Pixels) {
+    let w = width.max(px(1.));
+    let left = dest.origin.x - w;
+    let top = dest.origin.y - w;
+    let right = dest.origin.x + dest.size.width;
+    let bottom = dest.origin.y + dest.size.height;
+    for rect in [
+        Bounds {
+            origin: point(left, top),
+            size: size(dest.size.width + w * 2., w),
+        },
+        Bounds {
+            origin: point(left, bottom),
+            size: size(dest.size.width + w * 2., w),
+        },
+        Bounds {
+            origin: point(left, top),
+            size: size(w, dest.size.height + w * 2.),
+        },
+        Bounds {
+            origin: point(right, top),
+            size: size(w, dest.size.height + w * 2.),
+        },
+    ] {
+        window.paint_quad(fill(rect, color));
     }
 }
 

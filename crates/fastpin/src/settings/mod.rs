@@ -261,6 +261,7 @@ enum SelectId {
     ElementDetection,
     ToolbarPosition,
     PanelPosition,
+    SelectionBorderStyle,
     // 贴图页下拉。
     PinLock,
     PinGroupSwitch,
@@ -568,6 +569,9 @@ pub struct SettingsView {
     pdf_quality: Entity<TextInput>,
     pin_wheel_step: Entity<TextInput>,
     pin_close_history: Entity<TextInput>,
+    /// 选区边框线宽（1~10）与颜色 hex 输入框。
+    selection_border_width: Entity<TextInput>,
+    selection_border_color: Entity<TextInput>,
     search: Entity<TextInput>,
     /// The global reset asks for a second click; a single stray press must not
     /// wipe every setting.
@@ -971,6 +975,44 @@ impl SettingsView {
                 }
             },
         );
+        let border_width_value = crate::config::clamped_selection_border_width(
+            settings.screenshot.selection_border_width,
+        );
+        let selection_border_width = Self::number_field(
+            cx,
+            &mut subscriptions,
+            border_width_value.to_string(),
+            "1",
+            |s, raw| {
+                let Some(v) = parse_u32_clamped(raw, 1, 10) else {
+                    return false;
+                };
+                if s.screenshot.selection_border_width != v {
+                    s.screenshot.selection_border_width = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let border_color_hex = settings.screenshot.selection_border_color.clone();
+        let selection_border_color = Self::number_field(
+            cx,
+            &mut subscriptions,
+            border_color_hex,
+            "#F4F4F4",
+            |s, raw| {
+                if crate::config::parse_hex_color(raw).is_none() {
+                    return false;
+                }
+                if s.screenshot.selection_border_color != raw {
+                    s.screenshot.selection_border_color = raw.into();
+                    true
+                } else {
+                    false
+                }
+            },
+        );
 
         // Every field compares before storing: the inputs notify on cursor moves
         // too, and writing the file on a click would be pure churn.
@@ -1089,6 +1131,8 @@ impl SettingsView {
             pdf_quality,
             pin_wheel_step,
             pin_close_history,
+            selection_border_width,
+            selection_border_color,
             search,
             confirm_reset_all: false,
             http_warn_confirm: false,
@@ -1290,6 +1334,15 @@ impl SettingsView {
             .update(cx, |input, cx| input.set_text(wheel, cx));
         self.pin_close_history
             .update(cx, |input, cx| input.set_text(history, cx));
+        let border = &self.settings.screenshot;
+        let border_width =
+            crate::config::clamped_selection_border_width(border.selection_border_width)
+                .to_string();
+        self.selection_border_width
+            .update(cx, |input, cx| input.set_text(border_width, cx));
+        self.selection_border_color.update(cx, |input, cx| {
+            input.set_text(border.selection_border_color.clone(), cx)
+        });
         self.http_warn_confirm = false;
     }
 
@@ -3437,6 +3490,77 @@ impl SettingsView {
         );
 
         // 10 自定义工具栏：按钮切换下方的勾选面板，逻辑沿用 toggle_toolbar_item。
+        use crate::config::SelectionBorderStyle;
+        let border_style = self.enum_select_row(
+            cx,
+            SelectId::SelectionBorderStyle,
+            "选区边框线类型",
+            "选择选区边框线使用虚线或实线。",
+            self.settings.screenshot.selection_border_style,
+            &SelectionBorderStyle::ALL,
+            SelectionBorderStyle::id,
+            SelectionBorderStyle::label,
+            |s: &mut Settings, v: SelectionBorderStyle| {
+                if s.screenshot.selection_border_style != v {
+                    s.screenshot.selection_border_style = v;
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        let border_width = self.number_row(
+            "选区边框线粗细",
+            "设置选区边框线粗细，范围为 1~10 像素，边框向选区外侧扩展。",
+            &self.selection_border_width,
+            60.,
+        );
+        let border_color_row = {
+            let current = self.settings.screenshot.selection_border_color.trim();
+            let swatches = [
+                ("#F4F4F4", 0xF4F4F4u32),
+                ("#FFFFFF", 0xFFFFFFu32),
+                ("#40A0FF", 0x40A0FFu32),
+                ("#FA3C3C", 0xFA3C3Cu32),
+            ]
+            .into_iter()
+            .map(|(hex, rgb24)| {
+                div()
+                    .id(SharedString::from(format!("border-swatch-{hex}")))
+                    .w(px(18.))
+                    .h(px(18.))
+                    .rounded_full()
+                    .bg(gpui::rgb(rgb24))
+                    .border_2()
+                    .border_color(if current.eq_ignore_ascii_case(hex) {
+                        widgets::accent()
+                    } else {
+                        theme::border()
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            let input = this.selection_border_color.clone();
+                            input.update(cx, |i, cx| i.set_text(hex, cx));
+                            if this.settings.screenshot.selection_border_color != hex {
+                                this.settings.screenshot.selection_border_color = hex.into();
+                                this.persist(cx);
+                            }
+                        }),
+                    )
+            })
+            .collect::<Vec<_>>();
+            widgets::row("选区边框线颜色", "设置截屏选区边框线的颜色。").child(widgets::control(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .children(swatches)
+                    .child(div().w(px(110.)).child(self.selection_border_color.clone())),
+            ))
+        };
+
         let customize = widgets::stack(
             "自定义工具栏",
             "选择截屏工具栏上显示的按钮；完成与取消始终显示。",
@@ -3463,6 +3587,9 @@ impl SettingsView {
                 middle_click,
                 click_outside,
                 element_detection,
+                border_style,
+                border_width,
+                border_color_row,
                 record_history,
                 widgets::row("默认颜色", "新画笔、形状和文字标注的颜色。").child(widgets::control(
                     div().flex().flex_row().gap(px(8.)).children(swatches),
@@ -5772,6 +5899,9 @@ fn settings_persist_merge(
     screenshot.show_magnifier = s.show_magnifier;
     screenshot.show_info_bar = s.show_info_bar;
     screenshot.show_shortcut_hints = s.show_shortcut_hints;
+    screenshot.selection_border_style = s.selection_border_style;
+    screenshot.selection_border_width = s.selection_border_width;
+    screenshot.selection_border_color = s.selection_border_color.clone();
     keep_edited(
         &mut screenshot.collage.direction,
         &s.collage.direction,

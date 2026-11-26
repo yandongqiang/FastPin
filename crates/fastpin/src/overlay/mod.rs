@@ -247,6 +247,8 @@ pub struct OverlayView {
     uia_last_point: POINT,
     /// UIA 查询序号，用于丢弃鼠标移动后返回的过期结果。
     uia_epoch: u64,
+    /// 截图会话序号。变化时 worker 刷新 snow-shot selector 的窗口快照。
+    uia_session: u64,
     /// 连续超时次数；达到阈值后暂时禁用当前窗口的 UIA 候选（熔断）。
     uia_timeouts: u8,
     /// 被熔断的 UIA 提供程序所属顶层窗口；hover 移到别的窗口时解除。
@@ -1198,6 +1200,7 @@ impl OverlayView {
             uia_last_target: None,
             uia_last_point: POINT::default(),
             uia_epoch: 0,
+            uia_session: 0,
             uia_timeouts: 0,
             uia_blocked_hwnd: None,
             monitor_rects: Vec::new(),
@@ -1277,6 +1280,7 @@ impl OverlayView {
             uia_last_target: None,
             uia_last_point: POINT::default(),
             uia_epoch: 0,
+            uia_session: 0,
             uia_timeouts: 0,
             uia_blocked_hwnd: None,
             monitor_rects: Vec::new(),
@@ -1374,6 +1378,8 @@ impl OverlayView {
         self.uia_pending = None;
         self.uia_last.clear();
         self.uia_last_target = None;
+        // 新一轮截图：worker 据此刷新 snow-shot selector 的窗口快照。
+        self.uia_session = self.uia_session.wrapping_add(1);
         self.uia_timeouts = 0;
         self.uia_blocked_hwnd = None;
         self.color_open = false;
@@ -1413,7 +1419,10 @@ impl OverlayView {
             return;
         }
         self.uia_epoch = self.uia_epoch.wrapping_add(1);
-        let query = crate::uia::elements_at_point_async(target, pt, self.uia_epoch);
+        // 排除覆盖层自身窗口（snow-shot selector 在顶层窗口快照里剔除它），
+        // 并带上截图会话序号让 worker 在新一轮截图时刷新快照。
+        let query =
+            crate::uia::elements_at_point_async(self_hwnd, pt, self.uia_epoch, self.uia_session);
         if query.failed_fast {
             // 队列满 / worker 已退出：等价于一次超时。必须在这里就计数——
             // 鼠标快速移动时 pending 可能下一帧就被清掉，poll 根本看不到它。
@@ -1449,9 +1458,8 @@ impl OverlayView {
         let (recv, (epoch, point, started, target)) = received;
         match recv {
             Ok(reply) => {
-                self.uia_pending = None;
                 if reply.epoch != epoch {
-                    // 鼠标已经移动，旧结果直接丢弃。
+                    // 鼠标已经移动，旧结果直接丢弃；pending 属于更新的 epoch。
                     return;
                 }
                 // 查询时的屏幕点与当前 hover 点允许小幅偏差（每轴 <=24px），
@@ -1463,6 +1471,7 @@ impl OverlayView {
                 if (now.x - point.x).abs() > UIA_POINT_TOLERANCE
                     || (now.y - point.y).abs() > UIA_POINT_TOLERANCE
                 {
+                    self.uia_pending = None;
                     return;
                 }
                 let hwnd = crate::platform::hwnd_of(window);
@@ -1470,6 +1479,7 @@ impl OverlayView {
                 // hover 窗口仍是查询目标，否则这批复选框属于别的窗口，必须丢弃。
                 // window_under_point 只走 Win32 枚举，不会触发同步 COM。
                 if window_under_point(hwnd, now) != Some(target) {
+                    self.uia_pending = None;
                     return;
                 }
                 self.uia_timeouts = 0;
@@ -1495,6 +1505,14 @@ impl OverlayView {
                     &self.candidates,
                     self.mouse,
                 );
+                if reply.final_reply {
+                    // refinement 已结束，释放 pending；此间的每一帧都已应用。
+                    self.uia_pending = None;
+                } else if let Some(pending) = self.uia_pending.as_mut() {
+                    // 每收到一帧就把超时计时推后，refinement 持续期间不算超时；
+                    // 只有真正没有新帧到达（provider 卡死）才触发熔断计数。
+                    pending.started = Instant::now();
+                }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if started.elapsed() > crate::uia::UIA_QUERY_TIMEOUT {

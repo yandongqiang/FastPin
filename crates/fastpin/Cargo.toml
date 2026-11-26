@@ -24,6 +24,10 @@ image = "0.25"
 # Vendored from snow-shot (GPL-3.0-or-later): ORB feature-based image stitching.
 # See NOTICE and LICENSE-GPL-3.0 at the workspace root.
 snow-stitch-images = { path = "../snow-stitch-images", default-features = false }
+# Vendored from snow-shot (GPL-3.0-or-later): native window / accessibility
+# element selection, so the region picker's window+element behaviour matches
+# snow-shot exactly (UIA + MSAA backends, spatial index, two-phase queries).
+snow-ui-selector = { path = "../snow-ui-selector" }
 oar-ocr = "0.9"
 printpdf = "0.6"
 serde = { version = "1", features = ["derive"] }

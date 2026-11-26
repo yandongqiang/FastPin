@@ -1,0 +1,47 @@
+[package]
+name = "snow-ui-selector"
+version = "0.1.0"
+edition = "2024"
+autoexamples = false
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "snow_ui_selector"
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+crossbeam-channel = "0.5"
+rstar = "0.12.2"
+windows = { version = "0.62.2", features = [
+    "Win32_UI_Accessibility", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_Threading", "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility-sys = "0.2.0"
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+] }
+
+[[example]]
+name = "overlay"
+path = "examples/overlay.rs"
+required-features = ["windows-examples"]
+
+[features]
+windows-examples = []
+
+[[example]]
+name = "hit_bench"
+path = "examples/hit_bench.rs"
+required-features = ["windows-examples"]
+
+[[example]]
+name = "macos_probe"
+path = "examples/macos_probe.rs"

@@ -4,6 +4,7 @@ members = [
     "crates/fastpin",
     "crates/snow-memory",
     "crates/snow-stitch-images",
+    "crates/snow-ui-selector",
 ]
 
 [workspace.package]

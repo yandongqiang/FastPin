@@ -55,10 +55,14 @@ scroll stepping, adaptive capture cadence and other modules:
     Copyright (C) 2026 mg-chao
     SPDX-License-Identifier: GPL-3.0-or-later
 
-    crates/snow-stitch-images/ and crates/snow-memory/ are derived from
-    snow-crates/ in the Snow Shot repository; the additional modules listed
-    above are ported into FastPin itself. See COPYRIGHT.snow-shot and the
-    LICENSE files inside those crate directories for full notices.
+    crates/snow-stitch-images/, crates/snow-memory/ and crates/snow-ui-selector/
+    are derived from snow-crates/ in the Snow Shot repository; the additional
+    modules listed above are ported into FastPin itself. In particular the
+    region picker's window+element detection now calls the vendored
+    snow-ui-selector directly, so it shares snow-shot's UIA/MSAA backends,
+    window spatial index, per-monitor clipping and two-phase queries. See
+    COPYRIGHT.snow-shot and the LICENSE files inside those crate directories
+    for full notices.
 
 === 第三方组件 / Third-party components ===
 

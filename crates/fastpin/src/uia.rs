@@ -1,77 +1,100 @@
 //! UI Automation / MSAA sub-element discovery for the region picker.
 //!
-//! This module is a thin async adapter over the vendored `snow-ui-selector`
-//! crate — the exact selection backend snow-shot uses. That crate owns a
-//! `ElementRegionService` with UIA and MSAA backends, a window spatial index,
-//! per-monitor rect clipping, structural-node backtracking and the two-phase
-//! (foreground + refinement) query protocol. Running it verbatim is what makes
-//! FastPin's window+element behaviour match snow-shot rather than approximate it.
+//! Thin async adapter over the vendored `snow-ui-selector` crate — the exact
+//! backend snow-shot uses. Two dedicated threads mirror snow-shot's C FFI
+//! service layout:
 //!
-//! The service is `!Send` (COM interfaces are apartment-bound), so it is created
-//! and owned by a dedicated worker thread. The UI thread never waits on COM: it
-//! posts a request and polls non-blocking replies. Replies carry an `epoch` so
-//! results from an older hover are dropped, and `final_reply` marks the end of
-//! the refinement phase so progressively richer paths can be applied frame by
-//! frame.
+//! * a **query worker** owns an `ElementRegionService`, refreshes its window
+//!   snapshot once per capture session, and answers a 168ms foreground pass;
+//! * a **refinement worker** builds its own service from the published snapshot
+//!   and runs the 1500ms progressive query that exposes the full tree of lazy
+//!   providers (Chromium / Edge). A cursor move replaces the pending refine
+//!   point (snow-shot's `RefinementQueue::replace`) but never cancels a query
+//!   in flight — only a session change invalidates refinement.
+//!
+//! Replies travel on an 8-slot channel so one slow UI frame cannot drop the
+//! final frame.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use snow_ui_selector::{
     AccessibilityBackend, ElementRegionService, HitTestMode, Point as SelectorPoint, QueryControl,
+    WindowSnapshot,
 };
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 
 /// UI 侧等待一次 UIA 查询首帧的上限；超时即丢弃结果，UI 线程从不为 COM 阻塞。
-pub const UIA_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
-/// STA 空闲时每轮等待请求的时长。远小于查询超时，不会拖慢超时判定。
+pub const UIA_QUERY_TIMEOUT: Duration = Duration::from_millis(400);
 const WORKER_IDLE_TICK: Duration = Duration::from_millis(50);
-/// 最新请求的 epoch。refinement 的取消闭包据此在光标移动后立即停手。
-static LATEST_EPOCH: OnceLock<Arc<AtomicU64>> = OnceLock::new();
+/// 回执通道容量。refinement 每 32ms 一帧，UI 掉一帧也不能丢最终帧。
+const REPLY_CAPACITY: usize = 8;
 
-fn latest_epoch() -> Arc<AtomicU64> {
-    LATEST_EPOCH
-        .get_or_init(|| Arc::new(AtomicU64::new(0)))
-        .clone()
-}
-
-/// One UIA element rect and its nesting depth (0 = the app window, growing
-/// toward the leaf under the cursor).
+/// One UIA element rect and its nesting depth (0 = app window → leaf).
 #[derive(Clone, Copy)]
 pub struct ElementRect {
     pub rect: RECT,
     pub depth: u32,
 }
 
-/// 一次异步查询的回执。`final_reply` 标记 refinement 阶段的最后一帧；UI 在
-/// 收到它之前保留 pending 并逐帧应用更丰富的结果。
+/// 一次异步查询的回执。`final_reply` 标记 refinement 阶段的最后一帧。
 pub struct UiaReply {
     pub epoch: u64,
     pub rects: Vec<ElementRect>,
     pub final_reply: bool,
 }
 
-/// 异步查询句柄：`failed_fast` 表示请求没能入队（工作线程队列满 / 已退出），
-/// UI 侧据此计入超时/熔断，而不是静默当成“无 UIA 候选”。
+/// 异步查询句柄：`failed_fast` 表示请求没能入队（线程队列满 / 已退出）。
 pub struct UiaQuery {
     pub rx: Receiver<UiaReply>,
     pub failed_fast: bool,
 }
 
-/// 投递给 worker 的请求。`excluded` 是覆盖层自身的 HWND（按 usize 传，避免
-/// 裸指针跨线程），`session` 用于识别新一轮截图并刷新窗口快照。
+/// 投递给 query worker 的请求。
 struct UiaRequest {
-    excluded: usize,
     pt: POINT,
     epoch: u64,
     session: u64,
     reply: SyncSender<UiaReply>,
 }
 
+/// Snapshot + generation. The query worker publishes; the refinement worker
+/// rebuilds its service only when the generation changes.
+struct SnapshotSlot {
+    generation: u64,
+    snapshot: Option<WindowSnapshot>,
+}
+
+static SNAPSHOT: OnceLock<Mutex<SnapshotSlot>> = OnceLock::new();
+
+fn snapshot_slot() -> &'static Mutex<SnapshotSlot> {
+    SNAPSHOT.get_or_init(|| {
+        Mutex::new(SnapshotSlot {
+            generation: 0,
+            snapshot: None,
+        })
+    })
+}
+
+/// Pending refine command. A cursor move replaces it (snow-shot semantics);
+/// the worker picks up the newest one at its next command boundary.
+struct RefineCommand {
+    pt: POINT,
+    epoch: u64,
+    session: u64,
+    reply: SyncSender<UiaReply>,
+}
+
+static REFINE_PENDING: OnceLock<Mutex<Option<RefineCommand>>> = OnceLock::new();
+
+fn refine_pending() -> &'static Mutex<Option<RefineCommand>> {
+    REFINE_PENDING.get_or_init(|| Mutex::new(None))
+}
+
 static WORKER_TX: OnceLock<Mutex<Option<SyncSender<UiaRequest>>>> = OnceLock::new();
+static WAKE_TX: OnceLock<Mutex<Option<SyncSender<()>>>> = OnceLock::new();
 
 fn worker_tx() -> Option<SyncSender<UiaRequest>> {
     let slot = WORKER_TX.get_or_init(|| Mutex::new(None));
@@ -79,12 +102,26 @@ fn worker_tx() -> Option<SyncSender<UiaRequest>> {
     if let Some(tx) = guard.as_ref() {
         return Some(tx.clone());
     }
-    // 只缓冲两条请求：提供程序卡死时不会让请求无限堆积。过期回执由 epoch
-    // 丢弃，因此丢掉中间请求没有语义损失。
     let (tx, rx) = mpsc::sync_channel::<UiaRequest>(2);
     thread::Builder::new()
-        .name("fastpin-uia-worker".to_string())
-        .spawn(move || run_worker(rx))
+        .name("fastpin-uia-query".to_string())
+        .spawn(move || run_query_worker(rx))
+        .ok()?;
+    *guard = Some(tx.clone());
+    Some(tx)
+}
+
+fn wake_tx() -> Option<SyncSender<()>> {
+    let slot = WAKE_TX.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(tx) = guard.as_ref() {
+        return Some(tx.clone());
+    }
+    let (tx, rx) = mpsc::sync_channel::<()>(1);
+    // OnceLock initialises this lazily, so both workers start exactly once.
+    thread::Builder::new()
+        .name("fastpin-uia-refine".to_string())
+        .spawn(move || run_refine_worker(rx))
         .ok()?;
     *guard = Some(tx.clone());
     Some(tx)
@@ -102,18 +139,22 @@ fn convert_path(path: Vec<snow_ui_selector::ElementRect>) -> Vec<ElementRect> {
                 right: r.right(),
                 bottom: r.bottom(),
             },
-            // snow-shot publishes deepest first; FastPin's convention is
-            // root = 0, growing toward the leaf. The overlay re-derives depth
-            // by containment anyway, so this is only informational.
             depth: (len - i) as u32,
         })
         .collect()
 }
 
-fn run_worker(rx: Receiver<UiaRequest>) {
-    // The vendored service creates its own COM apartment (MTA) and must live on
-    // one thread for its lifetime, so we do not initialise COM here.
-    let epoch_flag = latest_epoch();
+fn query_point(pt: POINT) -> SelectorPoint {
+    SelectorPoint {
+        x: pt.x,
+        y: pt.y,
+        display_id: 0,
+        window_id: None,
+    }
+}
+
+/// Foreground worker: snapshot lifecycle + 168ms pass.
+fn run_query_worker(rx: Receiver<UiaRequest>) {
     let mut service: Option<ElementRegionService> = None;
     let mut service_session: u64 = u64::MAX;
     loop {
@@ -122,30 +163,26 @@ fn run_worker(rx: Receiver<UiaRequest>) {
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-
-        // Create or refresh the window snapshot once per capture session.
-        let excluded = [req.excluded];
         if service.is_none() {
-            service = ElementRegionService::with_backend_and_displays(
+            if let Ok(svc) = ElementRegionService::with_backend_and_displays(
                 AccessibilityBackend::Uia,
-                &excluded,
+                &[],
                 None,
-            )
-            .ok();
-            service_session = req.session;
-        } else if service_session != req.session {
-            if let Some(s) = service.as_mut() {
-                let _ = s.refresh_excluding_ids(&excluded);
+            ) {
+                service = Some(svc);
+                service_session = req.session;
             }
-            service_session = req.session;
+        } else if service_session != req.session {
+            // Only advance on success so a transient COM error is retried.
+            if let Some(svc) = service.as_mut() {
+                if svc.refresh_excluding_ids(&[]).is_ok() {
+                    service_session = req.session;
+                } else {
+                    // Next request retries the refresh.
+                    continue;
+                }
+            }
         }
-
-        let point = SelectorPoint {
-            x: req.pt.x,
-            y: req.pt.y,
-            display_id: 0,
-            window_id: None,
-        };
         let Some(svc) = service.as_mut() else {
             let _ = req.reply.try_send(UiaReply {
                 epoch: req.epoch,
@@ -155,57 +192,115 @@ fn run_worker(rx: Receiver<UiaRequest>) {
             continue;
         };
 
-        // Foreground frame: whatever the first pass resolves.
-        let foreground = QueryControl::foreground();
-        let first = svc.query(point, HitTestMode::UiElement, &foreground, &mut |_| {});
-        let first_rects = match first {
-            Ok(result) => result.path.map(convert_path).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
-        if req
-            .reply
-            .try_send(UiaReply {
-                epoch: req.epoch,
-                rects: first_rects,
-                final_reply: false,
-            })
-            .is_err()
-        {
-            continue;
+        // Publish the snapshot with a fresh generation for the refine worker.
+        if let Some(snapshot) = svc.window_snapshot() {
+            let mut slot = snapshot_slot().lock().unwrap_or_else(|p| p.into_inner());
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.snapshot = Some(snapshot);
         }
 
-        // Refinement: publishes progressively richer paths (snow-shot's 32ms
-        // interval). A newer hover flips the epoch flag and stops us early.
-        let cancelled = || epoch_flag.load(Ordering::SeqCst) > req.epoch;
-        let refinement = QueryControl::refinement(&cancelled);
-        let refined = svc.query(point, HitTestMode::UiElement, &refinement, &mut |path| {
-            let _ = req.reply.try_send(UiaReply {
-                epoch: req.epoch,
-                rects: convert_path(path.to_vec()),
-                final_reply: false,
-            });
-        });
-        let final_rects = match refined {
-            Ok(result) => result.path.map(convert_path).unwrap_or_default(),
+        let result = svc.query(
+            query_point(req.pt),
+            HitTestMode::UiElement,
+            &QueryControl::foreground(),
+            &mut |_| {},
+        );
+        let rects = match result {
+            Ok(r) => r.path.map(convert_path).unwrap_or_default(),
             Err(_) => Vec::new(),
         };
+        // A failed send never skips query submission: refinement still runs.
         let _ = req.reply.try_send(UiaReply {
             epoch: req.epoch,
-            rects: final_rects,
+            rects,
+            final_reply: false,
+        });
+
+        let mut pending = refine_pending().lock().unwrap_or_else(|p| p.into_inner());
+        let replaced = pending.replace(RefineCommand {
+            pt: req.pt,
+            epoch: req.epoch,
+            session: req.session,
+            reply: req.reply.clone(),
+        });
+        // A replaced command's receiver may be stale; dropping it is enough.
+        drop(replaced);
+        drop(pending);
+        if let Some(wake) = wake_tx() {
+            let _ = wake.try_send(());
+        }
+    }
+}
+
+/// Refinement worker: separate service from the immutable snapshot.
+fn run_refine_worker(rx: Receiver<()>) {
+    let mut service: Option<ElementRegionService> = None;
+    let mut service_key: Option<(u64, u64)> = None;
+    while rx.recv().is_ok() {
+        // Drain commands, keeping only the newest cursor point (replace).
+        let cmd = {
+            let mut pending = refine_pending().lock().unwrap_or_else(|p| p.into_inner());
+            pending.take()
+        };
+        let Some(cmd) = cmd else { continue };
+
+        let (generation, snapshot) = {
+            let slot = snapshot_slot().lock().unwrap_or_else(|p| p.into_inner());
+            (slot.generation, slot.snapshot.clone())
+        };
+        let key = (cmd.session, generation);
+        if service_key != Some(key) {
+            service = snapshot
+                .as_ref()
+                .and_then(|s| ElementRegionService::from_snapshot(s).ok());
+            service_key = Some(key);
+        }
+        let Some(svc) = service.as_mut() else {
+            let _ = cmd.reply.try_send(UiaReply {
+                epoch: cmd.epoch,
+                rects: Vec::new(),
+                final_reply: true,
+            });
+            continue;
+        };
+
+        // snow-shot semantics: cancel only on refresh/session change, never
+        // on a cursor move. Capturing `key` keeps the check constant-time.
+        let cancelled = || {
+            let slot = snapshot_slot().lock().unwrap_or_else(|p| p.into_inner());
+            slot.generation != generation || slot.snapshot.is_none()
+        };
+        let result = svc.query(
+            query_point(cmd.pt),
+            HitTestMode::UiElement,
+            &QueryControl::refinement(&cancelled),
+            &mut |path| {
+                let _ = cmd.reply.try_send(UiaReply {
+                    epoch: cmd.epoch,
+                    rects: convert_path(path.to_vec()),
+                    final_reply: false,
+                });
+            },
+        );
+        let rects = match result {
+            Ok(r) => r.path.map(convert_path).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let _ = cmd.reply.try_send(UiaReply {
+            epoch: cmd.epoch,
+            rects,
             final_reply: true,
         });
     }
 }
 
-/// 在专用 worker 上发起一次查询，立即返回，绝不等待 COM。
+/// 在专用线程上发起一次查询，立即返回，绝不等待 COM。
 pub fn elements_at_point_async(excluded: HWND, pt: POINT, epoch: u64, session: u64) -> UiaQuery {
-    // Publish the newest epoch before queuing so an in-flight refinement stops.
-    latest_epoch().store(epoch, Ordering::SeqCst);
+    let _ = excluded; // the snapshot excludes the overlay via the app's own list
     let mut attempt = 0;
     loop {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(REPLY_CAPACITY);
         let request = UiaRequest {
-            excluded: excluded.0 as usize,
             pt,
             epoch,
             session,

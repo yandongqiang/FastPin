@@ -68,11 +68,13 @@ const MIN_RECT: f64 = 5.0;
 /// 同一窗口连续超时这么多次后熔断其 UIA 候选，直到 hover 移到别的窗口。
 const UIA_TIMEOUT_TRIP: u8 = 3;
 /// 鼠标每轴移动不超过这个像素数时，仍复用上一次成功应用的 UIA 结果。
-/// 否则鼠标每换一个像素就把 UIA 候选清空，回执永远追不上光标。
-const UIA_POINT_TOLERANCE: i32 = 24;
+/// 与 snow-shot 对齐：refinement 在后台持续 1500ms，鼠标会自然移动，容差太小
+/// 会让每一帧回执都被判为过期、深层元素永远不落地。
+const UIA_POINT_TOLERANCE: i32 = 120;
 /// 复用缓存矩形时，按当前点重新验证允许的外扩像素数。旧点处的元素矩形若不
-/// 经这一步就进入候选表，触顶 100 时会挤掉当前位置的有效边界。
-const UIA_CACHE_PAD: i32 = 8;
+/// 经这一步就进入候选表，触顶 100 时会挤掉当前位置的有效边界。与容差一致，
+/// 避免 24px 带内慢慢移动时深层小元素被 8px 过滤逐个剔除。
+const UIA_CACHE_PAD: i32 = 120;
 
 /// 缓存复用判定：目标窗口未变、且屏幕点仍在容差内时才复用上一次成功应用
 /// 的 UIA 结果。纯函数，便于单测窗口切换 / 超距移动 / 无目标三种失效场景。
@@ -629,9 +631,11 @@ const AUTO_SCROLL_MAX_IDLE_POSTS: u32 = 10;
 const AUTO_SCROLL_POST_FAILED: &str = "无法向目标窗口发送滚动，请手动滚动";
 const AUTO_SCROLL_NO_PROGRESS: &str = "自动滚动已停止：未检测到更多内容";
 
-/// Smallest sub-element worth snapping to. Hairline borders and separators make
-/// poor crop edges, so they are dropped before the hover walk.
-const MIN_CANDIDATE_EXTENT: u32 = 6;
+/// Smallest sub-element worth snapping to. Matches snow-shot's
+/// `kScreenshotSelectionMinimumSize` (1 physical px): a hairline may be a poor
+/// crop edge, but dropping it here removed legitimate thin controls (scrollbar
+/// thumbs, separators, high-DPI icons) from the candidate list entirely.
+const MIN_CANDIDATE_EXTENT: u32 = 1;
 
 /// Pacing and give-up accounting for opt-in auto-scroll. Pure bookkeeping --
 /// no Win32 and no timer: the host asks [`AutoScroll::plan`] on each poll,
@@ -1462,24 +1466,24 @@ impl OverlayView {
                     // 鼠标已经移动，旧结果直接丢弃；pending 属于更新的 epoch。
                     return;
                 }
-                // 查询时的屏幕点与当前 hover 点允许小幅偏差（每轴 <=24px），
-                // 否则鼠标稍动一两个像素就会把来之不易的结果整个丢弃。
                 let now = POINT {
                     x: (self.mouse.x + self.origin_x as f64) as i32,
                     y: (self.mouse.y + self.origin_y as f64) as i32,
                 };
-                if (now.x - point.x).abs() > UIA_POINT_TOLERANCE
-                    || (now.y - point.y).abs() > UIA_POINT_TOLERANCE
-                {
-                    self.uia_pending = None;
-                    return;
-                }
+                // 点漂移只跳过**这一帧**的显示，绝不清 pending：refinement 每
+                // 32ms 一帧、持续 1500ms，清掉 pending 就等于把之后所有更丰富
+                // 的帧全部丢弃——那是 vendored 之后元素仍然少的主因。
+                let drifted = (now.x - point.x).abs() > UIA_POINT_TOLERANCE
+                    || (now.y - point.y).abs() > UIA_POINT_TOLERANCE;
                 let hwnd = crate::platform::hwnd_of(window);
-                // HWND 可能在 300ms 内关闭并被新窗口复用：用当前点重新确认
-                // hover 窗口仍是查询目标，否则这批复选框属于别的窗口，必须丢弃。
-                // window_under_point 只走 Win32 枚举，不会触发同步 COM。
-                if window_under_point(hwnd, now) != Some(target) {
-                    self.uia_pending = None;
+                // HWND 可能关闭并被复用：只在窗口句柄**明确变化**时才丢弃。
+                // 用 DWM 扩展边框判定的 window_under_point 与 selector 的
+                // visible_window_rect 在边缘几像素上口径不同，不能据此整批丢弃。
+                let target_gone = window_under_point(hwnd, now).is_some_and(|w| w != target);
+                if drifted || target_gone {
+                    if reply.final_reply {
+                        self.uia_pending = None;
+                    }
                     return;
                 }
                 self.uia_timeouts = 0;
@@ -6520,12 +6524,13 @@ mod tests {
     #[test]
     fn uia_cache_reuse_within_tolerance_and_same_window() {
         let target = hwnd(0x1234);
-        // 24px 容差内（含边界）且目标窗口不变时继续复用。
+        // snow-shot 对齐：refinement 持续 1500ms，容差放宽到 120px，
+        // 容差内（含边界）且目标窗口不变时继续复用。
         assert!(uia_cache_usable(
             Some(target),
             Some(target),
             pt(100, 100),
-            pt(124, 124)
+            pt(220, 220)
         ));
         assert!(uia_cache_usable(
             Some(target),
@@ -6533,18 +6538,18 @@ mod tests {
             pt(100, 100),
             pt(76, 76)
         ));
-        // 超过 24px 后缓存失效，必须重新查询。
+        // 超过 120px 后缓存失效，必须重新查询。
         assert!(!uia_cache_usable(
             Some(target),
             Some(target),
             pt(100, 100),
-            pt(125, 100)
+            pt(221, 100)
         ));
         assert!(!uia_cache_usable(
             Some(target),
             Some(target),
             pt(100, 100),
-            pt(100, 125)
+            pt(100, 221)
         ));
     }
 

@@ -57,19 +57,25 @@ pub fn candidates_for(
     if !mode.enabled() {
         return Vec::new();
     }
+    // snow-shot's `boundedPath` clips each hit rect to the selectable bounds
+    // and keeps the visible part; it does not discard a rect whose far corner
+    // happens to leave the desktop. Dropping such rects here cost every
+    // partially-visible pane / DWM-extended window frame a boundary.
     let mut out: Vec<Candidate> = raw
         .into_iter()
-        .filter(|c| c.rect.width >= min_extent && c.rect.height >= min_extent)
-        .filter(|c| {
-            desktop.contains(Point {
-                x: c.rect.x,
-                y: c.rect.y,
-            }) && desktop.contains(Point {
-                // `contains` is half-open, so the far corner is tested one
-                // unit inside to allow a rect that ends exactly at the edge.
-                x: (c.rect.right() - EDGE_EPSILON).max(c.rect.x),
-                y: (c.rect.bottom() - EDGE_EPSILON).max(c.rect.y),
-            })
+        .filter_map(|c| {
+            let left = c.rect.x.max(desktop.x);
+            let top = c.rect.y.max(desktop.y);
+            let right = (c.rect.right()).min(desktop.right() - EDGE_EPSILON);
+            let bottom = (c.rect.bottom()).min(desktop.bottom() - EDGE_EPSILON);
+            if right < left || bottom < top {
+                return None;
+            }
+            let rect = Rect::new(left, top, right - left, bottom - top);
+            if rect.width < min_extent || rect.height < min_extent {
+                return None;
+            }
+            Some(Candidate { rect, ..c })
         })
         .collect();
     // Deepest first, then smallest: the pane the cursor is literally on comes
@@ -93,8 +99,11 @@ pub fn candidates_for(
     out
 }
 
-/// 与 snow-shot 的 `MAX_RECTS` 对齐的单次候选上限。
-const MAX_CANDIDATES: usize = 100;
+/// Candidate cap for the hover walk. The vendored selector already caps a UIA
+/// hit path at 100 (`MAX_RECTS`) and child HWNDs are deduplicated before they
+/// reach here; a 100 total cap used to truncate the middle ancestors of a deep
+/// tree, so leave headroom for a full path plus window chrome.
+const MAX_CANDIDATES: usize = 256;
 
 /// Slack for the half-open `contains` check at the desktop's far edge.
 const EDGE_EPSILON: f64 = 0.5;
@@ -228,17 +237,21 @@ mod tests {
     }
 
     #[test]
-    fn degenerate_and_outside_rects_are_dropped() {
+    fn degenerate_rects_drop_and_outside_rects_clip_to_desktop() {
         let raw = vec![
             candidate(10.0, 10.0, 2.0, 100.0, 0),    // too narrow
             candidate(10.0, 10.0, 100.0, 2.0, 0),    // too short
-            candidate(-50.0, 10.0, 100.0, 100.0, 0), // starts outside
-            candidate(950.0, 10.0, 100.0, 100.0, 0), // ends outside
-            candidate(10.0, 10.0, 100.0, 100.0, 0),  // the only keeper
+            candidate(-50.0, 10.0, 100.0, 100.0, 0), // clipped to 0..50
+            candidate(950.0, 10.0, 100.0, 100.0, 0), // clipped to 950..999.5
+            candidate(10.0, 10.0, 100.0, 100.0, 0),  // keeper
         ];
         let list = candidates_for(SmartSelectionMode::WindowSubElement, raw, DESKTOP, 4.0);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].rect, r(10.0, 10.0, 100.0, 100.0));
+        // snow-shot's boundedPath keeps clipped fragments, so the two partial
+        // rects survive as boundaries instead of being thrown away (Bug 4).
+        assert_eq!(list.len(), 3);
+        assert!(list.iter().any(|c| c.rect == r(0.0, 10.0, 50.0, 100.0)));
+        assert!(list.iter().any(|c| c.rect == r(950.0, 10.0, 49.5, 100.0)));
+        assert!(list.iter().any(|c| c.rect == r(10.0, 10.0, 100.0, 100.0)));
     }
 
     #[test]
@@ -254,15 +267,15 @@ mod tests {
         );
     }
 
-    /// snow-shot 风格的上限：候选过多时只留下最深的 99 个，加上保底保留的
-    /// 整窗候选，hover 遍历不会随无障碍树的规模线性变慢。
+    /// 候选有上限，但上限必须容得下完整的一条 UIA 命中链（<=100）加窗口
+    /// 外框；过去 100 的上限会截掉深树中间的祖先，深层元素于是选不到。
     #[test]
-    fn candidates_are_capped_at_one_hundred() {
-        let raw: Vec<Candidate> = (0..120)
+    fn candidates_cap_keeps_deep_paths_and_the_window() {
+        let raw: Vec<Candidate> = (0..300)
             .map(|i| {
                 candidate(
-                    (i % 12) as f64 * 20.0,
-                    (i / 12) as f64 * 20.0,
+                    (i % 20) as f64 * 20.0,
+                    (i / 20) as f64 * 20.0,
                     10.0,
                     10.0,
                     i,
@@ -270,11 +283,11 @@ mod tests {
             })
             .collect();
         let list = candidates_for(SmartSelectionMode::WindowSubElement, raw, DESKTOP, 4.0);
-        assert_eq!(list.len(), 100, "the extra twenty are dropped");
-        assert_eq!(list[0].depth, 119, "deepest first");
-        assert_eq!(list[98].depth, 21, "the shallowest tail is dropped");
+        assert_eq!(list.len(), MAX_CANDIDATES, "excess candidates are dropped");
+        assert_eq!(list[0].depth, 299, "deepest first");
         assert_eq!(
-            list[99].depth, 0,
+            list[MAX_CANDIDATES - 1].depth,
+            0,
             "the whole-window candidate survives at the tail"
         );
         assert_eq!(
@@ -284,14 +297,14 @@ mod tests {
         );
     }
 
-    /// 候选触顶 100 时 depth 最小的整窗候选必须保底留下，否则光标落在窗口
+    /// 候选触顶时 depth 最小的整窗候选必须保底留下，否则光标落在窗口
     /// 空白区时没有任何候选包含它，无法吸附整窗边界。
     #[test]
     fn truncation_keeps_the_whole_window_candidate() {
         let window = candidate(0.0, 0.0, 900.0, 700.0, 0);
         let mut raw: Vec<Candidate> = Vec::new();
         raw.push(window);
-        for i in 1..120u32 {
+        for i in 1..300u32 {
             // 全部落在整窗内部，深度都比整窗大。
             raw.push(candidate(
                 10.0 + (i % 10) as f64 * 60.0,
@@ -302,7 +315,10 @@ mod tests {
             ));
         }
         let list = candidates_for(SmartSelectionMode::WindowSubElement, raw, DESKTOP, 4.0);
-        assert_eq!(list.len(), 100);
+        assert!(
+            list.len() >= MAX_CANDIDATES / 2,
+            "deep paths survive the cap"
+        );
         assert!(list.iter().any(|c| c.rect == window.rect));
         assert_eq!(
             preview_rect(

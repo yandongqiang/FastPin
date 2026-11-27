@@ -2370,7 +2370,13 @@ impl SettingsView {
                         .top(px(DROPDOWN_TOP))
                         .right(px(16.))
                         .w(px(INLINE_FIELD_W))
-                        .child(widgets::select_list().children(rows)),
+                        .child(
+                            widgets::select_list(SharedString::from(format!(
+                                "select-list-{}",
+                                which as u8
+                            )))
+                            .children(rows),
+                        ),
                 ))
             })
     }
@@ -5388,7 +5394,9 @@ impl SettingsView {
                         .top(px(DROPDOWN_TOP))
                         .right(px(0.))
                         .w(px(140.))
-                        .child(widgets::select_list().children(filter_rows)),
+                        .child(
+                            widgets::select_list("select-list-hist-filter").children(filter_rows),
+                        ),
                 ))
             });
 

@@ -608,13 +608,21 @@ pub fn select_option(
 }
 
 /// Wraps the open option rows so they read as one surface under the field.
-pub fn select_list() -> Div {
+///
+/// The theme dropdown has ~38 entries; without a height cap the absolute
+/// overlay grows past the settings window and the lower entries are clipped,
+/// with no way to scroll to them. `id` makes the surface an interactive element
+/// so `overflow_y_scroll` can attach scroll hit-testing to it.
+pub fn select_list(id: impl Into<ElementId>) -> Stateful<Div> {
     div()
+        .id(id)
         .w_full()
         .mt(px(4.))
         .p(px(4.))
         .flex()
         .flex_col()
+        .max_h(px(320.))
+        .overflow_y_scroll()
         .rounded(px(8.))
         .bg(input_bg())
         .border_1()

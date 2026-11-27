@@ -41,6 +41,11 @@ pub const WM_FASTPIN_HOTKEY_RECORDED: u32 = WM_APP + 3;
 /// hidden window runs the popup menu's modal loop, where no gpui window is
 /// mid-update, then hands the chosen command back to the pin.
 pub const WM_FASTPIN_PIN_MENU: u32 = WM_APP + 4;
+/// Posted (never sent) from `WM_TRAYICON` with the callback's LPARAM, so the
+/// shell's synchronous `SendMessage` returns immediately instead of waiting
+/// out our popup's modal loop — which is what leaves explorer's "busy" cursor
+/// (hourglass) stuck on screen for the whole menu.
+pub const WM_FASTPIN_TRAY_MENU: u32 = WM_APP + 5;
 /// Overlay-interactive sentinel. The value is fixed by the vendored gpui patch
 /// (`Window::on_app_ready_sentinel`) — changing it here alone breaks the T7 mark.
 pub const WM_APP_READY_SENTINEL: u32 = WM_APP + 32;

@@ -44,7 +44,8 @@ use crate::platform::{
     register_emergency_quit, register_fallback_hotkeys, remove_tray_icon, set_dpi_aware,
     set_hook_target, taskbar_created_message, uninstall_ll_hook, unpack_hotkey,
     unregister_fallback_hotkeys, SingleInstance, TrayCommand, EMERGENCY_QUIT_ID, WM_FASTPIN_HOTKEY,
-    WM_FASTPIN_HOTKEY_RECORDED, WM_FASTPIN_PIN_MENU, WM_FASTPIN_SETTINGS, WM_TRAYICON,
+    WM_FASTPIN_HOTKEY_RECORDED, WM_FASTPIN_PIN_MENU, WM_FASTPIN_SETTINGS, WM_FASTPIN_TRAY_MENU,
+    WM_TRAYICON,
 };
 
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -1030,8 +1031,6 @@ unsafe extern "system" fn hidden_proc(
         }
         return LRESULT(0);
     }
-    // Tray menu: the popup runs its own modal loop inside `handle_tray`, so
-    // there is no owner-draw traffic on the hidden window any more.
     if msg == taskbar_created_message() {
         if let Err(e) = add_tray_icon(hwnd) {
             // 不能静默吞掉：没有托盘图标时同样需要紧急退出通路和可见提示。
@@ -1039,7 +1038,18 @@ unsafe extern "system" fn hidden_proc(
         }
         return LRESULT(0);
     }
+    // Tray menu runs in its own posted message, not inside WM_TRAYICON: the
+    // shell delivers WM_TRAYICON synchronously (SendMessage), so handling the
+    // popup's modal loop here would block explorer's own message pump and
+    // leave its "busy" hourglass cursor on screen for the whole menu.
     if msg == WM_TRAYICON {
+        // shell 在我们的 WndProc 里同步等待，期间它把光标设成沙漏；先把箭头
+        // 强制回去，再转投消息立即返回。菜单循环每轮也会再强制一次。
+        crate::platform::tray_menu::reset_cursor_arrow();
+        let _ = PostMessageW(Some(hwnd), WM_FASTPIN_TRAY_MENU, WPARAM(0), lparam);
+        return LRESULT(0);
+    }
+    if msg == WM_FASTPIN_TRAY_MENU {
         if let Some(cmd) = handle_tray(hwnd, lparam) {
             match cmd {
                 TrayCommand::Region => post_action(hwnd, HotkeyAction::Region),

@@ -44,11 +44,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetMessageW, GetWindowLongPtrW, IsWindow, LoadCursorW, PostQuitMessage, RegisterClassExW,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, CS_DROPSHADOW,
+    SetCursor, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, CS_DROPSHADOW,
     CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, MSG, SW_SHOW, WA_ACTIVE, WA_CLICKACTIVE,
     WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSEXW,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 // Command ids. The original numbers are kept so `tray.rs` / `app.rs` dispatch
@@ -406,6 +406,18 @@ unsafe fn apply_rounding(hwnd: HWND, w: i32, h: i32, scale: f32) {
     }
 }
 
+/// Explorer puts an hourglass (IDC_WAIT) on the cursor while it waits for the
+/// shell's synchronous `SendMessage(WM_TRAYICON)` callback to return. When our
+/// menu opens on that first right-click the mouse does not move, so no new
+/// `WM_SETCURSOR` arrives to clear it and the hourglass stays for the whole
+/// menu. Force the arrow at the callback entry (before posting) and on every
+/// pump turn so the busy cursor never gets a chance to stick.
+pub(crate) fn reset_cursor_arrow() {
+    unsafe {
+        SetCursor(LoadCursorW(None, IDC_ARROW).ok());
+    }
+}
+
 /// Shows the compact card at the cursor and returns the chosen command id
 /// (None when dismissed). The popup runs its own message loop, so this still
 /// returns synchronously, exactly like the previous `TrackPopupMenu` call.
@@ -477,6 +489,7 @@ pub(crate) fn track(hwnd: HWND, items: Vec<MenuItem>) -> Option<u32> {
         let _ = SetCapture(popup);
         let _ = UpdateWindow(popup);
     }
+    reset_cursor_arrow();
 
     let mut msg = MSG::default();
     loop {
@@ -493,6 +506,9 @@ pub(crate) fn track(hwnd: HWND, items: Vec<MenuItem>) -> Option<u32> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        // Dispatching a message may let the shell (or any window under the
+        // captured mouse) set IDC_WAIT again; force the arrow every turn.
+        reset_cursor_arrow();
         if !unsafe { IsWindow(Some(popup)).as_bool() } {
             break;
         }
@@ -500,6 +516,7 @@ pub(crate) fn track(hwnd: HWND, items: Vec<MenuItem>) -> Option<u32> {
 
     unsafe {
         let _ = ReleaseCapture();
+        reset_cursor_arrow();
         if IsWindow(Some(popup)).as_bool() {
             let _ = DestroyWindow(popup);
         }
@@ -524,6 +541,16 @@ unsafe extern "system" fn popup_proc(
     };
 
     match msg {
+        WM_SETCURSOR => {
+            // 本窗口用 SetCapture 在托盘右键期间独占鼠标。捕获期间所有
+            // WM_SETCURSOR 都发给我们；若交给 DefWindowProc，Windows 会从
+            // 被抢占的前台窗口（explorer 的托盘）继承“忙”光标，看起来像
+            // 卡住。显式设为箭头并返回 TRUE，整段菜单期间都保持普通光标。
+            unsafe {
+                SetCursor(LoadCursorW(None, IDC_ARROW).ok());
+            }
+            LRESULT(1)
+        }
         WM_PAINT => {
             paint(hwnd, state);
             LRESULT(0)

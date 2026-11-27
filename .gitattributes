@@ -4,3 +4,6 @@
 * text=auto
 *.sh text eol=lf
 *.patch text eol=lf
+# ort-sys 的 dist.tsv 是制表符分隔的数据文件，hash 在末列；CRLF 会让末列
+# 带上 \r，导致 build script 的 hex 解析 panic。
+*.tsv text eol=lf

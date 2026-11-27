@@ -12,7 +12,10 @@ pub fn hex_str_to_bytes(c: impl AsRef<[u8]>) -> Vec<u8> {
 		}
 	}
 
-	c.as_ref().chunks(2).map(|n| (nibble(n[0]) << 4) | nibble(n[1])).collect()
+	// FastPin patch: tolerate a trailing \r when dist.tsv was checked out with
+	// CRLF line endings (git * text=auto). Upstream panicked on the non-hex byte.
+	let trimmed = c.as_ref().trim_ascii();
+	trimmed.chunks(2).map(|n| (nibble(n[0]) << 4) | nibble(n[1])).collect()
 }
 
 pub fn bytes_to_hex_str(bytes: &[u8]) -> String {

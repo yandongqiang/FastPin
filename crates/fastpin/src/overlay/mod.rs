@@ -41,6 +41,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
+use gpui_component::input::{Textarea, TextareaState};
+
 use crate::capture::{crop_sdr_bgra, CapturedDesktop, Gpu, WgcLive};
 use crate::error::Result;
 use crate::geom::{
@@ -296,6 +298,9 @@ pub struct OverlayView {
     /// selection rect so the full-canvas mask is not rebuilt every frame.
     spotlight_cache: SpotlightDimCache,
     panel: Option<Panel>,
+    /// OCR / 翻译结果的可选取文本状态；只读 Textarea 支持鼠标拖拽选一部分复制。
+    /// placeholder 没有 window，无法创建 TextareaState，因此是 Option。
+    panel_text: Option<Entity<TextareaState>>,
     /// 多显示器采集中缺失区域的可见告警。独立于 panel：panel 依赖 toolbar
     /// 几何，在选区完成前根本不会渲染，而采集失败发生在选区之前。
     capture_warning: Option<String>,
@@ -1224,6 +1229,7 @@ impl OverlayView {
             mask_cache: RefCell::new(None),
             spotlight_cache: RefCell::new(None),
             panel: None,
+            panel_text: None,
             capture_warning: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
             toolbar_position: screenshot.toolbar_position,
@@ -1304,6 +1310,7 @@ impl OverlayView {
             mask_cache: RefCell::new(None),
             spotlight_cache: RefCell::new(None),
             panel: None,
+            panel_text: Some(cx.new(|c| TextareaState::new(window, c))),
             capture_warning,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
             toolbar_position: screenshot.toolbar_position,
@@ -4692,12 +4699,21 @@ impl OverlayView {
     fn panel_element(
         &self,
         scale: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
         geom: Option<Rect>,
         mon: Rect,
     ) -> Option<impl IntoElement> {
         let panel = self.panel.as_ref()?;
         let bar = geom?;
+        // 同步只读 Textarea 的文本。只在内容变化时 set_value，避免每帧重置
+        // 用户正在进行的部分选中。
+        let text_state = self.panel_text.as_ref()?;
+        if text_state.read(cx).value() != *panel.body {
+            text_state.update(cx, |state, c| {
+                state.set_value(panel.body.clone(), window, c);
+            });
+        }
         let copyable = !panel.busy && !panel.body.is_empty();
         // toolbar_geom and active_monitor_rect are in physical pixels; the
         // element tree is logical, so convert before placing.
@@ -4764,13 +4780,13 @@ impl OverlayView {
                         .child(panel.title.clone()),
                 )
                 .child(
-                    div()
-                        .id("overlay-panel-body")
-                        .max_h(px(place.body_max_h as f32))
-                        .overflow_y_scroll()
+                    Textarea::new(text_state)
+                        .readonly(true)
+                        .appearance(false)
+                        .bordered(false)
+                        .h(px(place.body_max_h as f32))
                         .text_size(px(13.))
-                        .text_color(theme::primary_fg())
-                        .child(panel.body.clone()),
+                        .text_color(theme::primary_fg()),
                 )
                 .children(copyable.then(|| {
                     div().flex().flex_row().justify_end().child(
@@ -5089,7 +5105,7 @@ impl Render for OverlayView {
                     toolbar_geom,
                     active_monitor,
                 ))
-                .children(self.panel_element(scale, cx, toolbar_geom, active_monitor))
+                .children(self.panel_element(scale, window, cx, toolbar_geom, active_monitor))
                 .children(self.text_layer(scale, &marks))
             })
     }

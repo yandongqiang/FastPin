@@ -131,11 +131,14 @@ fn compare_prerelease(latest: &str, current: &str) -> std::cmp::Ordering {
     }
 }
 
-/// Blocking. Call it off the UI thread.
-pub fn check_latest() -> Result<Release> {
-    let body = get(&format!(
-        "https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    ))?;
+/// 没有任何发布记录时 GitHub 的 `/releases/latest` 返回 404（不是网络错误）。
+/// `Ok(None)` 表示"仓库尚未发布任何版本"，UI 用它显示友好提示而不是错误。
+pub fn check_latest_or_none() -> Result<Option<Release>> {
+    const LATEST: &str = "https://api.github.com/repos/yandongqiang/FastPin/releases/latest";
+    let body = match get_raw(LATEST)? {
+        Some(body) => body,
+        None => return Ok(None),
+    };
     let json: serde_json::Value =
         serde_json::from_str(&body).map_err(|_| Error::new("发布信息不是有效的 JSON"))?;
     let tag = json["tag_name"].as_str().unwrap_or_default();
@@ -148,11 +151,16 @@ pub fn check_latest() -> Result<Release> {
     if !trusted_release_url(url) {
         return Err(Error::new("发布页地址不可信，已拒绝打开"));
     }
-    Ok(Release {
+    Ok(Some(Release {
         version: normalize_version(tag),
         url: url.to_string(),
         tag: tag.to_string(),
-    })
+    }))
+}
+
+/// 保留旧签名供其它调用方/测试使用；没有发布时返回明确错误。
+pub fn check_latest() -> Result<Release> {
+    check_latest_or_none()?.ok_or_else(|| Error::new("仓库尚未发布任何版本"))
 }
 
 /// Only `https://github.com/...` release pages may be opened. Rejects
@@ -199,10 +207,11 @@ pub fn open_release_page(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// GET the whole body, status-checked. Mirrors `translate::post_json` minus
-/// the request body and auth header; GitHub only insists on a User-Agent,
-/// which `WinHttpOpen`'s agent string already supplies.
-fn get(url: &str) -> Result<String> {
+/// GET the whole body, status-checked. Returns `Ok(None)` for 404 so callers
+/// can distinguish "no releases yet" from a real failure. Mirrors
+/// `translate::post_json` minus the request body and auth header; GitHub only
+/// insists on a User-Agent, which `WinHttpOpen`'s agent string supplies.
+fn get_raw(url: &str) -> Result<Option<String>> {
     let wide: Vec<u16> = url.encode_utf16().chain([0]).collect();
     let mut parts = URL_COMPONENTS {
         dwStructSize: std::mem::size_of::<URL_COMPONENTS>() as u32,
@@ -284,10 +293,15 @@ fn get(url: &str) -> Result<String> {
 
         let payload = crate::net::read_response(request.0, crate::net::MAX_RESPONSE_BYTES)?;
 
+        if status == 404 {
+            return Ok(None);
+        }
         if !(200..300).contains(&status) {
             return Err(Error::new(format!("检查更新失败（HTTP {status}）")));
         }
-        String::from_utf8(payload).map_err(|_| Error::new("发布信息不是有效的 UTF-8"))
+        let text =
+            String::from_utf8(payload).map_err(|_| Error::new("发布信息不是有效的 UTF-8"))?;
+        Ok(Some(text))
     }
 }
 

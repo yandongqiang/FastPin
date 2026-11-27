@@ -2674,13 +2674,13 @@ impl SettingsView {
         }
         self.update_checking = true;
         self.ok("正在检查更新…");
-        let task = cx.background_spawn(async move { crate::update::check_latest() });
+        let task = cx.background_spawn(async move { crate::update::check_latest_or_none() });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |view, cx| {
                 view.update_checking = false;
                 match result {
-                    Ok(release)
+                    Ok(Some(release))
                         if crate::update::is_newer(
                             &release.version,
                             crate::update::current_version(),
@@ -2689,9 +2689,15 @@ impl SettingsView {
                         view.ok(format!("发现新版本 v{}", release.version));
                         view.update_available = Some((release.version, release.url, release.tag));
                     }
-                    Ok(_) => {
+                    Ok(Some(_)) => {
                         view.update_available = None;
                         view.ok("当前已是最新版本");
+                    }
+                    // GitHub 在仓库还没有任何 Release 时 /releases/latest 返回 404。
+                    // 这不是网络故障，给用户一个可理解的提示而不是 HTTP 错误码。
+                    Ok(None) => {
+                        view.update_available = None;
+                        view.ok("暂无发布版本");
                     }
                     Err(e) => view.fail(format!("检查更新失败：{e}")),
                 }

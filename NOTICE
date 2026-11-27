@@ -71,6 +71,8 @@ scroll stepping, adaptive capture cadence and other modules:
 
 - GPUI (https://github.com/zed-industries/zed) — Zed 编辑器的 GPU 加速 UI 框架，Apache-2.0。
 - ONNX Runtime (https://github.com/microsoft/onnxruntime) — MIT。
+- ort-sys (https://github.com/pykeio/ort) — Apache-2.0 / MIT；crates/ort-sys/
+  是其本地副本，仅修改 build script 使 DLL 复制在缺少目标目录时不再中止构建。
 - PaddleOCR (https://github.com/PaddlePaddle/PaddleOCR) — PP-OCRv6 模型（Apache-2.0）。
 
 完整致谢列表见随分发包附带的 README.md「致谢」一节。

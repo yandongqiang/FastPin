@@ -38,3 +38,8 @@ panic = "abort"
 [patch.crates-io]
 gpui-pre = { path = "third_party/gpui-pre" }
 gpui-pre-windows = { path = "third_party/gpui-pre-windows" }
+# ort-sys 2.0.0-rc.13 unconditionally unwraps dylib symlink/copy operations in
+# its build script; on a fresh CI runner the destination dirs are missing and
+# fs::copy fails with code 3, aborting the build. This vendored copy makes the
+# dylib copy best-effort. See crates/ort-sys/build/dynamic_link.rs.
+ort-sys = { path = "crates/ort-sys" }

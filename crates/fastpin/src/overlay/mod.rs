@@ -1428,10 +1428,11 @@ impl OverlayView {
         let query =
             crate::uia::elements_at_point_async(self_hwnd, pt, self.uia_epoch, self.uia_session);
         if query.failed_fast {
-            // 队列满 / worker 已退出：等价于一次超时。必须在这里就计数——
-            // 鼠标快速移动时 pending 可能下一帧就被清掉，poll 根本看不到它。
+            // 队列满是**背压**（快速移动时请求太多），不是 provider 卡死。
+            // 过去把它计入超时，60Hz 移动下连续三次 failed_fast 就熔断整个
+            // 窗口，且熔断后不再发请求，只能重新截图恢复。这里只丢弃本次
+            // 请求，真正的超时由 poll 中"长时间收不到任何帧"来判定。
             self.uia_pending = None;
-            self.note_uia_timeout(target);
             return;
         }
         self.uia_pending = Some(UiaPending {
@@ -1481,8 +1482,13 @@ impl OverlayView {
                 // visible_window_rect 在边缘几像素上口径不同，不能据此整批丢弃。
                 let target_gone = window_under_point(hwnd, now).is_some_and(|w| w != target);
                 if drifted || target_gone {
+                    // 收到帧本身就证明 worker 还活着：即使这一帧不显示，也要
+                    // 推后超时计时，否则 refinement 持续 1500ms 期间用户的自然
+                    // 移动会被误判为 400ms 超时，累积三次就熔断该窗口。
                     if reply.final_reply {
                         self.uia_pending = None;
+                    } else if let Some(pending) = self.uia_pending.as_mut() {
+                        pending.started = Instant::now();
                     }
                     return;
                 }
@@ -1501,8 +1507,17 @@ impl OverlayView {
                 );
                 // 缓存成功应用的矩形：后续鼠标小幅移动时继续复用，直到窗口
                 // 切换或新一轮截图让它失效。request_uia 不碰这份缓存。
-                self.uia_last = uia_rects;
-                self.uia_last_target = Some(target);
+                // 关键：空结果绝不能建立缓存。首轮 foreground 在 provider 尚未
+                // 就绪时可能返回空，若此时把 uia_last_target 设为 Some，
+                // uia_cache_usable 会一直判为“缓存可用”，后续鼠标移动都不再
+                // 发起查询——于是元素检测持续为空，只有重新截图清空缓存才恢复。
+                if uia_rects.is_empty() {
+                    self.uia_last.clear();
+                    self.uia_last_target = None;
+                } else {
+                    self.uia_last = uia_rects;
+                    self.uia_last_target = Some(target);
+                }
                 self.uia_last_point = point;
                 self.hover = crate::smart_selection::preview_rect(
                     self.smart_selection,

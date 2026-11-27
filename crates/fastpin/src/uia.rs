@@ -102,7 +102,10 @@ fn worker_tx() -> Option<SyncSender<UiaRequest>> {
     if let Some(tx) = guard.as_ref() {
         return Some(tx.clone());
     }
-    let (tx, rx) = mpsc::sync_channel::<UiaRequest>(2);
+    // 快速鼠标移动会连续投递查询；容量太小会让 try_send 频繁 Full 返回
+    // failed_fast，被 UI 侧误当成 provider 超时而熔断整个窗口。留出足够
+    // 背压空间，worker 会按自己的节奏处理最新请求。
+    let (tx, rx) = mpsc::sync_channel::<UiaRequest>(8);
     thread::Builder::new()
         .name("fastpin-uia-query".to_string())
         .spawn(move || run_query_worker(rx))

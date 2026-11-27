@@ -27,7 +27,7 @@ use gpui::{
     actions, canvas, div, img, prelude::*, px, size, App, AsyncApp, Bounds, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, EntityInputHandler, FocusHandle, Focusable, ImageSource,
     KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point as GpuiPoint, Render, RenderImage, ScrollDelta, ScrollWheelEvent, UTF16Selection, Window,
+    Point as GpuiPoint, Render, RenderImage, ScrollDelta, ScrollEvent, UTF16Selection, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
 };
 use windows::core::PCWSTR;
@@ -1817,7 +1817,7 @@ impl PinView {
         // Ctrl+press arms a drag-export gesture (upstream snow-shot): the pin
         // itself never moves while it is armed. Resizing beats nothing here --
         // an armed press owns the pointer until release or threshold.
-        if event.modifiers.secondary() {
+        if event.modifiers.secondary(cx) {
             let mut cursor = POINT::default();
             if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
                 self.export_drag_origin = Some((cursor.x, cursor.y));
@@ -2097,7 +2097,7 @@ impl PinView {
     /// anchor, edge by edge, so seams stay closed.
     fn on_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2684,7 +2684,7 @@ impl Render for PinView {
             .border_color(theme::border().opacity(0.7))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
-            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_scroll(cx.listener(Self::on_scroll_wheel))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::close))
             .on_action(cx.listener(Self::confirm))

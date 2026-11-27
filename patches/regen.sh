@@ -36,5 +36,5 @@ regen() {
     echo "wrote $OUT ($ADDED added, $REMOVED removed)"
 }
 
-regen gpui-pre-0.3.9 gpui-pre-0.3.9 third_party/gpui-pre
-regen gpui-pre-windows-0.3.9 gpui-pre-windows-0.3.9 third_party/gpui-pre-windows
+regen gpui-pre-0.3.14 gpui-pre-0.3.14 third_party/gpui-pre
+regen gpui-pre-windows-0.3.14 gpui-pre-windows-0.3.14 third_party/gpui-pre-windows

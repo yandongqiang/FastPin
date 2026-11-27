@@ -1,10 +1,11 @@
 # Vendored gpui-pre deltas
 
-`third_party/gpui-pre` and `third_party/gpui-pre-windows` are **gpui-pre 0.3.9**
-and **gpui-pre-windows 0.3.9** from crates.io, each with a local patch, wired in
+`third_party/gpui-pre` and `third_party/gpui-pre-windows` are **gpui-pre 0.3.14**
+and **gpui-pre-windows 0.3.14** from crates.io, each with a local patch, wired in
 through `[patch.crates-io]` in the workspace `Cargo.toml`. The FastPin application
-itself depends on `gpui-kit = "=0.8.0"` (which renames `gpui-pre` as its `gpui`
-dependency), so the patched crates are what the app actually compiles against.
+itself depends on `gpui-kit = "=0.11.0"` (which depends on `gpui-pre 0.3.14` and
+`gpui-pre-windows 0.3.14` indirectly), so the patched crates are what the app
+actually compiles against.
 
 The old `third_party/gpui` (gpui 0.2.2 + its patch, `gpui-0.2.2-fastpin-overlay.patch`)
 is kept untouched for reference only; nothing consumes it after the gpui-kit
@@ -12,17 +13,17 @@ migration.
 
 ## What the patches add
 
-`gpui-pre-0.3.9-fastpin-overlay.patch` (163 added, 0 removed) — the platform-neutral
+`gpui-pre-0.3.14-fastpin-overlay.patch` (163 added, 0 removed) — the platform-neutral
 surface:
 
 | File | Change |
 | --- | --- |
 | `Cargo.toml` | Renamed `windows61` dependency (`windows 0.61`) so the patched public API signatures use the same `windows` major that applications compile against. Type identity comes from the crate version, so `windows61::ID3D11Device` **is** the app's `windows::ID3D11Device`. |
-| `src/platform.rs` | `Platform` trait: `gpu_generation`, `adapter_luid`, `with_gpu_context`, `on_gpu_reset_begin` (windows-only, default no-op) and `release_gpu_devices`. `PlatformWindow` trait: `set_background_swap_chain`, `wait_for_commit_completion`, `on_app_ready_sentinel` (windows-only, default no-op). |
-| `src/app.rs` | `App::gpu_generation / adapter_luid / with_gpu_context / on_gpu_reset_begin / release_gpu_devices`. |
+| `src/platform.rs` | `Platform` trait: `gpu_generation`, `adapter_luid`, `with_gpu_context`, `on_gpu_reset_begin`, `on_gpu_reset_end` (windows-only, default no-op) and `release_gpu_devices`. `PlatformWindow` trait: `set_background_swap_chain`, `wait_for_commit_completion`, `on_app_ready_sentinel` (windows-only, default no-op). |
+| `src/app.rs` | `App::gpu_generation / adapter_luid / with_gpu_context / on_gpu_reset_begin / on_gpu_reset_end / release_gpu_devices`. |
 | `src/window.rs` | `Window::set_background_swap_chain / wait_for_commit_completion / on_app_ready_sentinel`. |
 
-`gpui-pre-windows-0.3.9-fastpin-overlay.patch` (271 added, 7 removed) — the
+`gpui-pre-windows-0.3.14-fastpin-overlay.patch` (271 added, 7 removed) — the
 Windows implementation:
 
 | File | Change |

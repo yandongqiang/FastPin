@@ -550,13 +550,9 @@ struct PrepaintState {
     selection: Option<PaintQuad>,
 }
 
-impl IntoElement for TextElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
+// 0.3.14+ provides a blanket `impl<T: Element> IntoElement for T`, so the old
+// manual impl here now conflicts. `TextElement` is still used as a child
+// directly (`.child(TextElement { .. })`) via that blanket impl.
 
 impl Element for TextElement {
     type RequestLayoutState = ();

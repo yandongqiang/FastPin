@@ -1,6 +1,6 @@
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/Cargo.toml b/Cargo.toml
---- a/Cargo.toml	2026-11-12 17:50:30.298289200 +0800
-+++ b/Cargo.toml	2026-11-12 17:50:30.376804800 +0800
+--- a/Cargo.toml	2026-11-27 10:26:01.978008400 +0800
++++ b/Cargo.toml	2026-11-27 10:26:02.072239000 +0800
 @@ -193,6 +193,20 @@
      "Win32_UI_Input_Pointer",
  ]
@@ -23,8 +23,8 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
  version = "0.62"
  
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/directx_devices.rs b/src/directx_devices.rs
---- a/src/directx_devices.rs	2026-11-12 17:50:30.311284700 +0800
-+++ b/src/directx_devices.rs	2026-11-12 17:50:30.394312100 +0800
+--- a/src/directx_devices.rs	2026-11-27 10:26:01.997496600 +0800
++++ b/src/directx_devices.rs	2026-11-27 10:26:02.059486000 +0800
 @@ -70,6 +70,17 @@
              device_context,
          })
@@ -44,9 +44,9 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
  
  #[inline]
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/directx_renderer.rs b/src/directx_renderer.rs
---- a/src/directx_renderer.rs	2026-11-12 17:50:30.313285000 +0800
-+++ b/src/directx_renderer.rs	2026-11-12 17:50:30.395311200 +0800
-@@ -117,8 +117,13 @@
+--- a/src/directx_renderer.rs	2026-11-27 10:26:01.987549000 +0800
++++ b/src/directx_renderer.rs	2026-11-27 10:26:02.060993000 +0800
+@@ -115,8 +115,13 @@
  
  struct DirectComposition {
      comp_device: IDCompositionDevice,
@@ -84,13 +84,13 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
 +        Ok(())
 +    }
 +
-     fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+     fn pre_draw(&self, clear_color: &[f32; 4], depth_scale: f32) -> Result<()> {
          let resources = self.resources.as_ref().expect("resources missing");
          let device_context = &self
-@@ -1015,23 +1039,63 @@
+@@ -1034,23 +1058,63 @@
      pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
          let comp_device = get_comp_device(dxgi_device)?;
-         let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+         let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
 -        let comp_visual = unsafe { comp_device.CreateVisual() }?;
 +        let root_visual = unsafe { comp_device.CreateVisual() }?;
 +        let freeze_visual = unsafe { comp_device.CreateVisual() }?;
@@ -156,12 +156,12 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
  
  impl DirectXGlobalElements {
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/events.rs b/src/events.rs
---- a/src/events.rs	2026-11-12 17:50:30.316285200 +0800
-+++ b/src/events.rs	2026-11-12 17:50:30.381805200 +0800
-@@ -28,6 +28,9 @@
+--- a/src/events.rs	2026-11-27 10:26:01.989574500 +0800
++++ b/src/events.rs	2026-11-27 10:26:02.064062200 +0800
+@@ -27,6 +27,9 @@
+ pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
  pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
  pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
- pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 +// FastPin overlay patch: sent from the vsync thread before DirectX devices are
 +// recreated, so the app can release device-dependent state on the main thread.
 +pub(crate) const WM_GPUI_GPU_RESET_BEGIN: u32 = WM_USER + 9;
@@ -169,15 +169,15 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
  
  const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 @@ -160,6 +163,8 @@
-             WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
-             WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
-             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+             WM_GPUI_CURSOR_STYLE_CHANGED
+             | WM_GPUI_FORCE_UPDATE_WINDOW
+             | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(handle, msg, wparam, lparam),
 +            // FastPin overlay patch: WM_APP + 32 — overlay input-ready sentinel.
 +            0x8020 => self.handle_app_ready_sentinel(),
-             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
-             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
              _ => None,
-@@ -1312,6 +1317,18 @@
+         };
+         if let Some(n) = handled {
+@@ -1352,6 +1357,18 @@
          Some(0)
      }
  
@@ -197,8 +197,8 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
          self.state.direct_manipulation.on_pointer_hit_test(wparam);
          None
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform.rs b/src/platform.rs
---- a/src/platform.rs	2026-11-12 17:50:30.319285100 +0800
-+++ b/src/platform.rs	2026-11-12 17:50:30.383804900 +0800
+--- a/src/platform.rs	2026-11-27 10:26:01.991625600 +0800
++++ b/src/platform.rs	2026-11-27 10:26:02.066086400 +0800
 @@ -6,7 +6,7 @@
      rc::{Rc, Weak},
      sync::{
@@ -218,9 +218,9 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
  }
  
  pub(crate) struct WindowsPlatformState {
-@@ -112,6 +115,13 @@
-     system_sleep: Cell<Option<Box<dyn FnMut()>>>,
+@@ -114,6 +117,13 @@
      system_wake: Cell<Option<Box<dyn FnMut()>>>,
+     low_power_mode_change: Cell<Option<Box<dyn FnMut()>>>,
      displays_changed: Cell<Option<Box<dyn FnMut()>>>,
 +    // FastPin overlay patch: runs on the main thread before DirectX devices are
 +    // recreated after a device reset, so the overlay can park its freeze frame.
@@ -232,7 +232,7 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
  }
  
  impl WindowsPlatformState {
-@@ -581,6 +591,83 @@
+@@ -559,6 +569,83 @@
              .set(Some(callback));
      }
  
@@ -316,7 +316,7 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
      fn on_thermal_state_change(&self, _callback: Box<dyn FnMut()>) {}
  
      fn thermal_state(&self) -> ThermalState {
-@@ -1163,6 +1250,7 @@
+@@ -1169,6 +1256,7 @@
                  .main_receiver
                  .take()
                  .context("missing main receiver")?,
@@ -324,17 +324,17 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
          }))
      }
  
-@@ -1192,7 +1280,8 @@
+@@ -1216,7 +1304,8 @@
              | WM_GPUI_DOCK_MENU_ACTION
              | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
              | WM_GPUI_DISPLAYS_CHANGED
 -            | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
 +            | WM_GPUI_GPU_DEVICE_LOST
 +            | WM_GPUI_GPU_RESET_BEGIN => self.handle_gpui_events(msg, wparam, lparam),
-             WM_POWERBROADCAST => self.handle_power_broadcast(wparam),
+             WM_POWERBROADCAST => self.handle_power_broadcast(wparam, lparam),
              WM_DISPLAYCHANGE => self.handle_display_change(handle),
              WM_QUERYENDSESSION => Some(1),
-@@ -1221,6 +1310,7 @@
+@@ -1245,6 +1334,7 @@
              WM_GPUI_KEYBOARD_LAYOUT_CHANGED => self.handle_keyboard_layout_change(),
              WM_GPUI_DISPLAYS_CHANGED => self.handle_displays_changed(),
              WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
@@ -342,7 +342,7 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
              _ => unreachable!(),
          }
      }
-@@ -1396,7 +1486,30 @@
+@@ -1430,9 +1520,32 @@
          if current.is_some() {
              *current = Some(directx_devices.clone());
          }
@@ -359,10 +359,10 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
 +            |callbacks| &callbacks.gpu_reset_end,
 +            |callback| callback(generation),
 +        );
-+
-+        Some(0)
-+    }
  
+         Some(0)
+     }
++
 +    // FastPin overlay patch: the vsync thread signals that device recreation is
 +    // about to start, before any GPU work touches the new device set.
 +    fn handle_gpu_reset_begin(&self) -> Option<isize> {
@@ -370,10 +370,12 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
 +            |callbacks| &callbacks.gpu_reset_begin,
 +            |callback| callback(),
 +        );
-         Some(0)
-     }
++        Some(0)
++    }
  }
-@@ -1717,6 +1830,17 @@
+ 
+ unsafe fn power_saving_status(lparam: LPARAM) -> Option<bool> {
+@@ -1770,6 +1883,17 @@
      // If we don't wait, the final drawing result will be blank.
      std::thread::sleep(std::time::Duration::from_millis(350));
  
@@ -392,9 +394,9 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
          DirectXDevices::new().context("Failed to recreate new DirectX devices after device lost")
      })?;
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/window.rs b/src/window.rs
---- a/src/window.rs	2026-11-12 17:50:30.325287500 +0800
-+++ b/src/window.rs	2026-11-12 17:50:30.388309300 +0800
-@@ -408,6 +408,8 @@
+--- a/src/window.rs	2026-11-27 10:26:01.996306600 +0800
++++ b/src/window.rs	2026-11-27 10:26:02.069127400 +0800
+@@ -410,6 +410,8 @@
      pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
      pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
      pub(crate) appearance_changed: Cell<Option<Box<dyn FnMut()>>>,
@@ -403,7 +405,7 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
  }
  
  struct WindowCreateContext {
-@@ -1057,6 +1059,38 @@
+@@ -1059,6 +1061,38 @@
          self.0.hwnd
      }
  

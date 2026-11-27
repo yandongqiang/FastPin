@@ -17,8 +17,8 @@ path = "src/main.rs"
 [dependencies]
 # Lock-free publication of hotkey bindings to the WH_KEYBOARD_LL callback.
 arc-swap = "1"
-gpui-kit = { version = "=0.8.0", default-features = false, features = ["component", "assets"] }
-gpui-component = { version = "=0.8.0", default-features = false }
+gpui-kit = { version = "=0.11.0", default-features = false, features = ["component", "assets"] }
+gpui-component = { version = "=0.11.0", default-features = false }
 raw-window-handle = "0.6"
 image = "0.25"
 # Vendored from snow-shot (GPL-3.0-or-later): ORB feature-based image stitching.

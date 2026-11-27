@@ -12,7 +12,7 @@ edition = "2021"
 # Vendoring snow-shot's GPL-3.0-or-later crates makes the whole workspace a
 # derivative work; FastPin is therefore relicensed to GPL-3.0-or-later.
 license = "GPL-3.0-or-later"
-version = "0.3.0"
+version = "0.4.0"
 # Match rust-toolchain.toml and ci.yml/release.yml so contributors and CI
 # agree on the minimum compiler before a build even starts.
 rust-version = "1.100.0"

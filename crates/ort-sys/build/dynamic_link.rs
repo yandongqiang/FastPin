@@ -14,14 +14,19 @@ pub fn prefer_dynamic_linking() -> bool {
 pub fn copy_dylibs(lib_dir: &Path, out_dir: &Path) {
 	use std::fs;
 
-	// FastPin patch: upstream unconditionally unwrapped symlink/copy operations.
-	// On a fresh CI runner the target sub-directories (examples, deps) do not
-	// exist yet, so the Windows symlink fallback `fs::copy` failed with "path
-	// not found" (code 3) and aborted the whole build. Create each destination
-	// directory first and treat a symlink/copy failure as best-effort (the
-	// dylibs are only needed by examples/tests; the library links statically).
-	let out_dir = out_dir.ancestors().nth(3).unwrap();
-	for out_dir in [out_dir.to_path_buf(), out_dir.join("examples"), out_dir.join("deps")] {
+	// FastPin patch: upstream derives the destination from `OUT_DIR.ancestors().nth(3)`.
+	// Cargo 1.100 nests build-script output one level deeper
+	// (`target/<profile>/build/ort-sys/<hash>/out`), so nth(3) now resolves to
+	// `target/<profile>/build` instead of `target/<profile>`. The DLL must sit
+	// next to the exe (and in examples/deps for tests), so locate the profile
+	// root by walking up to the `build` directory and taking its parent. Also
+	// create directories and make failures best-effort — a fresh CI runner has
+	// no Developer Mode and no pre-created sub-directories.
+	let Some(build_dir) = out_dir.ancestors().find(|p| p.file_name().is_some_and(|n| n == "build")) else {
+		return;
+	};
+	let Some(profile_dir) = build_dir.parent() else { return };
+	for out_dir in [profile_dir.to_path_buf(), profile_dir.join("examples"), profile_dir.join("deps")] {
 		if fs::create_dir_all(&out_dir).is_err() {
 			continue;
 		}

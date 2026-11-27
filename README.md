@@ -4,257 +4,62 @@
 
 # FastPin
 
-**常驻托盘的 Windows 截图工具（Rust 版）**
+**常驻托盘的 Windows 截图工具**
 
-标注编辑 · 本地 OCR · 自带 API 翻译 · 长截图 · 贴图钉住
-
-[![Release](https://img.shields.io/github/v/release/yandongqiang/FastPin?style=flat-square)](../../releases)
-[![License](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?style=flat-square&logo=windows)](../../releases)
-
-[下载](../../releases) · [快速上手](#快速上手) · [功能](#功能) · [从源码构建](#从源码构建)
+标注编辑 · 本地 OCR · API 翻译 · 长截图 · 贴图钉住
 
 </div>
 
----
+## 关于
 
-## 这是什么
+**本项目完全由 vibe coding（AI 辅助编程）完成。**
 
-按下热键 → 框选 → 标注 / 取字 / 翻译 / 接着往下滚 → 保存并复制 → 回到托盘。
+实现上参考了两个优秀的开源项目：
 
-全程不出现主窗口。没有启动器，没有欢迎页，没有图库。设置是从托盘单独打开的一个窗口，关掉它进程不退出。
+- **[snow-shot](https://github.com/mg-chao/snow-shot)**（GPL-3.0-or-later）—— 图像拼接、UI 元素检测、贴图、切图等模块直接来自它，或按它的实现移植
+- **Zshot** —— FastPin 最初基于它二次开发而来
 
-GPUI 界面、单 HWND 冻结覆盖层、DirectComposition 合成，目标是更小的体积与更快的冷启动。功能上对齐 C# 版的主干流程，尚未补齐的部分见[与 C# 版的差距](#与-c-版的差距)。
-
-FastPin 最初基于 Zshot 二次开发，底座技术来自 Starshot。
-
-## 为什么
-
-主流截图工具二选一：要么交互顺手但在 HDR 屏幕上发灰过曝，要么色彩正确却没有标注和取字。
-
-- **HDR 屏幕上截图是对的。** 直接从 DXGI 拿 `R16G16B16A16Float` scRGB 帧缓冲，在 GPU 上做 tone mapping，不经过系统合成器的 8bit 压缩，高光不削顶。
-- **取字不出机器。** OCR 用本地 PP-OCRv6 模型推理，截图不上传任何服务器。
-- **翻译用你自己的 API。** 填自己的 Base URL 和 Key，不经过任何中间服务，密钥存 Windows 凭据管理器。
-
-## 快速上手
-
-发布页提供 Portable zip 和由 `installer/fastpin.iss` 构建的 Inno Setup 安装包（默认每用户安装，无需管理员权限）。装好后程序静默进托盘，直接按热键即可：
-
-| 热键 | 动作 |
-| --- | --- |
-| `Ctrl` + `Alt` + `A` | 区域截图（最常用） |
-| `Ctrl` + `Alt` + `W` | 区域截图，只进剪贴板不存文件 |
-| `PrtSc` | 全屏截图 |
-
-三个热键都能在「设置 → 快捷键」里点击方框重新录制。托盘**左键单击 = 区域截图**；右键菜单列出三个动作及当前绑定的热键，外加设置和退出。
-
-框选完成后覆盖层不会关闭，直接在选区上标注、取字、翻译或继续长截图，按 `Enter` 或点「完成」结束。
-
-默认保存 PNG 到 `图片\FastPin`，文件名带时间戳并自动防重名，保存目录可在设置里更改。
+在参考项目的基础上，FastPin 新增的功能是标注工具里的**云线**。
 
 ## 功能
 
-### 区域截图覆盖层
+- **区域截图**：冻结帧框选，窗口 / 元素自动吸附，可自定义选区边框（实线 / 虚线、粗细、颜色）
+- **标注编辑**：矩形、椭圆、箭头、画笔、文字、马赛克、序号、直线（实线 / 虚线 / **云线**），支持撤销 / 重做
+- **本地 OCR**：PP-OCRv6 本地推理，截图不上传
+- **翻译**：发往你自己配置的 OpenAI 兼容 API，密钥存 Windows 凭据管理器
+- **长截图**：自动滚动 + 特征匹配拼接，可切图、拼图、导出 PDF
+- **贴图钉住**：无边框置顶、拼接成组、组内标注
+- **托盘常驻**：无主窗口，设置独立打开
 
-冻结帧渲染，框选期间画面不会变。窗口自动探测（悬停高亮、可吸附）、15×15 像素放大镜、实时坐标、多显示器跨屏框选，独占全屏的游戏窗口也能抓。
+## 快速上手
 
-`Esc` 或右键取消，`Enter` 确认。
+装好后程序静默进托盘，直接按热键：
 
-### 标注编辑
-
-在选区内直接画，不弹独立编辑窗：
-
-矩形 · 椭圆 · 箭头 · 画笔 · 文字 · 马赛克 · 序号 · 直线（实线 / 虚线 / 云线）
-
-支持撤销 / 重做 / 清空，颜色、线宽、马赛克格子的默认值都能在设置里改。
-
-**工具栏可自定义**：除「完成」「取消」外的按钮都能在「设置 → 截屏」里显示或隐藏。
-
-### 本地 OCR
-
-选区里的文字一键提取，识别结果可整段复制。
-
-- 模型是 **PP-OCRv6 Small**，随发布包一起分发，装完即用，不需要联网下载
-- 多语言单模型：简体中文、繁体中文、英文、日文及拉丁语系
-- **全程本地推理，截图不上传**
-- 首次调用加载模型约 160–400 ms，之后会话保留 60 秒，空闲超时自动释放，不长期占内存
-
-### 翻译
-
-OCR 取出文字后一键翻译：
-
-- 兼容 OpenAI 格式的任意服务，填 Base URL / API Key / 模型名
-- 目标语言、系统提示词、超时（5~300 秒）都可配
-- API Key 存进 Windows 凭据管理器，不写进配置文件
-- 对返回格式做了容错：流式 `delta`、缺字段都不会让程序崩
-
-不提供本地翻译模型：所有翻译都发往你自己在设置里配置的 API 端点。
-
-### 长截图
-
-固定选区，滚动页面时自动检测新内容并拼接。可以手动滚动，也可以打开长截图工具栏上的「自动滚动」开关，让程序按固定节奏代你滚动；连续多步没有新内容时会自动停止。
-
-- 自适应帧率采帧（2–30 fps，初始约 125 ms 一帧），按重叠区域做灰度 SAD / ORB 特征匹配对齐，避免重复条带
-- 上限 16384px（D3D11 纹理尺寸上限）
-- 拼接期间选区点击穿透，下方的应用正常接收滚轮
-- 自动滚动按原生滚轮步长发送，每步间隔与步长可配
-- 完成进入预览窗口，可手动保存 PNG、复制或继续裁剪/拼图
-
-长截图预览窗口还能把结果直接送到两个后续工具：
-
-- **切图**：按等分、指定尺寸或智能边界把长图切成多块，逐块导出
-- **拼图**：把多张图排成版式，支持 PNG 导出和 PDF（合并或逐页）导出
-
-### 贴图钉住
-
-把标注后的选区作为无边框置顶窗口钉在屏幕上（PixPin 式）：拖动移动、滚轮缩放，`Esc` 或双击关闭，可同时钉多张。`Ctrl` + `C` 复制、`Ctrl` + `S` 保存当前钉图。
-
-**拼接**：把一张钉图拖到另一张的边缘附近会自动吸附贴齐，接缝处出现 `✓`，点击（或按 `Enter`）后两张就连成一组：一起拖动、一起缩放、一起关闭，复制或保存时合成为一张大图，错位拼接留下的空角在 PNG 里保持透明。拖到别的钉图上面则只是叠放，不会吸附；按住 `Alt` 拖动可强制不吸附。`Ctrl` + `D` 把当前这块从组里拆出来。
-
-**标注**：右键菜单「标注」或 `Ctrl` + `E` 在钉图下方打开与截图时同款的标注工具栏（矩形、箭头、画笔、文字、马赛克、颜色、撤销、重做、清空），标注直接画在钉图上，拼接成组的钉图可以跨接缝画一根箭头。`Enter` 或工具栏「完成」把标注烙进图片，`Esc` 或「取消」丢弃。标注期间复制或保存会先完成当前标注，再导出图片。标注期间不能移动和缩放。
-
-**右键菜单**：复制、保存、标注、确认拼接、从组中拆开、实际大小、关闭、关闭所有贴图，条件项只在有意义时出现。
-
-### 更新检查
-
-「设置 → 关于」里可手动检查更新，对照 GitHub Releases 的最新版本。发现新版本后有两种方式：
-
-- **应用内下载**：直接流式下载官方安装包到 `%LOCALAPPDATA%\FastPin\downloads`，界面显示进度（按 `Content-Length` 计算百分比），完成后可打开所在目录；下载不经浏览器、不解压、不自动安装。
-- **前往下载**：跳到 GitHub 发布页，由浏览器选择要下载的资产。
-
-差分补丁更新尚未实现（需要服务端发布补丁清单与校验信息）。
-
-### 设置窗口
-
-设置从托盘右键菜单单独打开，关掉后进程仍留在托盘。左侧共 12 类：常规、截图、录屏、历史图片、输出、贴图、外观、快捷键、翻译、文本识别、数据管理、关于。
-
-- 「输出」可配置文字 / 图片水印（九宫格位置、不透明度、大小、平铺、拍摄时间）与保存位置，以及导出格式 / 质量和文件名模板；「自动保存」与「自动复制」是**两个独立开关**，可任意组合（默认只复制不保存，与旧行为一致），都关闭时「完成」不产生输出。工具栏的「保存」按钮仍固定为只保存文件、不进剪贴板。
-- 「截屏」可开关工具栏按钮、设置默认标注样式、选择「元素检测」吸附方式（窗口与元素 / 仅窗口 / 不检测），并配置长截图自动滚动的间隔与步长。
-- 「数据管理」可配置截图历史的保留策略、打开历史目录，并在历史窗口里浏览、复制、删除以往截图；即使关闭“记录截图历史”，仍可查看和删除已有记录。
-- 「外观」使用 gpui-kit 主题：默认内置 21 个主题族共 36 个变体（另加 2 个默认主题），由 `ThemeRegistry` 从 themes 目录加载并监听，可在此页下拉选择（按主题名如 `Ayu Light`），立即生效并保存。
-- 「录屏」页当前暂不支持；界面目前仅提供简体中文。
-
-## 与 C# 版的差距
-
-Rust 版仍在补齐以下 C# 版已有的能力：
-
-- HDR 输出格式（AVIF / JPEG XL / PNGv3）：当前在 HDR 屏幕上做正确的 tone mapping，但只输出 SDR 文件。Windows WIC 在这套依赖里没有 AVIF / JPEG XL / PNGv3 的编码器，补上它们需要引入较重的第三方编码库，与本作「小体积、快冷启动」的目标冲突，暂时保留为差距。
-- 差分补丁更新：应用内流式下载已支持，但增量补丁需要发布端提供补丁清单与校验信息，当前仍为整包下载。
-
-## 已知限制
-
-- OCR 典型选区约 1 秒出结果（CPU 推理的固有开销），识别中会显示状态提示
-- 长截图默认手动滚动，可在工具栏打开「自动滚动」；单次滚动超过选区高度的帧会被丢弃
-- 翻译依赖你自己提供的 API；没有本地翻译模型，也没有内置翻译服务
-
-## 系统要求
-
-- Windows 10 / 11，x64
-- HDR 捕获需要 HDR 显示器，SDR 屏幕自动走 8bit 路径
-
-## 架构
-
-单 crate，按职责分模块：
-
-```text
-crates/fastpin/src/
-├── capture/      WGC 优先、DXGI DuplicateOutput1 兜底的屏幕捕获
-├── overlay/      GPUI 冻结覆盖层：框选、标注、工具栏、放大镜
-├── settings/     设置窗口（GPUI）
-├── platform/     托盘、全局热键、Win32 杂项
-├── ocr/          PP-OCRv6 推理，60 秒空闲自动卸载
-├── codec/        WIC PNG 编码
-├── translate.rs  WinHTTP 直连 OpenAI 兼容接口
-├── update.rs     GitHub Releases 更新检查
-└── pin.rs / longcapture.rs / hdr.rs / exclusive.rs / perf.rs …
-```
-
-UI 依赖 `gpui-kit = "=0.8.0"`，它把 `gpui-pre` 重导出为 `gpui`。仓库通过根 `Cargo.toml` 的 `[patch.crates-io]` 把 `gpui-pre` / `gpui-pre-windows`（0.3.9，位于 `third_party/gpui-pre*`）替换为打了本地补丁的版本，用于冻结帧的 DirectComposition 合成。补丁内容与重新生成方式见 `patches/README.md`、`patches/regen.sh`。
-
-| 层 | 技术 |
+| 热键 | 动作 |
 | --- | --- |
-| UI | gpui-kit 0.8.0 + patched gpui-pre 0.3.9 |
-| 图形 | D3D11 + DirectComposition + Direct2D |
-| 捕获 | Windows.Graphics.Capture / DXGI Output Duplication |
-| 编码 | WIC（PNG） |
-| OCR | oar-ocr（ONNX Runtime）+ PP-OCRv6 Small |
-| 网络 | WinHTTP（翻译、更新检查） |
-| 密钥 | Windows 凭据管理器 |
+| `Ctrl` + `Alt` + `A` | 区域截图 |
+| `Ctrl` + `Alt` + `W` | 区域截图，只进剪贴板 |
+| `PrtSc` | 全屏截图 |
+
+热键可在「设置 → 快捷键」里重新录制。托盘左键单击 = 区域截图，右键菜单里有设置和退出。
+
+框选后覆盖层不关闭，可直接在选区上标注 / 取字 / 翻译 / 长截图，`Enter` 或「完成」结束。
 
 ## 从源码构建
 
-### 前置要求
-
-- Rust stable（MSVC 工具链）
-- Windows 10/11 SDK
-
-### 步骤
+需要 Rust stable（MSVC）和 Windows 10/11 SDK。OCR 模型已随仓库提供（`models/v6/`），无需联网下载。
 
 ```bash
-cargo build --release    # 产出 target/release/FastPin.exe
-cargo test --workspace    # 单元测试（CI 用 --workspace，覆盖整个工作区）
-cargo fmt --all -- --check    # CI 同款格式检查
-cargo clippy --workspace --all-targets --locked -- -D warnings   # CI 同款检查
+cargo build --release                              # 产出 target/release/FastPin.exe
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-OCR 模型已入库（`models/v6/`，约 31 MiB），发布包会把它们放在 exe 旁边的 `models\v6\`。这是有意选择：克隆后无需 LFS、无需联网即可从源码运行，且发布包天然离线可用；代价是 clone 较重、模型升级会产生较大的二进制 diff。只关心源码的贡献者可用 `git clone --depth 1` 减少下载量。若将来要切到 Git LFS，需要重写历史并强制推送，属于独立的仓库迁移，不在普通代码改动范围内。
-
-`FASTPIN_MODELS` 是可选的：从源码直接运行时，不设置也能回退到仓库内的模型目录。仅当需要指向其它模型目录时才设置：
-
-```text
-set FASTPIN_MODELS=<你的仓库路径>\models\v6
-```
-
-其它可选环境变量：`FASTPIN_BENCH`（内部压测）、`FASTPIN_NO_TRAY_HINT`（不显示首次托盘提示）。
-
-### 调试与性能 flags
-
-| Flag | 作用 |
-| --- | --- |
-| `--once-capture [path]` | 抓当前显示器存 PNG 后退出 |
-| `--self-test` | 初始化托盘与热键，打印结果后退出 |
-| `--bench-overlay --mode first\|warm --n N` | 覆盖层 T2→T7 延迟采样 |
-| `--stress-overlay N` | 覆盖层反复显隐，采样工作集内存 |
-
-设置存 `%LOCALAPPDATA%\FastPin\settings.json`（每个键都可缺省），运行日志在同目录 `logs\`。首次启动会把旧版数据目录、开机启动项和翻译密钥迁移过来。
-
-## 常见问题
-
-**截图发灰 / 过曝？**
-HDR 屏幕下捕获走 scRGB + GPU tone mapping，理论上不会发灰。若遇到请提 issue 并附显示器型号。
-
-**OCR 第一次特别慢？**
-首次调用要加载 ONNX 模型（约 160–400 ms），之后 60 秒内复用同一会话。稳定后典型选区约 1 秒。
-
-**OCR 认不出某种语言？**
-PP-OCRv6 Small 覆盖中日英与拉丁语系。韩文、阿拉伯文等不在支持范围内。
-
-**翻译报错？**
-先确认 Base URL 填的是兼容 OpenAI 格式的地址（通常以 `/v1` 结尾即可，程序会自动补 `/chat/completions`）。错误信息会直接显示 API 返回的状态码。
-
-**长截图拼接错位？**
-滚动慢一点。每次滚动的距离若超过选区高度，相邻两帧就没有重叠区域可供对齐，该帧会被丢弃。
-
-**关掉设置窗口程序就退出了？**
-不会。设置是独立窗口，关掉后程序继续留在托盘。要退出请用托盘右键菜单的「退出」。
-
-## 致谢
-
-- Zshot — FastPin 最初基于其二次开发的 Rust / GPUI 截图工具（来源项目）
-- [Starshot](https://github.com/loliri/Starshot) — 底座技术来源，作者 [@loliri](https://github.com/loliri)（MIT）
-- [GPUI](https://github.com/zed-industries/zed) — Zed 编辑器的 GPU 加速 UI 框架
-- [oar-ocr](https://github.com/GreatV/oar-ocr) — Rust OCR 推理封装
-- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) — PP-OCRv6 模型（Apache-2.0）
-- [ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）
-
-## Privacy
-
-FastPin 不会把截图、OCR 结果、API 密钥或任何用户数据发送到用户未显式配置或请求的系统。网络访问只发生在两种情况：用户主动请求的翻译（发往用户自己配置的 API 端点）和针对 GitHub Releases 的更新检查。
-
-FastPin does not transfer screenshots, OCR results, API keys, or other user data to systems not explicitly configured or requested by the user. Network access only occurs for user-requested translation through the configured API endpoint and update checks against GitHub Releases.
+设置存 `%LOCALAPPDATA%\FastPin\settings.json`。
 
 ## 许可证
 
 GPL-3.0-or-later，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
 
-FastPin 包含来自 snow-shot（GPL-3.0-or-later）的图像拼接、切图、历史、颜色选取、滚动步长、自适应帧率等多个模块的代码，因此整体按 GPL-3.0-or-later 发布。FastPin 最初基于 Zshot 二次开发，底座技术来自 Starshot。
+FastPin 包含来自 snow-shot（GPL-3.0-or-later）的代码并参考其实现，因此整体按 GPL-3.0-or-later 发布。
